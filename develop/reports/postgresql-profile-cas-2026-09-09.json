@@ -1,0 +1,749 @@
+{
+  "schema_version": 1,
+  "python": "3.12.7",
+  "platform": "Darwin",
+  "database_storage": "tmpfs",
+  "workload": "synthetic broker/market; Analytics ASGI; Worker SQLite; CoreClient TCP HTTP; Core PostgreSQL",
+  "clock": "logical minute per tick for domain; all latency uses perf_counter monotonic",
+  "queue_clock": "real outbox ORM creation to first CoreClient HTTP attempt; includes Worker transaction wait",
+  "percentiles": "p50 median; p95/p99 nearest rank; no prespecified SLA threshold",
+  "overlap": "HTTP includes Core ingress; ingress includes SQL and session commit; session commit includes flush SQL and DBAPI commit. Do not sum these quantiles.",
+  "conditions": "serial decision then explicit drain; warmup excluded from WAIT; initial BUY/FILLED includes intervening WAIT/rate limiter; one isolated Alembic-head schema per case",
+  "results": [
+    {
+      "instruments": 6,
+      "postgresql_version": "16.15",
+      "warmup": 3,
+      "iterations": 100,
+      "batch_size": 100,
+      "deadline_ms": 0,
+      "retry_limit": 0,
+      "initial_buy_filled": {
+        "decision_tick_ms": {
+          "samples": 3,
+          "min": 96.09337500296533,
+          "p50": 114.82891600462608,
+          "p95": 130.00004200148396,
+          "p99": 130.00004200148396,
+          "max": 130.00004200148396
+        },
+        "queue_wait_ms": {
+          "samples": 234,
+          "min": 2.7103339962195605,
+          "p50": 37.93181250512134,
+          "p95": 92.99166699929629,
+          "p99": 111.96779199235607,
+          "max": 115.54583399265539
+        },
+        "sql_execution_ms": {
+          "samples": 2712,
+          "min": 0.26270899979863316,
+          "p50": 0.34895849967142567,
+          "p95": 0.5228329973760992,
+          "p99": 0.8046250004554167,
+          "max": 4.159916003118269
+        },
+        "dbapi_commit_ms": {
+          "samples": 18,
+          "min": 0.3067499928874895,
+          "p50": 0.3387495016795583,
+          "p95": 0.44099999649915844,
+          "p99": 0.44099999649915844,
+          "max": 0.44099999649915844
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 18,
+          "min": 0.3491669922368601,
+          "p50": 0.38808300450909883,
+          "p95": 0.5103330040583387,
+          "p99": 0.5103330040583387,
+          "max": 0.5103330040583387
+        },
+        "core_ingress_ms": {
+          "samples": 3,
+          "min": 441.1802910035476,
+          "p50": 456.4347919949796,
+          "p95": 495.21658300363924,
+          "p99": 495.21658300363924,
+          "max": 495.21658300363924
+        },
+        "sql_statements_per_request": {
+          "samples": 3,
+          "min": 900,
+          "p50": 904,
+          "p95": 908,
+          "p99": 908,
+          "max": 908
+        },
+        "dbapi_commits_per_request": {
+          "samples": 3,
+          "min": 6,
+          "p50": 6,
+          "p95": 6,
+          "p99": 6,
+          "max": 6
+        },
+        "facts_per_request": {
+          "samples": 3,
+          "min": 78,
+          "p50": 78,
+          "p95": 78,
+          "p99": 78,
+          "max": 78
+        },
+        "http_roundtrip_ms": {
+          "samples": 3,
+          "min": 444.11383400438353,
+          "p50": 459.55425000283867,
+          "p95": 503.6099999997532,
+          "p99": 503.6099999997532,
+          "max": 503.6099999997532
+        },
+        "outbox_drain_ms": {
+          "samples": 3,
+          "min": 450.6972079980187,
+          "p50": 464.45887500885874,
+          "p95": 510.4938340082299,
+          "p99": 510.4938340082299,
+          "max": 510.4938340082299
+        },
+        "sql_statement_count": 2712,
+        "delivered_facts": 234,
+        "stage_totals_ms": {
+          "decision_tick_ms": 340.9223330090754,
+          "queue_wait_ms": 10136.563820313313,
+          "sql_execution_ms": 1019.4073632737854,
+          "dbapi_commit_ms": 6.369249967974611,
+          "session_commit_including_flush_ms": 7.206207010312937,
+          "core_ingress_ms": 1392.8316660021665,
+          "http_roundtrip_ms": 1407.2780840069754,
+          "outbox_drain_ms": 1425.6499170151073
+        },
+        "measured_decisions": 18,
+        "decisions_per_second": 52.79794914321685,
+        "pipeline_decisions_per_second": 10.185356276629335,
+        "pipeline_facts_per_second": 132.40963159618136,
+        "wall_elapsed_seconds": 1.7672430410020752,
+        "outbox_backlog_peak": 78,
+        "broker_fills": 6
+      },
+      "wait": {
+        "decision_tick_ms": {
+          "samples": 100,
+          "min": 52.89674999949057,
+          "p50": 67.69131299370201,
+          "p95": 89.94029099994805,
+          "p99": 96.42804099712521,
+          "max": 110.16270899563096
+        },
+        "queue_wait_ms": {
+          "samples": 5400,
+          "min": 2.0177919941488653,
+          "p50": 16.97833350044675,
+          "p95": 53.45787499391008,
+          "p99": 69.4958329986548,
+          "max": 96.00570799375419
+        },
+        "sql_execution_ms": {
+          "samples": 61200,
+          "min": 0.22958400950301439,
+          "p50": 0.35345800279174,
+          "p95": 0.5988750053802505,
+          "p99": 0.9626250102883205,
+          "max": 10.482166995643638
+        },
+        "dbapi_commit_ms": {
+          "samples": 600,
+          "min": 0.2512920036679134,
+          "p50": 0.33589550002943724,
+          "p95": 0.44175000221002847,
+          "p99": 0.5416249914560467,
+          "max": 6.026125003700145
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 600,
+          "min": 0.29733299743384123,
+          "p50": 0.3803330037044361,
+          "p95": 0.5015409988118336,
+          "p99": 0.5924589931964874,
+          "max": 6.093999996664934
+        },
+        "core_ingress_ms": {
+          "samples": 100,
+          "min": 285.95900000073016,
+          "p50": 318.8138329933281,
+          "p95": 365.3197499952512,
+          "p99": 399.4696669979021,
+          "max": 450.1933330029715
+        },
+        "sql_statements_per_request": {
+          "samples": 100,
+          "min": 612,
+          "p50": 612.0,
+          "p95": 612,
+          "p99": 612,
+          "max": 612
+        },
+        "dbapi_commits_per_request": {
+          "samples": 100,
+          "min": 6,
+          "p50": 6.0,
+          "p95": 6,
+          "p99": 6,
+          "max": 6
+        },
+        "facts_per_request": {
+          "samples": 100,
+          "min": 54,
+          "p50": 54.0,
+          "p95": 54,
+          "p99": 54,
+          "max": 54
+        },
+        "http_roundtrip_ms": {
+          "samples": 100,
+          "min": 288.28900000371505,
+          "p50": 321.4400005090283,
+          "p95": 367.8319579921663,
+          "p99": 402.13237499119714,
+          "max": 452.6483750087209
+        },
+        "outbox_drain_ms": {
+          "samples": 100,
+          "min": 292.73512501094956,
+          "p50": 326.1473954989924,
+          "p95": 372.3622079996858,
+          "p99": 407.1669160039164,
+          "max": 457.63383399753366
+        },
+        "sql_statement_count": 61200,
+        "delivered_facts": 5400,
+        "stage_totals_ms": {
+          "decision_tick_ms": 7099.438749006367,
+          "queue_wait_ms": 114748.4926347679,
+          "sql_execution_ms": 23761.523646651767,
+          "dbapi_commit_ms": 215.30534120392986,
+          "session_commit_including_flush_ms": 242.87212299532257,
+          "core_ingress_ms": 32361.767746901023,
+          "http_roundtrip_ms": 32611.31504306104,
+          "outbox_drain_ms": 33131.944334090804
+        },
+        "measured_decisions": 600,
+        "decisions_per_second": 84.51372301563636,
+        "pipeline_decisions_per_second": 14.907277556476705,
+        "pipeline_facts_per_second": 134.16549800829034,
+        "wall_elapsed_seconds": 40.24879779201001,
+        "outbox_backlog_peak": 54,
+        "reason_counts": {
+          "NO_THRESHOLD": 600
+        }
+      },
+      "recovery": {
+        "backlog_before_restart": 54,
+        "backlog_after_restart": 54,
+        "backlog_final": 0,
+        "committed_before_restart": 54,
+        "replayed_facts": 54,
+        "lost_ack_transport_errors": 1,
+        "restart_and_drain_ms": 198.49629199597985,
+        "worker_decisions": 648,
+        "core_decisions": 648,
+        "sdk_dispatches_before": 6,
+        "sdk_dispatches_after": 6,
+        "core_orders_before": 6,
+        "core_orders_after": 6,
+        "immutable_envelopes_preserved": true
+      }
+    },
+    {
+      "instruments": 20,
+      "postgresql_version": "16.15",
+      "warmup": 3,
+      "iterations": 100,
+      "batch_size": 100,
+      "deadline_ms": 0,
+      "retry_limit": 0,
+      "initial_buy_filled": {
+        "decision_tick_ms": {
+          "samples": 10,
+          "min": 256.0232909891056,
+          "p50": 285.6863124980009,
+          "p95": 300.1982910063816,
+          "p99": 300.1982910063816,
+          "max": 300.1982910063816
+        },
+        "queue_wait_ms": {
+          "samples": 2040,
+          "min": 5.980583009659313,
+          "p50": 614.1400000051362,
+          "p95": 790.4800840042299,
+          "p99": 1293.925499994657,
+          "max": 1405.2802920050453
+        },
+        "sql_execution_ms": {
+          "samples": 23400,
+          "min": 0.22504199296236038,
+          "p50": 0.355874995875638,
+          "p95": 0.5979999987175688,
+          "p99": 0.8298750035464764,
+          "max": 7.2842500085243955
+        },
+        "dbapi_commit_ms": {
+          "samples": 420,
+          "min": 0.26250000519212335,
+          "p50": 0.3319795068819076,
+          "p95": 0.45924998994451016,
+          "p99": 0.5391660088207573,
+          "max": 1.643249997869134
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 420,
+          "min": 0.3063750045839697,
+          "p50": 0.3745834983419627,
+          "p95": 0.5142919981153682,
+          "p99": 0.6330410105874762,
+          "max": 1.7214170075021684
+        },
+        "core_ingress_ms": {
+          "samples": 30,
+          "min": 23.954250005772337,
+          "p50": 587.775687003159,
+          "p95": 688.8641659897985,
+          "p99": 708.1063329969766,
+          "max": 708.1063329969766
+        },
+        "sql_statements_per_request": {
+          "samples": 30,
+          "min": 46,
+          "p50": 1144.0,
+          "p95": 1164,
+          "p99": 1168,
+          "max": 1168
+        },
+        "dbapi_commits_per_request": {
+          "samples": 30,
+          "min": 2,
+          "p50": 20.0,
+          "p95": 20,
+          "p99": 20,
+          "max": 20
+        },
+        "facts_per_request": {
+          "samples": 30,
+          "min": 4,
+          "p50": 100.0,
+          "p95": 100,
+          "p99": 100,
+          "max": 100
+        },
+        "http_roundtrip_ms": {
+          "samples": 30,
+          "min": 24.953125001047738,
+          "p50": 592.2023540042574,
+          "p95": 692.8153750050114,
+          "p99": 711.9162919989321,
+          "max": 711.9162919989321
+        },
+        "outbox_drain_ms": {
+          "samples": 10,
+          "min": 1215.183624997735,
+          "p50": 1275.1661455040448,
+          "p95": 1415.0825410033576,
+          "p99": 1415.0825410033576,
+          "max": 1415.0825410033576
+        },
+        "sql_statement_count": 23400,
+        "delivered_facts": 2040,
+        "stage_totals_ms": {
+          "decision_tick_ms": 2820.7109560025856,
+          "queue_wait_ms": 875389.9941210693,
+          "sql_execution_ms": 9109.328450460453,
+          "dbapi_commit_ms": 147.89704985741992,
+          "session_commit_including_flush_ms": 166.87596200790722,
+          "core_ingress_ms": 12623.914080031682,
+          "http_roundtrip_ms": 12709.655541024404,
+          "outbox_drain_ms": 12978.93241501879
+        },
+        "measured_decisions": 200,
+        "decisions_per_second": 70.90411003452587,
+        "pipeline_decisions_per_second": 12.657047458261264,
+        "pipeline_facts_per_second": 129.1018840742649,
+        "wall_elapsed_seconds": 15.80147350000334,
+        "outbox_backlog_peak": 204,
+        "broker_fills": 20
+      },
+      "wait": {
+        "decision_tick_ms": {
+          "samples": 100,
+          "min": 202.19091699982528,
+          "p50": 243.25506249442697,
+          "p95": 303.5540840064641,
+          "p99": 330.2561659947969,
+          "max": 370.66758300352376
+        },
+        "queue_wait_ms": {
+          "samples": 18000,
+          "min": 5.667125005857088,
+          "p50": 184.57212499924935,
+          "p95": 724.9597499903757,
+          "p99": 787.8704579925397,
+          "max": 948.4650829981547
+        },
+        "sql_execution_ms": {
+          "samples": 206000,
+          "min": 0.17433299217373133,
+          "p50": 0.3408545017009601,
+          "p95": 0.5507089954335243,
+          "p99": 0.9511670068604872,
+          "max": 8.517666996340267
+        },
+        "dbapi_commit_ms": {
+          "samples": 4000,
+          "min": 0.20995899103581905,
+          "p50": 0.3276250063208863,
+          "p95": 0.433833003626205,
+          "p99": 0.5483749991981313,
+          "max": 10.440208003274165
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 4000,
+          "min": 0.25249998725485057,
+          "p50": 0.3704375048982911,
+          "p95": 0.4884590016445145,
+          "p99": 0.611750001553446,
+          "max": 10.50920800480526
+        },
+        "core_ingress_ms": {
+          "samples": 200,
+          "min": 402.30099999462254,
+          "p50": 550.7506244975957,
+          "p95": 677.3926659952849,
+          "p99": 719.0319999936037,
+          "max": 834.9301249982091
+        },
+        "sql_statements_per_request": {
+          "samples": 200,
+          "min": 900,
+          "p50": 1030.0,
+          "p95": 1160,
+          "p99": 1160,
+          "max": 1160
+        },
+        "dbapi_commits_per_request": {
+          "samples": 200,
+          "min": 20,
+          "p50": 20.0,
+          "p95": 20,
+          "p99": 20,
+          "max": 20
+        },
+        "facts_per_request": {
+          "samples": 200,
+          "min": 80,
+          "p50": 90.0,
+          "p95": 100,
+          "p99": 100,
+          "max": 100
+        },
+        "http_roundtrip_ms": {
+          "samples": 200,
+          "min": 405.56899999501184,
+          "p50": 554.0320415020688,
+          "p95": 681.4607920096023,
+          "p99": 722.8570409934036,
+          "max": 838.8037090044236
+        },
+        "outbox_drain_ms": {
+          "samples": 100,
+          "min": 974.557374996948,
+          "p50": 1079.2694585034042,
+          "p95": 1248.2964580121916,
+          "p99": 1308.4774169983575,
+          "max": 1495.5142920080107
+        },
+        "sql_statement_count": 206000,
+        "delivered_facts": 18000,
+        "stage_totals_ms": {
+          "decision_tick_ms": 24724.533459972008,
+          "queue_wait_ms": 6250028.547504189,
+          "sql_execution_ms": 76826.24093962659,
+          "dbapi_commit_ms": 1395.5871063662926,
+          "session_commit_including_flush_ms": 1571.7773208452854,
+          "core_ingress_ms": 106854.86688111268,
+          "http_roundtrip_ms": 107625.95466490893,
+          "outbox_drain_ms": 110198.77491802617
+        },
+        "measured_decisions": 2000,
+        "decisions_per_second": 80.89131401560789,
+        "pipeline_decisions_per_second": 14.821165258706612,
+        "pipeline_facts_per_second": 133.3904873283595,
+        "wall_elapsed_seconds": 134.94215637499292,
+        "outbox_backlog_peak": 180,
+        "reason_counts": {
+          "NO_THRESHOLD": 2000
+        }
+      },
+      "recovery": {
+        "backlog_before_restart": 180,
+        "backlog_after_restart": 180,
+        "backlog_final": 0,
+        "committed_before_restart": 100,
+        "replayed_facts": 100,
+        "lost_ack_transport_errors": 1,
+        "restart_and_drain_ms": 1139.7635829926003,
+        "worker_decisions": 2300,
+        "core_decisions": 2300,
+        "sdk_dispatches_before": 20,
+        "sdk_dispatches_after": 20,
+        "core_orders_before": 20,
+        "core_orders_after": 20,
+        "immutable_envelopes_preserved": true
+      }
+    },
+    {
+      "instruments": 50,
+      "postgresql_version": "16.15",
+      "warmup": 3,
+      "iterations": 100,
+      "batch_size": 100,
+      "deadline_ms": 0,
+      "retry_limit": 0,
+      "initial_buy_filled": {
+        "decision_tick_ms": {
+          "samples": 25,
+          "min": 502.732458000537,
+          "p50": 559.2385830095736,
+          "p95": 630.5442080047214,
+          "p99": 644.9615000019548,
+          "max": 644.9615000019548
+        },
+        "queue_wait_ms": {
+          "samples": 11850,
+          "min": 250.94362499658018,
+          "p50": 1384.9069369971403,
+          "p95": 2722.100916013005,
+          "p99": 2832.485082995845,
+          "max": 2933.4977910039015
+        },
+        "sql_execution_ms": {
+          "samples": 138700,
+          "min": 0.18562500190455467,
+          "p50": 0.3395409876247868,
+          "p95": 0.5677920125890523,
+          "p99": 0.7062090007821098,
+          "max": 3.8304580084513873
+        },
+        "dbapi_commit_ms": {
+          "samples": 6250,
+          "min": 0.1888330007204786,
+          "p50": 0.3174579978804104,
+          "p95": 0.41366599907632917,
+          "p99": 0.4956250049872324,
+          "max": 6.81808301305864
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 6250,
+          "min": 0.22129100398160517,
+          "p50": 0.35354149440536276,
+          "p95": 0.4579999949783087,
+          "p99": 0.5467500013764948,
+          "max": 6.873582999105565
+        },
+        "core_ingress_ms": {
+          "samples": 125,
+          "min": 455.1007919944823,
+          "p50": 601.0376670019468,
+          "p95": 659.7746249899501,
+          "p99": 685.2451250015292,
+          "max": 708.7445840006694
+        },
+        "sql_statements_per_request": {
+          "samples": 125,
+          "min": 880,
+          "p50": 1158,
+          "p95": 1226,
+          "p99": 1246,
+          "max": 1250
+        },
+        "dbapi_commits_per_request": {
+          "samples": 125,
+          "min": 50,
+          "p50": 50,
+          "p95": 50,
+          "p99": 50,
+          "max": 50
+        },
+        "facts_per_request": {
+          "samples": 125,
+          "min": 74,
+          "p50": 100,
+          "p95": 100,
+          "p99": 100,
+          "max": 100
+        },
+        "http_roundtrip_ms": {
+          "samples": 125,
+          "min": 458.08708399999887,
+          "p50": 604.8549159895629,
+          "p95": 664.4455839996226,
+          "p99": 689.4509580015438,
+          "max": 712.7925829991
+        },
+        "outbox_drain_ms": {
+          "samples": 25,
+          "min": 2967.7101660054177,
+          "p50": 3068.6255839973455,
+          "p95": 3222.929875002592,
+          "p99": 3254.05433299602,
+          "max": 3254.05433299602
+        },
+        "sql_statement_count": 138700,
+        "delivered_facts": 11850,
+        "stage_totals_ms": {
+          "decision_tick_ms": 14139.7294170456,
+          "queue_wait_ms": 16669295.541881336,
+          "sql_execution_ms": 50858.20809970028,
+          "dbapi_commit_ms": 2074.368716479512,
+          "session_commit_including_flush_ms": 2303.0040269513847,
+          "core_ingress_ms": 73437.9831640399,
+          "http_roundtrip_ms": 73884.99807995686,
+          "outbox_drain_ms": 77085.7586680213
+        },
+        "measured_decisions": 1250,
+        "decisions_per_second": 88.40338899930512,
+        "pipeline_decisions_per_second": 13.701599504985486,
+        "pipeline_facts_per_second": 129.89116330726242,
+        "wall_elapsed_seconds": 91.23022458401101,
+        "outbox_backlog_peak": 474,
+        "broker_fills": 50
+      },
+      "wait": {
+        "decision_tick_ms": {
+          "samples": 100,
+          "min": 445.96233300399035,
+          "p50": 535.4151044957689,
+          "p95": 620.9454170020763,
+          "p99": 730.7408749911701,
+          "max": 733.392708003521
+        },
+        "queue_wait_ms": {
+          "samples": 45000,
+          "min": 215.0030000047991,
+          "p50": 1345.5601669993484,
+          "p95": 2665.5996250046883,
+          "p99": 2847.8586669953074,
+          "max": 3241.238542002975
+        },
+        "sql_execution_ms": {
+          "samples": 530000,
+          "min": 0.17908400332089514,
+          "p50": 0.33433400676585734,
+          "p95": 0.5670410027960315,
+          "p99": 0.7145419949665666,
+          "max": 45.16458300349768
+        },
+        "dbapi_commit_ms": {
+          "samples": 25000,
+          "min": 0.17304100038018078,
+          "p50": 0.31170900183496997,
+          "p95": 0.41237499681301415,
+          "p99": 0.5168329953448847,
+          "max": 5.823125000461005
+        },
+        "session_commit_including_flush_ms": {
+          "samples": 25000,
+          "min": 0.19891701231244951,
+          "p50": 0.3453329991316423,
+          "p95": 0.45929200132377446,
+          "p99": 0.5821670056320727,
+          "max": 5.8865419996436685
+        },
+        "core_ingress_ms": {
+          "samples": 500,
+          "min": 277.1182080032304,
+          "p50": 592.5701454980299,
+          "p95": 703.5855420108419,
+          "p99": 759.2552499991143,
+          "max": 1023.6877499992261
+        },
+        "sql_statements_per_request": {
+          "samples": 500,
+          "min": 600,
+          "p50": 1150.0,
+          "p95": 1250,
+          "p99": 1250,
+          "max": 1250
+        },
+        "dbapi_commits_per_request": {
+          "samples": 500,
+          "min": 50,
+          "p50": 50.0,
+          "p95": 50,
+          "p99": 50,
+          "max": 50
+        },
+        "facts_per_request": {
+          "samples": 500,
+          "min": 50,
+          "p50": 100.0,
+          "p95": 100,
+          "p99": 100,
+          "max": 100
+        },
+        "http_roundtrip_ms": {
+          "samples": 500,
+          "min": 279.4012500089593,
+          "p50": 596.265416505048,
+          "p95": 708.1646250007907,
+          "p99": 764.7995839943178,
+          "max": 1028.1399169907672
+        },
+        "outbox_drain_ms": {
+          "samples": 100,
+          "min": 2625.8437499927823,
+          "p50": 2918.5733955018804,
+          "p95": 3172.383875004016,
+          "p99": 3430.6500000093365,
+          "max": 3442.0249160029925
+        },
+        "sql_statement_count": 530000,
+        "delivered_facts": 45000,
+        "stage_totals_ms": {
+          "decision_tick_ms": 54678.148210950894,
+          "queue_wait_ms": 59267486.24555965,
+          "sql_execution_ms": 191610.7493724412,
+          "dbapi_commit_ms": 8109.148825111333,
+          "session_commit_including_flush_ms": 9000.045105975005,
+          "core_ingress_ms": 278384.431982151,
+          "http_roundtrip_ms": 280195.5209138541,
+          "outbox_drain_ms": 292852.07945703587
+        },
+        "measured_decisions": 5000,
+        "decisions_per_second": 91.4442087670885,
+        "pipeline_decisions_per_second": 14.386489502117431,
+        "pipeline_facts_per_second": 129.47840551905688,
+        "wall_elapsed_seconds": 347.54830212499655,
+        "outbox_backlog_peak": 450,
+        "reason_counts": {
+          "NO_THRESHOLD": 5000
+        }
+      },
+      "recovery": {
+        "backlog_before_restart": 450,
+        "backlog_after_restart": 450,
+        "backlog_final": 0,
+        "committed_before_restart": 100,
+        "replayed_facts": 100,
+        "lost_ack_transport_errors": 1,
+        "restart_and_drain_ms": 3877.140958007658,
+        "worker_decisions": 6500,
+        "core_decisions": 6500,
+        "sdk_dispatches_before": 50,
+        "sdk_dispatches_after": 50,
+        "core_orders_before": 50,
+        "core_orders_after": 50,
+        "immutable_envelopes_preserved": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+services:
+  trading_session:
+    name: moex_sentinel.services.trading_sessions.TradingSessionService
+    methods:
+      - name: status
+        returns: TradingSessionsStatus
+        description: |
+          Returns aggregated trading status for all active automation instruments.
+    models:
+      TradingSessionsStatus:
+        fields:
+          - name: status
+            type: str
+          - name: total
+            type: int
+          - name: open
+            type: int
+          - name: closed
+            type: int
+          - name: unavailable
+            type: int
+
+  automation_usecases:
+    name: moex_sentinel.usecases.automations
+    methods:
+      - name: ViewTradingAutomationDetailsUsecase.execute
+        returns: TradingAutomationDetails
+        description: |
+          Loads details for one automation, including broker operations and 2-hour
+          minute candles.
+      - name: ViewTradingAutomationStatusesUsecase.execute
+        returns: TradingAutomationStatuses
+        description: |
+          Returns all found automations plus missing ids from requested batch.
+
+  broker_service:
+    name: moex_sentinel.services.brokers.BrokerConfigurationService
+    methods:
+      - name: view_settings
+        returns: BrokerSettings
+      - name: save_settings
+        returns: Broker
+      - name: delete_settings
+        returns: None
+
+  trading_session_api_view:
+    name: moex_sentinel.views.automations.trading_sessions_status
+    methods:
+      - name: GET /trading-sessions/status
+        returns: TradingSessionsStatusSchema
+        description: |
+          Exposes current aggregated trading session status for front-end.
+
+  broker_settings_usecases:
+    name: moex_sentinel.usecases.brokers
+    methods:
+      - name: ViewBrokerSettingsUsecase.execute
+        returns: BrokerSettings
+        description: |
+          Returns persisted broker settings if configured.
+      - name: SaveBrokerSettingsUsecase.execute
+        returns: Broker
+        description: |
+          Creates or updates broker settings, including token/env/adapters.
+      - name: DeleteBrokerSettingsUsecase.execute
+        returns: None
+        description: |
+          Deletes stored broker settings by broker identifier.
+
+  dashboard_usecases:
+    name: moex_sentinel.usecases.dashboard
+    methods:
+      - name: ViewAnalyticsUsecase.execute
+        returns: AnalyticsView
+        description: |
+          Returns dashboard KPI snapshot with balance and PnL deltas.
+      - name: ViewVolatileInstrumentsUsecase.execute
+        returns: Tuple[VolatileInstrumentView, ...]
+        description: |
+          Returns watchlist with volatility-filtered instruments.
+      - name: ViewOpenPositionsUsecase.execute
+        returns: Tuple[OpenPositionView, ...]
+        description: |
+          Returns all currently open trading positions.
+      - name: ViewPositionDetailsUsecase.execute
+        returns: PositionDetailsView
+        description: |
+          Returns full details for selected position including operation timeline.

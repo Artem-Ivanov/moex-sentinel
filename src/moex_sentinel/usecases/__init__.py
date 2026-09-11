@@ -1,0 +1,1 @@
+"""Atomic application use cases."""

@@ -1,0 +1,14 @@
+{
+  "observed_from": "2026-09-09T13:05:50.164014+00:00",
+  "observed_until": "2026-09-09T13:15:47.177581+00:00",
+  "duration_seconds": 597.013567,
+  "samples": 120,
+  "decisions_delta": 1158,
+  "samples_without_decision_progress": 13,
+  "backlog_max": 54,
+  "empty_queue_samples": 27,
+  "oldest_pending_age_max_ms": 1560.218,
+  "decision_age_max_ms": 69038.218,
+  "retained_outbox_retry_count_max": 0,
+  "outbox_final": {}
+}

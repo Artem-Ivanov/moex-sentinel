@@ -1,0 +1,3159 @@
+openapi: 3.1.0
+info:
+  title: MOEX Sentinel API
+  version: 0.1.0
+paths:
+  /api/health:
+    get:
+      summary: Health
+      description: Report HTTP and database readiness without leaking connection errors.
+      operationId: health_api_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/environment:
+    get:
+      tags:
+      - environment
+      summary: View Environment
+      operationId: view_environment_api_environment_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentSchema'
+    put:
+      tags:
+      - environment
+      summary: Switch Environment
+      operationId: switch_environment_api_environment_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SwitchEnvironmentSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers:
+    get:
+      tags:
+      - brokers
+      summary: View Broker Settings
+      operationId: view_broker_settings_api_brokers_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrokerSettingsSchema'
+    post:
+      tags:
+      - brokers
+      summary: Create Broker Settings
+      operationId: create_broker_settings_api_brokers_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrokerDraftSchema'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrokerSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}:
+    put:
+      tags:
+      - brokers
+      summary: Replace Broker Settings
+      operationId: replace_broker_settings_api_brokers__broker_id__put
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrokerDraftSchema'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrokerSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - brokers
+      summary: Delete Broker Settings
+      operationId: delete_broker_settings_api_brokers__broker_id__delete
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/check:
+    post:
+      tags:
+      - brokers
+      summary: Check Broker Connection
+      operationId: check_broker_connection_api_brokers__broker_id__check_post
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/moex_sentinel__views__brokers__BrokerConnectionSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/prepare-test-environment:
+    post:
+      tags:
+      - brokers
+      summary: Prepare Test Environment
+      operationId: prepare_test_environment_api_brokers__broker_id__prepare_test_environment_post
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisioningSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/analytics:
+    get:
+      tags:
+      - dashboard
+      summary: Analytics
+      operationId: analytics_api_analytics_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Analytics Api Analytics Get
+  /api/volatile-instruments:
+    get:
+      tags:
+      - dashboard
+      summary: Volatile Instruments
+      operationId: volatile_instruments_api_volatile_instruments_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Volatile Instruments Api Volatile Instruments Get
+  /api/positions/{position_id}:
+    get:
+      tags:
+      - dashboard
+      summary: Position Details
+      operationId: position_details_api_positions__position_id__get
+      parameters:
+      - name: position_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Position Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                title: Response Position Details Api Positions  Position Id  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/accounts:
+    get:
+      tags:
+      - portfolio
+      summary: Broker Accounts
+      operationId: broker_accounts_api_brokers__broker_id__accounts_get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountsResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/portfolio/summary:
+    get:
+      tags:
+      - portfolio
+      summary: Portfolio Summary
+      operationId: portfolio_summary_api_portfolio_summary_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountsResponseSchema'
+  /api/positions:
+    get:
+      tags:
+      - portfolio
+      summary: Open Positions
+      operationId: open_positions_api_positions_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PositionsResponseSchema'
+  /api/operations:
+    get:
+      tags:
+      - portfolio
+      summary: Recent Operations
+      operationId: recent_operations_api_operations_get
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 500
+          minimum: 1
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationsResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading/summary:
+    get:
+      tags:
+      - trading
+      summary: Trading Summary
+      operationId: trading_summary_api_trading_summary_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TradingSummarySchema'
+  /api/brokers/{broker_id}/market/instruments:
+    get:
+      tags:
+      - market-data
+      summary: Search Instruments
+      operationId: search_instruments_api_brokers__broker_id__market_instruments_get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: query
+        in: query
+        required: false
+        schema:
+          type: string
+          default: ''
+          title: Query
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 20
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstrumentSearchResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/market/instruments/{instrument_id}/candles:
+    get:
+      tags:
+      - market-data
+      summary: Historic Candles
+      operationId: historic_candles_api_brokers__broker_id__market_instruments__instrument_id__candles_get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: instrument_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Instrument Id
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+          title: From
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+          title: To
+      - name: interval
+        in: query
+        required: true
+        schema:
+          $ref: '#/components/schemas/CandleInterval'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoricCandlesResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/market/instruments/{instrument_id}:
+    get:
+      tags:
+      - market-data
+      summary: Market Instrument
+      operationId: market_instrument_api_brokers__broker_id__market_instruments__instrument_id__get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: instrument_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Instrument Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstrumentSnapshotSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/instruments/synchronize:
+    post:
+      tags:
+      - instruments
+      summary: Synchronize
+      operationId: synchronize_api_brokers__broker_id__instruments_synchronize_post
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationResultSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/instruments:
+    get:
+      tags:
+      - instruments
+      summary: Instruments
+      operationId: instruments_api_brokers__broker_id__instruments_get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: category
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Category
+      - name: include_inactive
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Include Inactive
+      - name: selected_only
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Selected Only
+      - name: lot_price_from
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Lot Price From
+      - name: lot_price_to
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Lot Price To
+      - name: currency
+        in: query
+        required: false
+        schema:
+          type: string
+          default: RUB
+          title: Currency
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogListResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/instruments/{instrument_id}/selection:
+    put:
+      tags:
+      - instruments
+      summary: Set Selection
+      operationId: set_selection_api_brokers__broker_id__instruments__instrument_id__selection_put
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: instrument_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Instrument Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstrumentSelectionSchema'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogInstrumentSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/brokers/{broker_id}/instruments/{instrument_id}:
+    get:
+      tags:
+      - instruments
+      summary: Instrument Details
+      operationId: instrument_details_api_brokers__broker_id__instruments__instrument_id__get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: instrument_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Instrument Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstrumentDetailsSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/instruments/{broker_id}/{instrument_id}/trade:
+    post:
+      tags:
+      - trading-automations
+      summary: Create Automation
+      operationId: create_automation_api_instruments__broker_id___instrument_id__trade_post
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      - name: instrument_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Instrument Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAutomationSchema'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations:
+    get:
+      tags:
+      - trading-automations
+      summary: List Automations
+      operationId: list_automations_api_trading_automations_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationListSchema'
+  /api/trading-sessions/status:
+    get:
+      tags:
+      - trading-automations
+      summary: Trading Sessions Status
+      operationId: trading_sessions_status_api_trading_sessions_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TradingSessionsStatusSchema'
+  /api/trading-automations/{automation_id}:
+    get:
+      tags:
+      - trading-automations
+      summary: View Automation
+      operationId: view_automation_api_trading_automations__automation_id__get
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/details:
+    get:
+      tags:
+      - trading-automations
+      summary: View Automation Details
+      operationId: view_automation_details_api_trading_automations__automation_id__details_get
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TradingAutomationDetailsSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/audit:
+    get:
+      tags:
+      - trading-automations
+      summary: View Automation Audit
+      operationId: view_automation_audit_api_trading_automations__automation_id__audit_get
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 100
+          title: Limit
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusinessAuditListSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/strategy:
+    patch:
+      tags:
+      - trading-automations
+      summary: Update Strategy
+      operationId: update_strategy_api_trading_automations__automation_id__strategy_patch
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAutomationStrategySchema'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/hold:
+    post:
+      tags:
+      - trading-automations
+      summary: Hold Automation
+      operationId: hold_automation_api_trading_automations__automation_id__hold_post
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/resume:
+    post:
+      tags:
+      - trading-automations
+      summary: Resume Automation
+      operationId: resume_automation_api_trading_automations__automation_id__resume_post
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/trading-automations/{automation_id}/close:
+    post:
+      tags:
+      - trading-automations
+      summary: Close Automation
+      operationId: close_automation_api_trading_automations__automation_id__close_post
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/strategy-templates:
+    get:
+      tags:
+      - strategy-templates
+      summary: List Templates
+      operationId: list_templates_api_strategy_templates_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StrategyTemplateListSchema'
+    post:
+      tags:
+      - strategy-templates
+      summary: Create Template
+      operationId: create_template_api_strategy_templates_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StrategyTemplateWriteSchema'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StrategyTemplateSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/strategy-templates/{template_id}:
+    put:
+      tags:
+      - strategy-templates
+      summary: Update Template
+      operationId: update_template_api_strategy_templates__template_id__put
+      parameters:
+      - name: template_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Template Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StrategyTemplateUpdateSchema'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StrategyTemplateSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - strategy-templates
+      summary: Delete Template
+      operationId: delete_template_api_strategy_templates__template_id__delete
+      parameters:
+      - name: template_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Template Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/commands:
+    post:
+      tags:
+      - internal-automaton
+      summary: Claim Commands
+      operationId: claim_commands_internal_automaton_commands_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimCommandsRequestSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimCommandsResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/events:
+    post:
+      tags:
+      - internal-automaton
+      summary: Publish Events
+      operationId: publish_events_internal_automaton_events_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishEventsRequestSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishEventsResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/audit-events:
+    post:
+      tags:
+      - internal-automaton
+      summary: Publish Audit Events
+      operationId: publish_audit_events_internal_automaton_audit_events_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishAuditRequestSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishAuditResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/heartbeats:
+    post:
+      tags:
+      - internal-automaton
+      summary: Record Heartbeat
+      operationId: record_heartbeat_internal_automaton_heartbeats_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequestSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/automations/statuses:
+    post:
+      tags:
+      - internal-automaton
+      summary: Automation Statuses
+      operationId: automation_statuses_internal_automaton_automations_statuses_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutomationStatusesRequestSchema'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationStatusesResponseSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/automations/{automation_id}:
+    get:
+      tags:
+      - internal-automaton
+      summary: Automation Status
+      operationId: automation_status_internal_automaton_automations__automation_id__get
+      parameters:
+      - name: automation_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Automation Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutomationSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /internal/automaton/brokers/{broker_id}/connection:
+    get:
+      tags:
+      - internal-automaton
+      summary: Broker Connection
+      operationId: broker_connection_internal_automaton_brokers__broker_id__connection_get
+      parameters:
+      - name: broker_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Broker Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/moex_sentinel__views__schemas__automations__BrokerConnectionSchema'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    AccountSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        broker_name:
+          type: string
+          title: Broker Name
+        account_id:
+          type: string
+          title: Account Id
+        name:
+          type: string
+          title: Name
+        status:
+          type: string
+          title: Status
+        account_type:
+          type: string
+          title: Account Type
+        total_amount:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        free_cash:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        realized_pnl:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        unrealized_pnl:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - broker_name
+      - account_id
+      - name
+      - status
+      - account_type
+      - total_amount
+      - free_cash
+      - realized_pnl
+      - unrealized_pnl
+      title: AccountSchema
+    AccountsResponseSchema:
+      properties:
+        accounts:
+          items:
+            $ref: '#/components/schemas/AccountSchema'
+          type: array
+          title: Accounts
+        total_amounts:
+          items:
+            $ref: '#/components/schemas/MoneySchema'
+          type: array
+          title: Total Amounts
+        total_free_cash:
+          items:
+            $ref: '#/components/schemas/MoneySchema'
+          type: array
+          title: Total Free Cash
+        errors:
+          items:
+            $ref: '#/components/schemas/ReadErrorSchema'
+          type: array
+          title: Errors
+      additionalProperties: false
+      type: object
+      required:
+      - accounts
+      - total_amounts
+      - total_free_cash
+      - errors
+      title: AccountsResponseSchema
+    AutomationCommandSchema:
+      properties:
+        automation_id:
+          type: string
+          title: Automation Id
+        broker_id:
+          type: string
+          title: Broker Id
+        account_id:
+          type: string
+          title: Account Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        lot_size:
+          type: integer
+          title: Lot Size
+        min_price_increment:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Min Price Increment
+        state:
+          $ref: '#/components/schemas/AutomationState'
+        revision:
+          type: integer
+          title: Revision
+        last_sequence_number:
+          type: integer
+          title: Last Sequence Number
+        resume_requested:
+          type: boolean
+          title: Resume Requested
+        strategy:
+          $ref: '#/components/schemas/StrategySchema-Output'
+      additionalProperties: false
+      type: object
+      required:
+      - automation_id
+      - broker_id
+      - account_id
+      - instrument_id
+      - lot_size
+      - min_price_increment
+      - state
+      - revision
+      - last_sequence_number
+      - resume_requested
+      - strategy
+      title: AutomationCommandSchema
+    AutomationEventSchema:
+      properties:
+        event_id:
+          type: string
+          title: Event Id
+        automation_id:
+          type: string
+          title: Automation Id
+        sequence_number:
+          type: integer
+          title: Sequence Number
+        expected_revision:
+          type: integer
+          title: Expected Revision
+        state:
+          $ref: '#/components/schemas/AutomationState'
+        safe_message:
+          type: string
+          title: Safe Message
+        occurred_at:
+          type: string
+          format: date-time
+          title: Occurred At
+        metadata:
+          additionalProperties: true
+          type: object
+          title: Metadata
+      additionalProperties: false
+      type: object
+      required:
+      - event_id
+      - automation_id
+      - sequence_number
+      - expected_revision
+      - state
+      - safe_message
+      - occurred_at
+      title: AutomationEventSchema
+    AutomationListSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/AutomationSchema'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: AutomationListSchema
+    AutomationSchema:
+      properties:
+        id:
+          type: string
+          title: Id
+        broker_id:
+          type: string
+          title: Broker Id
+        account_id:
+          type: string
+          title: Account Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        state:
+          $ref: '#/components/schemas/AutomationState'
+        suspended_from_state:
+          anyOf:
+          - $ref: '#/components/schemas/AutomationState'
+          - type: 'null'
+        revision:
+          type: integer
+          title: Revision
+        last_sequence_number:
+          type: integer
+          title: Last Sequence Number
+        resume_requested:
+          type: boolean
+          title: Resume Requested
+        strategy:
+          $ref: '#/components/schemas/StrategySchema-Output'
+        quantity_lots:
+          type: integer
+          title: Quantity Lots
+        average_price:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Average Price
+        invested_amount:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Invested Amount
+        realized_pnl:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Realized Pnl
+        unrealized_pnl:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Unrealized Pnl
+        net_pnl:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Net Pnl
+        actual_commissions:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Actual Commissions
+        broker_name:
+          type: string
+          title: Broker Name
+        ticker:
+          type: string
+          title: Ticker
+        instrument_name:
+          type: string
+          title: Instrument Name
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - broker_id
+      - account_id
+      - instrument_id
+      - state
+      - suspended_from_state
+      - revision
+      - last_sequence_number
+      - resume_requested
+      - strategy
+      - quantity_lots
+      - average_price
+      - invested_amount
+      - realized_pnl
+      - unrealized_pnl
+      - net_pnl
+      - actual_commissions
+      - broker_name
+      - ticker
+      - instrument_name
+      title: AutomationSchema
+    AutomationState:
+      type: string
+      enum:
+      - IN_QUEUE
+      - OPENING
+      - IN_WORK
+      - HOLD
+      - CLOSED
+      - STOPPED
+      - COMPLETED
+      title: AutomationState
+    AutomationStatusesRequestSchema:
+      properties:
+        automation_ids:
+          items:
+            type: string
+          type: array
+          title: Automation Ids
+      additionalProperties: false
+      type: object
+      required:
+      - automation_ids
+      title: AutomationStatusesRequestSchema
+    AutomationStatusesResponseSchema:
+      properties:
+        automations:
+          items:
+            $ref: '#/components/schemas/AutomationSchema'
+          type: array
+          title: Automations
+        missing_automation_ids:
+          items:
+            type: string
+          type: array
+          title: Missing Automation Ids
+      additionalProperties: false
+      type: object
+      required:
+      - automations
+      - missing_automation_ids
+      title: AutomationStatusesResponseSchema
+    BrokerAdapterSchema:
+      properties:
+        adapter_code:
+          type: string
+          title: Adapter Code
+        provider_code:
+          type: string
+          title: Provider Code
+        environment_code:
+          type: string
+          title: Environment Code
+        fields:
+          items:
+            $ref: '#/components/schemas/BrokerFieldDefinitionSchema'
+          type: array
+          title: Fields
+      type: object
+      required:
+      - adapter_code
+      - provider_code
+      - environment_code
+      - fields
+      title: BrokerAdapterSchema
+    BrokerDraftSchema:
+      properties:
+        display_name:
+          type: string
+          title: Display Name
+        provider_code:
+          type: string
+          title: Provider Code
+        environment_code:
+          type: string
+          title: Environment Code
+        adapter_code:
+          type: string
+          title: Adapter Code
+        enabled:
+          type: boolean
+          title: Enabled
+        fields:
+          items:
+            $ref: '#/components/schemas/BrokerFieldSchema'
+          type: array
+          title: Fields
+        is_test:
+          type: boolean
+          title: Is Test
+        initial_balance:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Initial Balance
+      additionalProperties: false
+      type: object
+      required:
+      - display_name
+      - provider_code
+      - environment_code
+      - adapter_code
+      - enabled
+      - fields
+      - is_test
+      - initial_balance
+      title: BrokerDraftSchema
+    CurrencyTradingSummarySchema:
+      properties:
+        currency:
+          type: string
+          title: Currency
+        portfolio_value:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Portfolio Value
+        free_cash:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Free Cash
+        pnl_24h:
+          $ref: '#/components/schemas/TradingPnlPeriodSchema'
+        pnl_7d:
+          $ref: '#/components/schemas/TradingPnlPeriodSchema'
+        pnl_30d:
+          $ref: '#/components/schemas/TradingPnlPeriodSchema'
+      additionalProperties: false
+      type: object
+      required:
+      - currency
+      - portfolio_value
+      - free_cash
+      - pnl_24h
+      - pnl_7d
+      - pnl_30d
+      title: CurrencyTradingSummarySchema
+    BrokerFieldDefinitionSchema:
+      properties:
+        name:
+          type: string
+          title: Name
+        required:
+          type: boolean
+          title: Required
+        default_value:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Default Value
+      type: object
+      required:
+      - name
+      - required
+      - default_value
+      title: BrokerFieldDefinitionSchema
+    BrokerFieldSchema:
+      properties:
+        name:
+          type: string
+          title: Name
+        value:
+          type: string
+          title: Value
+      additionalProperties: false
+      type: object
+      required:
+      - name
+      - value
+      title: BrokerFieldSchema
+    BrokerSchema:
+      properties:
+        id:
+          type: string
+          title: Id
+        display_name:
+          type: string
+          title: Display Name
+        provider_code:
+          type: string
+          title: Provider Code
+        environment_code:
+          type: string
+          title: Environment Code
+        adapter_code:
+          type: string
+          title: Adapter Code
+        enabled:
+          type: boolean
+          title: Enabled
+        is_test:
+          type: boolean
+          title: Is Test
+        initial_balance:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Initial Balance
+        test_account_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Test Account Id
+        test_account_funded:
+          type: boolean
+          title: Test Account Funded
+        fields:
+          items:
+            $ref: '#/components/schemas/BrokerFieldSchema'
+          type: array
+          title: Fields
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+      type: object
+      required:
+      - id
+      - display_name
+      - provider_code
+      - environment_code
+      - adapter_code
+      - enabled
+      - is_test
+      - initial_balance
+      - test_account_id
+      - test_account_funded
+      - fields
+      - created_at
+      - updated_at
+      title: BrokerSchema
+    BrokerSettingsSchema:
+      properties:
+        adapters:
+          items:
+            $ref: '#/components/schemas/BrokerAdapterSchema'
+          type: array
+          title: Adapters
+        brokers:
+          items:
+            $ref: '#/components/schemas/BrokerSchema'
+          type: array
+          title: Brokers
+      type: object
+      required:
+      - adapters
+      - brokers
+      title: BrokerSettingsSchema
+    BusinessAuditEventSchema:
+      properties:
+        event_id:
+          type: string
+          title: Event Id
+        process_id:
+          type: string
+          title: Process Id
+        parent_process_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Process Id
+        automation_id:
+          type: string
+          title: Automation Id
+        broker_id:
+          type: string
+          title: Broker Id
+        account_id:
+          type: string
+          title: Account Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        level:
+          $ref: '#/components/schemas/BusinessAuditLevel'
+        stage:
+          $ref: '#/components/schemas/BusinessAuditStage'
+        message:
+          type: string
+          title: Message
+        data:
+          additionalProperties: true
+          type: object
+          title: Data
+        occurred_at:
+          type: string
+          format: date-time
+          title: Occurred At
+        critical:
+          type: boolean
+          title: Critical
+          default: false
+      additionalProperties: false
+      type: object
+      required:
+      - event_id
+      - process_id
+      - parent_process_id
+      - automation_id
+      - broker_id
+      - account_id
+      - instrument_id
+      - level
+      - stage
+      - message
+      - occurred_at
+      title: BusinessAuditEventSchema
+    BusinessAuditLevel:
+      type: string
+      enum:
+      - INFO
+      - WARNING
+      - ERROR
+      title: BusinessAuditLevel
+    BusinessAuditListSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/BusinessAuditEventSchema'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: BusinessAuditListSchema
+    BusinessAuditStage:
+      type: string
+      enum:
+      - MARKET_DATA_RECEIVED
+      - TRADING_CYCLE_UPDATED
+      - POSITION_RECONCILIATION_STARTED
+      - POSITION_RECONCILED
+      - POSITION_RECONCILIATION_FAILED
+      - POSITION_SNAPSHOT_RECEIVED
+      - STRATEGY_CALCULATION_STARTED
+      - STRATEGY_DECISION_MADE
+      - BROKER_INTENT_CREATED
+      - BROKER_ORDER_DISPATCH_STARTED
+      - BROKER_ORDER_DISPATCH_RESULT
+      - BROKER_ORDER_TERMINAL_STATE
+      - POSITION_STATE_UPDATED
+      - TRADING_STEP_COMPLETED
+      - TRADING_STEP_FAILED
+      - AUTOMATION_MOVED_TO_HOLD
+      - AUDIT_DELIVERY_RETRY_SCHEDULED
+      - WORKER_RECOVERY_STARTED
+      - WORKER_RECOVERY_COMPLETED
+      - CORE_BATCH_PUBLISH_STARTED
+      - CORE_BATCH_PUBLISH_COMPLETED
+      - CORE_BATCH_PUBLISH_FAILED
+      title: BusinessAuditStage
+    CandleInterval:
+      type: string
+      enum:
+      - 1_MIN
+      - 5_MIN
+      - 15_MIN
+      - HOUR
+      - DAY
+      title: CandleInterval
+    CatalogCategorySchema:
+      properties:
+        code:
+          type: string
+          title: Code
+        label:
+          type: string
+          title: Label
+        count:
+          type: integer
+          title: Count
+      additionalProperties: false
+      type: object
+      required:
+      - code
+      - label
+      - count
+      title: CatalogCategorySchema
+    CatalogInstrumentPriceSchema:
+      properties:
+        id:
+          type: string
+          title: Id
+        broker_id:
+          type: string
+          title: Broker Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        figi:
+          type: string
+          title: Figi
+        ticker:
+          type: string
+          title: Ticker
+        name:
+          type: string
+          title: Name
+        class_code:
+          type: string
+          title: Class Code
+        instrument_type:
+          type: string
+          title: Instrument Type
+        category:
+          type: string
+          title: Category
+        currency:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Currency
+        lot:
+          type: integer
+          title: Lot
+        min_price_increment:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Min Price Increment
+        api_trade_available:
+          type: boolean
+          title: Api Trade Available
+        is_active:
+          type: boolean
+          title: Is Active
+        is_selected:
+          type: boolean
+          title: Is Selected
+        first_seen_at:
+          type: string
+          format: date-time
+          title: First Seen At
+        last_seen_at:
+          type: string
+          format: date-time
+          title: Last Seen At
+        unit_price:
+          anyOf:
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Unit Price
+        lot_price:
+          anyOf:
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Lot Price
+        price_captured_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Price Captured At
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - broker_id
+      - instrument_id
+      - figi
+      - ticker
+      - name
+      - class_code
+      - instrument_type
+      - category
+      - currency
+      - lot
+      - min_price_increment
+      - api_trade_available
+      - is_active
+      - is_selected
+      - first_seen_at
+      - last_seen_at
+      - unit_price
+      - lot_price
+      - price_captured_at
+      title: CatalogInstrumentPriceSchema
+    CatalogInstrumentSchema:
+      properties:
+        id:
+          type: string
+          title: Id
+        broker_id:
+          type: string
+          title: Broker Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        figi:
+          type: string
+          title: Figi
+        ticker:
+          type: string
+          title: Ticker
+        name:
+          type: string
+          title: Name
+        class_code:
+          type: string
+          title: Class Code
+        instrument_type:
+          type: string
+          title: Instrument Type
+        category:
+          type: string
+          title: Category
+        currency:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Currency
+        lot:
+          type: integer
+          title: Lot
+        min_price_increment:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Min Price Increment
+        api_trade_available:
+          type: boolean
+          title: Api Trade Available
+        is_active:
+          type: boolean
+          title: Is Active
+        is_selected:
+          type: boolean
+          title: Is Selected
+        first_seen_at:
+          type: string
+          format: date-time
+          title: First Seen At
+        last_seen_at:
+          type: string
+          format: date-time
+          title: Last Seen At
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - broker_id
+      - instrument_id
+      - figi
+      - ticker
+      - name
+      - class_code
+      - instrument_type
+      - category
+      - currency
+      - lot
+      - min_price_increment
+      - api_trade_available
+      - is_active
+      - is_selected
+      - first_seen_at
+      - last_seen_at
+      title: CatalogInstrumentSchema
+    CatalogListResponseSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        items:
+          items:
+            $ref: '#/components/schemas/CatalogInstrumentPriceSchema'
+          type: array
+          title: Items
+        categories:
+          items:
+            $ref: '#/components/schemas/CatalogCategorySchema'
+          type: array
+          title: Categories
+        sync_state:
+          $ref: '#/components/schemas/CatalogSyncStateSchema'
+        currencies:
+          items:
+            type: string
+          type: array
+          title: Currencies
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - items
+      - categories
+      - sync_state
+      - currencies
+      title: CatalogListResponseSchema
+    CatalogSyncStateSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        status:
+          type: string
+          title: Status
+        last_attempt_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Attempt At
+        last_success_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Success At
+        safe_error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Safe Error
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - status
+      - last_attempt_at
+      - last_success_at
+      - safe_error
+      title: CatalogSyncStateSchema
+    ClaimCommandsRequestSchema:
+      properties:
+        worker_id:
+          type: string
+          title: Worker Id
+        limit:
+          type: integer
+          title: Limit
+          default: 10
+      additionalProperties: false
+      type: object
+      required:
+      - worker_id
+      title: ClaimCommandsRequestSchema
+    ClaimCommandsResponseSchema:
+      properties:
+        commands:
+          items:
+            $ref: '#/components/schemas/AutomationCommandSchema'
+          type: array
+          title: Commands
+      additionalProperties: false
+      type: object
+      required:
+      - commands
+      title: ClaimCommandsResponseSchema
+    CreateAutomationSchema:
+      properties:
+        account_id:
+          type: string
+          title: Account Id
+        strategy:
+          anyOf:
+          - $ref: '#/components/schemas/StrategySchema-Input'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - account_id
+      title: CreateAutomationSchema
+    EnvironmentSchema:
+      properties:
+        active_environment:
+          type: string
+          enum:
+          - TEST
+          - PROD
+          title: Active Environment
+        can_create_broker:
+          type: boolean
+          title: Can Create Broker
+        can_prepare_test_environment:
+          type: boolean
+          title: Can Prepare Test Environment
+      additionalProperties: false
+      type: object
+      required:
+      - active_environment
+      - can_create_broker
+      - can_prepare_test_environment
+      title: EnvironmentSchema
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - error
+          title: Status
+        service:
+          type: string
+          const: backend
+          title: Service
+          default: backend
+        version:
+          type: string
+          title: Version
+        database:
+          type: string
+          enum:
+          - ok
+          - error
+          title: Database
+      type: object
+      required:
+      - status
+      - version
+      - database
+      title: HealthResponse
+      description: Stable public health response.
+    HeartbeatRequestSchema:
+      properties:
+        worker_id:
+          type: string
+          title: Worker Id
+        occurred_at:
+          type: string
+          format: date-time
+          title: Occurred At
+      additionalProperties: false
+      type: object
+      required:
+      - worker_id
+      - occurred_at
+      title: HeartbeatRequestSchema
+    HeartbeatResponseSchema:
+      properties:
+        worker_id:
+          type: string
+          title: Worker Id
+        occurred_at:
+          type: string
+          format: date-time
+          title: Occurred At
+      additionalProperties: false
+      type: object
+      required:
+      - worker_id
+      - occurred_at
+      title: HeartbeatResponseSchema
+    HistoricCandleSchema:
+      properties:
+        instrument_id:
+          type: string
+          title: Instrument Id
+        open:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Open
+        high:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: High
+        low:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Low
+        close:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Close
+        volume:
+          type: integer
+          title: Volume
+        started_at:
+          type: string
+          format: date-time
+          title: Started At
+        is_complete:
+          type: boolean
+          title: Is Complete
+      additionalProperties: false
+      type: object
+      required:
+      - instrument_id
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - started_at
+      - is_complete
+      title: HistoricCandleSchema
+    HistoricCandlesResponseSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/HistoricCandleSchema'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: HistoricCandlesResponseSchema
+    InstrumentDetailsSchema:
+      properties:
+        broker_name:
+          type: string
+          title: Broker Name
+        instrument:
+          $ref: '#/components/schemas/CatalogInstrumentSchema'
+        last_price:
+          anyOf:
+          - $ref: '#/components/schemas/LastPriceSchema'
+          - type: 'null'
+        lot_price:
+          anyOf:
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Lot Price
+        sync_state:
+          $ref: '#/components/schemas/CatalogSyncStateSchema'
+      additionalProperties: false
+      type: object
+      required:
+      - broker_name
+      - instrument
+      - last_price
+      - lot_price
+      - sync_state
+      title: InstrumentDetailsSchema
+    InstrumentSearchResponseSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/InstrumentSnapshotSchema'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: InstrumentSearchResponseSchema
+    InstrumentSelectionSchema:
+      properties:
+        selected:
+          type: boolean
+          title: Selected
+      additionalProperties: false
+      type: object
+      required:
+      - selected
+      title: InstrumentSelectionSchema
+    InstrumentSnapshotSchema:
+      properties:
+        instrument_id:
+          type: string
+          title: Instrument Id
+        figi:
+          type: string
+          title: Figi
+        ticker:
+          type: string
+          title: Ticker
+        name:
+          type: string
+          title: Name
+        class_code:
+          type: string
+          title: Class Code
+        instrument_type:
+          type: string
+          title: Instrument Type
+        currency:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Currency
+        lot:
+          type: integer
+          title: Lot
+        api_trade_available:
+          type: boolean
+          title: Api Trade Available
+        last_price:
+          anyOf:
+          - $ref: '#/components/schemas/LastPriceSchema'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - instrument_id
+      - figi
+      - ticker
+      - name
+      - class_code
+      - instrument_type
+      - currency
+      - lot
+      - api_trade_available
+      - last_price
+      title: InstrumentSnapshotSchema
+    LastPriceSchema:
+      properties:
+        price:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Price
+        captured_at:
+          type: string
+          format: date-time
+          title: Captured At
+      additionalProperties: false
+      type: object
+      required:
+      - price
+      - captured_at
+      title: LastPriceSchema
+    MoneySchema:
+      properties:
+        amount:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Amount
+        currency:
+          type: string
+          title: Currency
+      additionalProperties: false
+      type: object
+      required:
+      - amount
+      - currency
+      title: MoneySchema
+    OperationSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        broker_name:
+          type: string
+          title: Broker Name
+        operation_id:
+          type: string
+          title: Operation Id
+        account_id:
+          type: string
+          title: Account Id
+        operation_type:
+          type: string
+          title: Operation Type
+        state:
+          type: string
+          title: State
+        occurred_at:
+          type: string
+          format: date-time
+          title: Occurred At
+        payment:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        price:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        quantity:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Quantity
+        commission:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        instrument_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Instrument Id
+        ticker:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ticker
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - broker_name
+      - operation_id
+      - account_id
+      - operation_type
+      - state
+      - occurred_at
+      - payment
+      - price
+      - quantity
+      - commission
+      - instrument_id
+      - ticker
+      title: OperationSchema
+    OperationsResponseSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/OperationSchema'
+          type: array
+          title: Items
+        errors:
+          items:
+            $ref: '#/components/schemas/ReadErrorSchema'
+          type: array
+          title: Errors
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      - errors
+      title: OperationsResponseSchema
+    PositionDetailsErrorSchema:
+      properties:
+        source:
+          type: string
+          title: Source
+        code:
+          type: string
+          title: Code
+        message:
+          type: string
+          title: Message
+      additionalProperties: false
+      type: object
+      required:
+      - source
+      - code
+      - message
+      title: PositionDetailsErrorSchema
+    PositionSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        broker_name:
+          type: string
+          title: Broker Name
+        account_id:
+          type: string
+          title: Account Id
+        instrument_id:
+          type: string
+          title: Instrument Id
+        ticker:
+          type: string
+          title: Ticker
+        quantity:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Quantity
+        average_price:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        current_price:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+        expected_yield:
+          anyOf:
+          - $ref: '#/components/schemas/MoneySchema'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - broker_name
+      - account_id
+      - instrument_id
+      - ticker
+      - quantity
+      - average_price
+      - current_price
+      - expected_yield
+      title: PositionSchema
+    PositionsResponseSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/PositionSchema'
+          type: array
+          title: Items
+        errors:
+          items:
+            $ref: '#/components/schemas/ReadErrorSchema'
+          type: array
+          title: Errors
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      - errors
+      title: PositionsResponseSchema
+    ProvisioningSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        account_id:
+          type: string
+          title: Account Id
+        amount:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Amount
+        currency:
+          type: string
+          title: Currency
+        reused:
+          type: boolean
+          title: Reused
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - account_id
+      - amount
+      - currency
+      - reused
+      title: ProvisioningSchema
+    PublishAuditRequestSchema:
+      properties:
+        events:
+          items:
+            $ref: '#/components/schemas/BusinessAuditEventSchema'
+          type: array
+          title: Events
+      additionalProperties: false
+      type: object
+      required:
+      - events
+      title: PublishAuditRequestSchema
+    PublishAuditResponseSchema:
+      properties:
+        accepted_event_ids:
+          items:
+            type: string
+          type: array
+          title: Accepted Event Ids
+      additionalProperties: false
+      type: object
+      required:
+      - accepted_event_ids
+      title: PublishAuditResponseSchema
+    PublishEventAcknowledgementSchema:
+      properties:
+        automation_id:
+          type: string
+          title: Automation Id
+        accepted_through_sequence:
+          type: integer
+          title: Accepted Through Sequence
+        current_revision:
+          type: integer
+          title: Current Revision
+      additionalProperties: false
+      type: object
+      required:
+      - automation_id
+      - accepted_through_sequence
+      - current_revision
+      title: PublishEventAcknowledgementSchema
+    PublishEventFailureSchema:
+      properties:
+        automation_id:
+          type: string
+          title: Automation Id
+        code:
+          type: string
+          title: Code
+      additionalProperties: false
+      type: object
+      required:
+      - automation_id
+      - code
+      title: PublishEventFailureSchema
+    PublishEventsRequestSchema:
+      properties:
+        events:
+          items:
+            $ref: '#/components/schemas/AutomationEventSchema'
+          type: array
+          title: Events
+      additionalProperties: false
+      type: object
+      required:
+      - events
+      title: PublishEventsRequestSchema
+    PublishEventsResponseSchema:
+      properties:
+        results:
+          items:
+            $ref: '#/components/schemas/PublishEventAcknowledgementSchema'
+          type: array
+          title: Results
+        failures:
+          items:
+            $ref: '#/components/schemas/PublishEventFailureSchema'
+          type: array
+          title: Failures
+      additionalProperties: false
+      type: object
+      required:
+      - results
+      title: PublishEventsResponseSchema
+    ReadErrorSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        broker_name:
+          type: string
+          title: Broker Name
+        account_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Account Id
+        code:
+          type: string
+          title: Code
+        message:
+          type: string
+          title: Message
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - broker_name
+      - account_id
+      - code
+      - message
+      title: ReadErrorSchema
+    ReconciliationResultSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        added:
+          type: integer
+          title: Added
+        updated:
+          type: integer
+          title: Updated
+        deactivated:
+          type: integer
+          title: Deactivated
+        synchronized_at:
+          type: string
+          format: date-time
+          title: Synchronized At
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - added
+      - updated
+      - deactivated
+      - synchronized_at
+      title: ReconciliationResultSchema
+    StrategySchema-Input:
+      properties:
+        currency:
+          type: string
+          title: Currency
+        max_position_amount:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Max Position Amount
+        initial_order_amount:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Initial Order Amount
+        stop_loss_percent:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Stop Loss Percent
+        take_profit_percent:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Take Profit Percent
+        averaging_step_percent:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Averaging Step Percent
+        averaging_order_lots:
+          type: integer
+          title: Averaging Order Lots
+        max_averaging_steps:
+          type: integer
+          title: Max Averaging Steps
+        partial_take_profit_percent:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Partial Take Profit Percent
+        partial_sell_percent:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Partial Sell Percent
+        max_partial_sell_steps:
+          type: integer
+          title: Max Partial Sell Steps
+        order_ttl_seconds:
+          type: integer
+          title: Order Ttl Seconds
+        order_retry_limit:
+          type: integer
+          title: Order Retry Limit
+        core_retry_limit:
+          type: integer
+          title: Core Retry Limit
+        enabled:
+          type: boolean
+          title: Enabled
+        minimum_free_cash:
+          anyOf:
+          - type: number
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Minimum Free Cash
+          default: '0'
+      additionalProperties: false
+      type: object
+      required:
+      - currency
+      - max_position_amount
+      - initial_order_amount
+      - stop_loss_percent
+      - take_profit_percent
+      - averaging_step_percent
+      - averaging_order_lots
+      - max_averaging_steps
+      - partial_take_profit_percent
+      - partial_sell_percent
+      - max_partial_sell_steps
+      - order_ttl_seconds
+      - order_retry_limit
+      - core_retry_limit
+      - enabled
+      title: StrategySchema
+    StrategySchema-Output:
+      properties:
+        currency:
+          type: string
+          title: Currency
+        max_position_amount:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Max Position Amount
+        initial_order_amount:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Initial Order Amount
+        stop_loss_percent:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Stop Loss Percent
+        take_profit_percent:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Take Profit Percent
+        averaging_step_percent:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Averaging Step Percent
+        averaging_order_lots:
+          type: integer
+          title: Averaging Order Lots
+        max_averaging_steps:
+          type: integer
+          title: Max Averaging Steps
+        partial_take_profit_percent:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Partial Take Profit Percent
+        partial_sell_percent:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Partial Sell Percent
+        max_partial_sell_steps:
+          type: integer
+          title: Max Partial Sell Steps
+        order_ttl_seconds:
+          type: integer
+          title: Order Ttl Seconds
+        order_retry_limit:
+          type: integer
+          title: Order Retry Limit
+        core_retry_limit:
+          type: integer
+          title: Core Retry Limit
+        enabled:
+          type: boolean
+          title: Enabled
+        minimum_free_cash:
+          type: string
+          pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          title: Minimum Free Cash
+          default: '0'
+      additionalProperties: false
+      type: object
+      required:
+      - currency
+      - max_position_amount
+      - initial_order_amount
+      - stop_loss_percent
+      - take_profit_percent
+      - averaging_step_percent
+      - averaging_order_lots
+      - max_averaging_steps
+      - partial_take_profit_percent
+      - partial_sell_percent
+      - max_partial_sell_steps
+      - order_ttl_seconds
+      - order_retry_limit
+      - core_retry_limit
+      - enabled
+      title: StrategySchema
+    StrategyTemplateListSchema:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/StrategyTemplateSchema'
+          type: array
+          title: Items
+      additionalProperties: false
+      type: object
+      required:
+      - items
+      title: StrategyTemplateListSchema
+    StrategyTemplateSchema:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        is_default:
+          type: boolean
+          title: Is Default
+        revision:
+          type: integer
+          title: Revision
+        values:
+          $ref: '#/components/schemas/StrategySchema-Output'
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - name
+      - is_default
+      - revision
+      - values
+      title: StrategyTemplateSchema
+    StrategyTemplateUpdateSchema:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_default:
+          type: boolean
+          title: Is Default
+        values:
+          $ref: '#/components/schemas/StrategySchema-Input'
+        expected_revision:
+          type: integer
+          title: Expected Revision
+      additionalProperties: false
+      type: object
+      required:
+      - name
+      - is_default
+      - values
+      - expected_revision
+      title: StrategyTemplateUpdateSchema
+    StrategyTemplateWriteSchema:
+      properties:
+        name:
+          type: string
+          title: Name
+        is_default:
+          type: boolean
+          title: Is Default
+        values:
+          $ref: '#/components/schemas/StrategySchema-Input'
+      additionalProperties: false
+      type: object
+      required:
+      - name
+      - is_default
+      - values
+      title: StrategyTemplateWriteSchema
+    SwitchEnvironmentSchema:
+      properties:
+        active_environment:
+          type: string
+          enum:
+          - TEST
+          - PROD
+          title: Active Environment
+      additionalProperties: false
+      type: object
+      required:
+      - active_environment
+      title: SwitchEnvironmentSchema
+    TradingAutomationDetailsSchema:
+      properties:
+        automation:
+          $ref: '#/components/schemas/AutomationSchema'
+        operations:
+          items:
+            $ref: '#/components/schemas/OperationSchema'
+          type: array
+          title: Operations
+        candles:
+          items:
+            $ref: '#/components/schemas/HistoricCandleSchema'
+          type: array
+          title: Candles
+        errors:
+          items:
+            $ref: '#/components/schemas/PositionDetailsErrorSchema'
+          type: array
+          title: Errors
+      additionalProperties: false
+      type: object
+      required:
+      - automation
+      - operations
+      - candles
+      - errors
+      title: TradingAutomationDetailsSchema
+    TradingPnlPeriodSchema:
+      properties:
+        value:
+          anyOf:
+          - type: string
+            pattern: ^(?!^[-+.]*$)[+-]?0*\d*\.?\d*$
+          - type: 'null'
+          title: Value
+        from:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: From
+        to:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: To
+        complete:
+          type: boolean
+          title: Complete
+      additionalProperties: false
+      type: object
+      required:
+      - value
+      - from
+      - to
+      - complete
+      title: TradingPnlPeriodSchema
+    TradingSessionsStatusSchema:
+      properties:
+        status:
+          type: string
+          title: Status
+        total:
+          type: integer
+          title: Total
+        open:
+          type: integer
+          title: Open
+        closed:
+          type: integer
+          title: Closed
+        unavailable:
+          type: integer
+          title: Unavailable
+      additionalProperties: false
+      type: object
+      required:
+      - status
+      - total
+      - open
+      - closed
+      - unavailable
+      title: TradingSessionsStatusSchema
+    TradingSummarySchema:
+      properties:
+        captured_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Captured At
+        currencies:
+          items:
+            $ref: '#/components/schemas/CurrencyTradingSummarySchema'
+          type: array
+          title: Currencies
+        errors:
+          items:
+            $ref: '#/components/schemas/ReadErrorSchema'
+          type: array
+          title: Errors
+      additionalProperties: false
+      type: object
+      required:
+      - captured_at
+      - currencies
+      - errors
+      title: TradingSummarySchema
+    UpdateAutomationStrategySchema:
+      properties:
+        expected_revision:
+          type: integer
+          title: Expected Revision
+        strategy:
+          $ref: '#/components/schemas/StrategySchema-Input'
+      additionalProperties: false
+      type: object
+      required:
+      - expected_revision
+      - strategy
+      title: UpdateAutomationStrategySchema
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+    moex_sentinel__views__brokers__BrokerConnectionSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        available:
+          type: boolean
+          title: Available
+        accounts_count:
+          type: integer
+          title: Accounts Count
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - available
+      - accounts_count
+      title: BrokerConnectionSchema
+    moex_sentinel__views__schemas__automations__BrokerConnectionSchema:
+      properties:
+        broker_id:
+          type: string
+          title: Broker Id
+        adapter_code:
+          type: string
+          title: Adapter Code
+        target:
+          type: string
+          title: Target
+        token:
+          type: string
+          title: Token
+        is_test:
+          type: boolean
+          title: Is Test
+      additionalProperties: false
+      type: object
+      required:
+      - broker_id
+      - adapter_code
+      - target
+      - token
+      - is_test
+      title: BrokerConnectionSchema

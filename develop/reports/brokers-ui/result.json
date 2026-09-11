@@ -1,0 +1,29 @@
+{
+  "status": "passed",
+  "started_at": "2026-09-09T13:47:45.667Z",
+  "mock": {
+    "passed": true,
+    "create_requests_intercepted": 2,
+    "checks": [
+      "empty-list",
+      "create-form",
+      "adapter-fields",
+      "validation-recovery",
+      "save-and-refresh",
+      "select-edit-cancel",
+      "accounts-navigation",
+      "return-navigation",
+      "mobile-width",
+      "no-page-errors"
+    ]
+  },
+  "runtime": {
+    "passed": true,
+    "broker_count": 1,
+    "account_count_first_broker": 1,
+    "blocked_requests": 0,
+    "page_errors": 0,
+    "mode": "GET-only; no screenshots or response bodies"
+  },
+  "finished_at": "2026-09-09T13:47:52.125Z"
+}

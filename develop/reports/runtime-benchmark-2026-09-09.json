@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "python": "3.12.7",
+  "platform": "Darwin",
+  "workload": "initial BUY/FILLED, measured WAIT; in-process ASGI; Core and Worker temporary SQLite",
+  "clock": "deterministic logical minute per tick; latency uses perf_counter",
+  "percentiles": "p50 median; p95/p99 nearest rank; no SLA threshold",
+  "results": [
+    {
+      "instruments": 6,
+      "warmup": 3,
+      "iterations": 100,
+      "measured_decisions": 600,
+      "measured_reason_counts": {
+        "NO_THRESHOLD": 600
+      },
+      "tick_ms": {
+        "samples": 100,
+        "min": 52.17058298876509,
+        "p50": 65.50370899640257,
+        "p95": 88.1359170016367,
+        "p99": 111.7268329981016,
+        "max": 112.21899998781737
+      },
+      "delivery_ms": {
+        "samples": 100,
+        "min": 77.04079200630076,
+        "p50": 82.8117079945514,
+        "p95": 93.39616699435282,
+        "p99": 110.14158300531562,
+        "max": 111.39399999228772
+      },
+      "decisions_per_second": 88.31190791914078,
+      "pipeline_decisions_per_second": 39.30617580159651,
+      "outbox_backlog_peak": 54,
+      "recovery": {
+        "backlog_before_restart": 54,
+        "backlog_after_restart": 54,
+        "backlog_final": 0,
+        "replayed_facts": 54,
+        "restart_and_drain_ms": 45.445667012245394,
+        "worker_decisions": 648,
+        "core_decisions": 648,
+        "orders_before_restart": 6,
+        "orders_after_restart": 6
+      }
+    },
+    {
+      "instruments": 20,
+      "warmup": 3,
+      "iterations": 100,
+      "measured_decisions": 2000,
+      "measured_reason_counts": {
+        "NO_THRESHOLD": 2000
+      },
+      "tick_ms": {
+        "samples": 100,
+        "min": 196.58987499133218,
+        "p50": 238.780958497955,
+        "p95": 297.8977080056211,
+        "p99": 339.20625000610016,
+        "max": 354.13879199768417
+      },
+      "delivery_ms": {
+        "samples": 100,
+        "min": 287.3502500005998,
+        "p50": 316.35943750006845,
+        "p95": 333.74766699853353,
+        "p99": 345.30733300198335,
+        "max": 359.4746659946395
+      },
+      "decisions_per_second": 82.28202249712483,
+      "pipeline_decisions_per_second": 35.79716693957642,
+      "outbox_backlog_peak": 180,
+      "recovery": {
+        "backlog_before_restart": 180,
+        "backlog_after_restart": 180,
+        "backlog_final": 0,
+        "replayed_facts": 100,
+        "restart_and_drain_ms": 203.30729099805467,
+        "worker_decisions": 2300,
+        "core_decisions": 2300,
+        "orders_before_restart": 20,
+        "orders_after_restart": 20
+      }
+    },
+    {
+      "instruments": 50,
+      "warmup": 3,
+      "iterations": 100,
+      "measured_decisions": 5000,
+      "measured_reason_counts": {
+        "NO_THRESHOLD": 5000
+      },
+      "tick_ms": {
+        "samples": 100,
+        "min": 442.35120799567085,
+        "p50": 521.7292290035402,
+        "p95": 590.8981669927016,
+        "p99": 705.3190410078969,
+        "max": 756.0745840019081
+      },
+      "delivery_ms": {
+        "samples": 100,
+        "min": 911.0714999987977,
+        "p50": 988.3438750039204,
+        "p95": 1060.1798339921515,
+        "p99": 1099.9432919925312,
+        "max": 1143.065750002279
+      },
+      "decisions_per_second": 94.97937842525538,
+      "pipeline_decisions_per_second": 32.91339350407109,
+      "outbox_backlog_peak": 450,
+      "recovery": {
+        "backlog_before_restart": 450,
+        "backlog_after_restart": 450,
+        "backlog_final": 0,
+        "replayed_facts": 100,
+        "restart_and_drain_ms": 915.1971249957569,
+        "worker_decisions": 6500,
+        "core_decisions": 6500,
+        "orders_before_restart": 50,
+        "orders_after_restart": 50
+      }
+    }
+  ]
+}

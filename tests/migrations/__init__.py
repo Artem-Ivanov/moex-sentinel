@@ -1,0 +1,1 @@
+"""Migration command behavior tests."""

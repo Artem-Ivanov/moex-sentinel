@@ -1,0 +1,121 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moex-sentinel"
+version = "0.1.0"
+description = "Local sandbox platform for safe algorithmic trading experiments"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.16,<2",
+  "fastapi>=0.116,<1",
+  "greenlet>=3.2,<4",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.10,<3",
+  "psycopg[binary]>=3.2,<4",
+  "SQLAlchemy>=2.0,<3",
+  "t-tech-investments>=1.49.3,<1.50.0",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=25.1,<26",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "PyYAML>=6,<7",
+  "ruff>=0.12,<0.13",
+]
+
+[[tool.uv.index]]
+name = "tbank"
+url = "https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple"
+explicit = true
+
+[tool.uv.sources]
+t-tech-investments = { index = "tbank" }
+
+[project.scripts]
+trading-automaton = "trading_automaton.__main__:main"
+moex-migrate-schema = "moex_sentinel.migrations.schema:main"
+portfolio-snapshot-worker = "moex_sentinel.portfolio_snapshot_worker:main"
+market-analytics = "market_analytics.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moex_sentinel", "src/sentinel_contracts", "src/trading_automaton", "src/market_analytics"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/develop"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["postgresql: requires an externally supplied PostgreSQL test database"]
+
+[tool.ruff]
+exclude = [
+    ".bzr",
+  ".direnv",
+  ".eggs",
+  ".git",
+  ".git-rewrite",
+  ".hg",
+  ".mypy_cache",
+  ".nox",
+  ".pants.d",
+  ".pytype",
+  ".ruff_cache",
+  ".svn",
+  ".tox",
+  ".venv",
+    "__pypackages__",
+    "_build",
+    "alembic",
+  "buck-out",
+  "build",
+  "dist",
+  "node_modules",
+  "venv",
+  "migrations",
+  "conftest.py",
+  "develop",
+]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "ASYNC", "S", "B", "C4", "DJ", "ISC", "ICN", "INP", "T20", "PT", "RSE", "SIM", "TID", "PTH", "PD",
+  "PL", "TRY", "NPY", "RUF", "PIE", "PTH", "I",
+  "RET501", "RET505", "RET506", "RET507", "RET508",
+  "S307", "G010", "PGH005",
+]
+ignore = [
+  "DJ001",
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "PLW2901",
+  "TRY003", "TRY300", "TRY401", "B904",
+  "RUF001", "RUF002", "RUF003", "RUF012", "RUF100",
+  "S104", "S105", "S603",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.isort]
+known-first-party = ["apps", "project", "settings"]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = [
+  "S101",
+  "ARG",
+  "FBT",
+  "PLR2004",
+  "S311",
+  "PT019",
+]
+"manage.py" = ["INP001"]
+
+[tool.black]
+target-version = ["py312"]
+line-length = 120

@@ -1,0 +1,39 @@
+{
+  "observed_from": "2026-09-09T13:03:43.128121+00:00",
+  "observed_until": "2026-09-09T13:13:43.057917+00:00",
+  "duration_seconds": 599.929796,
+  "samples": 120,
+  "instruments": 6,
+  "accepted_instrument_samples": 536,
+  "total_instrument_samples": 720,
+  "all_fresh_samples": 38,
+  "unavailable_instrument_samples": 6,
+  "reason_sample_counts": {
+    "STALE_ORDER_BOOK": 178,
+    "SNAPSHOT_OUTSIDE_TTL": 13,
+    "SOURCE_UNAVAILABLE": 6,
+    "TRADING_STATUS_UNAVAILABLE": 6,
+    "ORDER_BOOK_UNAVAILABLE": 6
+  },
+  "latency_ms": {
+    "p50": 29.47,
+    "p95": 45.6,
+    "p99": 147.47,
+    "max": 168.49
+  },
+  "max_book_age_ms": 61924.93,
+  "coherence_errors": 0,
+  "decisions_delta": 1168,
+  "outbox_final": {},
+  "core_log_counts": {
+    "parsed_json_lines": 4588,
+    "unparsed_lines": 0,
+    "market_source_disconnects": 1,
+    "market_source_cleanup_failures": 0,
+    "disconnect_grpc_statuses": {
+      "UNAVAILABLE": 1
+    }
+  },
+  "no_accepted_instruments_samples": 13,
+  "acceptance_percent": 74.444
+}
