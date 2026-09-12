@@ -205,7 +205,7 @@ class TradingFactIngressService:
         ):
             raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
         if not (
-            current.state is AutomationState.HOLD
+            current.state in {AutomationState.HOLD, AutomationState.IN_QUEUE}
             and str(cycle.payload.position_cycle_id) == current.bootstrap_position_cycle_id
             and str(cycle.payload.instrument_id) == current.instrument_id
             and cycle.payload.state is FactPositionCycleState.OPEN

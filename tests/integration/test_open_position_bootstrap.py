@@ -1,9 +1,11 @@
 """End-to-end bootstrap from Core HOLD snapshot through Worker typed facts."""
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
+import httpx
 import pytest
 from pydantic import TypeAdapter
 from sqlalchemy import create_engine, func, select
@@ -22,7 +24,9 @@ from moex_sentinel.storage.models import (
 from moex_sentinel.storage.models import (
     Base as CoreBase,
 )
+from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
+from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     BrokerPositionBootstrap,
@@ -32,7 +36,13 @@ from sentinel_contracts.trading_facts import (
 )
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 from tests.trading_automaton.command_factory import command
+from tests.trading_automaton.services.test_broker_tick_preparation_service import Hydration, Portfolio
+from tests.trading_automaton.test_analytics_runtime import FALLBACK, Source, Tick, frame
+from tests.trading_automaton.test_analytics_runtime import NOW as MARKET_NOW
 from trading_automaton.config import StrategySettings
+from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache
+from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
+from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import Base as WorkerBase
@@ -46,7 +56,7 @@ CYCLE_ID = UUID("00000000-0000-4000-8000-000000000604")
 LOT_ID = UUID("00000000-0000-4000-8000-000000000605")
 
 
-def bootstrap_context():
+def bootstrap_context(*, core_state=AutomationState.HOLD, core_revision=1, prepare_worker=True, worker_db_path=None):
     core_engine = create_engine("sqlite:///:memory:")
     CoreBase.metadata.create_all(core_engine)
     core_factory = sessionmaker(core_engine, expire_on_commit=False)
@@ -58,10 +68,10 @@ def bootstrap_context():
                 id=str(AUTOMATION_ID),
                 user_broker_id=str(SCOPE_ID),
                 instrument_id=str(INSTRUMENT_ID),
-                state=AutomationState.HOLD.value,
+                state=core_state.value,
                 suspended_from_state=None,
                 hold_reason="BOOTSTRAPPING",
-                revision=1,
+                revision=core_revision,
                 last_sequence_number=0,
                 resume_requested=False,
                 closed_at=None,
@@ -77,7 +87,7 @@ def bootstrap_context():
             )
         )
 
-    worker_engine = create_engine("sqlite:///:memory:")
+    worker_engine = create_engine("sqlite:///:memory:" if worker_db_path is None else f"sqlite:///{worker_db_path}")
     WorkerBase.metadata.create_all(worker_engine)
     worker = LocalAutomationRepository(
         sessionmaker(worker_engine, expire_on_commit=False),
@@ -88,7 +98,7 @@ def bootstrap_context():
         broker=str(SCOPE_ID),
         account="account-1",
         instrument="external-instrument",
-        state=AutomationState.HOLD,
+        state=core_state,
         bootstrap=BrokerPositionBootstrap(
             position_cycle_id=CYCLE_ID,
             position_lot_id=LOT_ID,
@@ -106,8 +116,9 @@ def bootstrap_context():
             "instrument_id": INSTRUMENT_ID,
         }
     )
-    worker.cache_command(value)
-    PositionBootstrapService(worker).ensure(value, StrategySettings())
+    if prepare_worker:
+        worker.cache_command(value)
+        PositionBootstrapService(worker).ensure(value, StrategySettings())
     rows = worker.ready_fact_outbox(10, now=NOW, deadline_ms=0)
     adapter: TypeAdapter[FactEnvelope] = TypeAdapter(FactEnvelope)
     facts = [
@@ -134,10 +145,159 @@ def bootstrap_context():
     return core_factory, worker, ingress, facts
 
 
-def test_adopted_position_reaches_in_work_only_after_atomic_core_fact_group() -> None:
-    core_factory, _worker, ingress, facts = bootstrap_context()
+@pytest.mark.parametrize("market_problem", ["unavailable", "stale", "closed", "crossed"])
+def test_unavailable_market_allows_position_adoption_but_no_tick_or_order(tmp_path, market_problem) -> None:
+    core_factory, worker, ingress, _ = bootstrap_context(
+        core_state=AutomationState.IN_QUEUE, prepare_worker=False, worker_db_path=tmp_path / "worker.db"
+    )
+    commands = AutomationCommandRepository(core_factory)
+    value = commands.claim(10)[0]
+    assert worker.cache_command(value)
+    source_frame = frame(at=MARKET_NOW, book_at=MARKET_NOW, ids=(value.external_instrument_id,))
+    instrument = source_frame.instruments[0]
+    market = instrument.market
+    if market_problem == "stale":
+        market = market.model_copy(
+            update={
+                "order_book": market.order_book.model_copy(update={"captured_at": MARKET_NOW - timedelta(seconds=3)})
+            }
+        )
+    elif market_problem == "closed":
+        market = market.model_copy(
+            update={"trading_status": market.trading_status.model_copy(update={"api_trade_available": False})}
+        )
+    elif market_problem == "crossed":
+        market = market.model_copy(
+            update={"order_book": market.order_book.model_copy(update={"asks": market.order_book.bids})}
+        )
+    source_frame = source_frame.model_copy(update={"instruments": (instrument.model_copy(update={"market": market}),)})
+
+    class Broker:
+        async def get_positions(self, account_id):
+            return (BrokerPosition(value.external_instrument_id, Decimal(2), Decimal(100), Decimal(101), "RUB"),)
+
+    class NoCommission:
+        async def refresh_if_due(self, *args, **kwargs):
+            raise AssertionError("Adoption without market must not estimate an order commission")
+
+    async def scenario():
+        tick = Tick()
+        preparation = BrokerTickPreparationService(
+            Broker(),
+            Portfolio(),
+            None,
+            NoCommission(),
+            Hydration(),
+            position_bootstrap=PositionBootstrapService(worker),
+            now=lambda: MARKET_NOW,
+        )
+        runtime = AnalyticsBrokerRuntime(
+            Source(
+                httpx.ReadTimeout("offline analytics unavailable") if market_problem == "unavailable" else source_frame
+            ),
+            tick,
+            preparation=preparation,
+            metrics=AnalyticsMetricsCache(),
+            source_id=str(SCOPE_ID),
+            fallback=FALLBACK,
+            now=lambda: MARKET_NOW,
+        )
+        await runtime.replace_commands((value,))
+        await runtime.run_once()
+        facts = [
+            FactSynchronizationService._envelope(row)
+            for row in worker.ready_fact_outbox(10, now=MARKET_NOW, deadline_ms=0)
+        ]
+        result = ingress.publish(facts)
+        assert result.failures == ()
+        assert result.results[0].accepted_through_sequence == 4
+        worker.acknowledge_fact_outbox(str(AUTOMATION_ID), accepted_through_sequence=4, current_revision=2)
+        await runtime.replace_commands((value.model_copy(update={"state": AutomationState.IN_WORK}),))
+        await runtime.run_once()
+        await runtime.close()
+        assert tick.calls == []
+        assert worker.get_active_intent(str(AUTOMATION_ID)) is None
+
+    asyncio.run(scenario())
     with core_factory() as session:
-        assert session.get_one(TradingAutomationModel, str(AUTOMATION_ID)).state == AutomationState.HOLD.value
+        assert session.get_one(TradingAutomationModel, str(AUTOMATION_ID)).state == "IN_WORK"
+        assert session.get_one(PositionCycleModel, str(CYCLE_ID)).quantity_lots == 2
+        assert session.scalar(select(func.count()).select_from(PositionLotModel)) == 1
+        assert session.scalar(select(func.count()).select_from(BrokerOrderModel)) == 0
+        assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 0
+
+
+def test_resumed_unfinished_bootstrap_recovers_speculative_activation_and_reconciled_lot() -> None:
+    core_factory, worker, ingress, _facts = bootstrap_context(
+        core_state=AutomationState.IN_QUEUE, core_revision=2, prepare_worker=False
+    )
+    commands = AutomationCommandRepository(core_factory)
+    current = commands.claim(10)[0]
+    # Reproduce the old Worker receiving a command with its bootstrap omitted.
+    legacy = current.model_copy(update={"bootstrap": None})
+    assert worker.cache_command(legacy)
+    worker.create_trade_lot(
+        automation_id=str(AUTOMATION_ID),
+        source_intent_id=None,
+        source="RECONCILED",
+        quantity_lots=2,
+        entry_price=Decimal("100"),
+        entry_commission=Decimal(),
+        opened_at=NOW,
+    )
+    worker.transition_state(
+        automation_id=str(AUTOMATION_ID),
+        state="IN_WORK",
+        safe_message="Legacy activation without bootstrap",
+        occurred_at=NOW,
+    )
+    speculative = worker.list_active()[0]
+    assert (speculative.state, speculative.revision, speculative.last_sequence_number) == (
+        AutomationState.IN_WORK,
+        3,
+        1,
+    )
+
+    class OfflineCore:
+        def claim_commands(self, worker_id, limit):
+            return commands.claim(limit)
+
+        def automation_statuses(self, automation_ids):
+            return commands.statuses(automation_ids)
+
+        def publish_facts(self, facts):
+            return ingress.publish(facts)
+
+    synchronization = FactSynchronizationService(
+        worker, OfflineCore(), now=lambda: NOW, sleep=lambda _: None, deadline_ms=0
+    )
+    assert synchronization.flush_outbox()
+    assert worker.get_state(str(AUTOMATION_ID)).state == "HOLD"
+    recovered = synchronization.claim_commands("offline-worker", 10)[0]
+    assert recovered.bootstrap is not None
+    assert PositionBootstrapService(worker).ensure(recovered, StrategySettings()).applied
+    assert synchronization.flush_outbox()
+    assert not PositionBootstrapService(worker).ensure(recovered, StrategySettings()).applied
+
+    lots = worker.list_open_lots(str(AUTOMATION_ID))
+    assert [(lot.id, lot.original_lots, lot.remaining_lots, lot.source) for lot in lots] == [
+        (str(LOT_ID), 2, 2, "BROKER_POSITION_BOOTSTRAP")
+    ]
+    assert worker.ready_fact_outbox(10, now=NOW, deadline_ms=0) == []
+    with core_factory() as session:
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_ID))
+        assert (automation.state, automation.revision, automation.last_sequence_number) == ("IN_WORK", 3, 4)
+        assert session.get_one(PositionCycleModel, str(CYCLE_ID)).quantity_lots == 2
+        assert session.scalar(select(func.count()).select_from(PositionLotModel)) == 1
+        assert session.scalar(select(func.count()).select_from(BrokerOrderModel)) == 0
+        assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 0
+
+
+@pytest.mark.parametrize("state", [AutomationState.HOLD, AutomationState.IN_QUEUE])
+def test_adopted_position_reaches_in_work_only_after_atomic_core_fact_group(state: AutomationState) -> None:
+    core_factory, _worker, ingress, facts = bootstrap_context()
+    with core_factory.begin() as session:
+        session.get_one(TradingAutomationModel, str(AUTOMATION_ID)).state = state.value
 
     result = ingress.publish(facts)
 

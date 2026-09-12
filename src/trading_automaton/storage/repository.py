@@ -843,9 +843,16 @@ class LocalAutomationRepository:
             if existing is not None:
                 self._validate_bootstrap_lot(existing, command)
                 return False
-            if (
-                session.scalar(select(TradeLotModel.id).where(TradeLotModel.automation_id == automation_id).limit(1))
-                is not None
+            previous_lots = session.scalars(
+                select(TradeLotModel).where(TradeLotModel.automation_id == automation_id)
+            ).all()
+            if previous_lots and not (
+                len(previous_lots) == 1
+                and previous_lots[0].source == "RECONCILED"
+                and previous_lots[0].source_intent_id is None
+                and previous_lots[0].original_lots == previous_lots[0].remaining_lots == snapshot.quantity_lots
+                and previous_lots[0].entry_price == snapshot.average_price
+                and previous_lots[0].entry_commission == 0
             ):
                 raise ValueError("Broker-position bootstrap cannot replace an existing lot ledger.")
             if (
@@ -859,7 +866,10 @@ class LocalAutomationRepository:
                 raise ValueError("Broker-position bootstrap cannot run after a trade intent.")
 
             current_state = AutomationState(cached.state)
-            if current_state is not AutomationState.HOLD:
+            if (
+                current_state not in {AutomationState.HOLD, AutomationState.IN_QUEUE}
+                or current_state is not command.state
+            ):
                 raise InvalidAutomationTransition(
                     f"WORKER_FACT bootstrap cannot transition {current_state.value} to IN_WORK."
                 )
@@ -872,6 +882,11 @@ class LocalAutomationRepository:
             self._compare_and_set_state(session, cached, AutomationState.IN_WORK)
 
             cached.position_cycle_id = str(snapshot.position_cycle_id)
+            # An untouched reconciliation lot represents this same position.
+            # Replace it atomically with the authoritative bootstrap identity; never
+            # adopt executed, partially consumed, or mismatching ledger history.
+            for previous_lot in previous_lots:
+                session.delete(previous_lot)
             session.add(
                 TradeLotModel(
                     id=str(snapshot.position_lot_id),

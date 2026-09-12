@@ -14,8 +14,11 @@ from sentinel_contracts.analytics import (
 )
 from sentinel_contracts.broker_execution import OrderBookLevel
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook, StreamTradingStatus
+from sentinel_contracts.trading import DecisionKind
 from tests.trading_automaton.command_factory import command
+from trading_automaton.domain.dtos import PositionEvaluationResult, PositionWorkItem, TradeDecision
 from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache
+from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
 
 NOW = datetime(2026, 9, 9, 12, tzinfo=UTC)
 FALLBACK = AdaptiveThresholds(Decimal("0.5"), Decimal("0.5"), "STRATEGY")
@@ -181,5 +184,33 @@ def test_mixed_batch_processes_only_fresh_instrument():
         await service.replace_commands((command(), second))
         await service.run_once()
         assert tick.calls[0][0] == (second,)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("book_offset_ms", [-1000, 1, 101])
+def test_runtime_and_scheduler_share_evaluation_time_without_extending_source_ttl(book_offset_ms):
+    class Decider:
+        async def decide(self, item, state):
+            return PositionEvaluationResult(
+                TradeDecision(DecisionKind.NO_ACTION, 0, None, "NO_THRESHOLD"), item.state, Decimal()
+            )
+
+    async def scenario():
+        evaluation_at = NOW + timedelta(milliseconds=100)
+        book_at = NOW + timedelta(milliseconds=book_offset_ms)
+        service, _, tick = runtime(Source(frame(book_at=book_at)), now=lambda: evaluation_at)
+        await service.replace_commands((command(),))
+        await service.run_once()
+        if book_at > evaluation_at:
+            assert not tick.calls
+            return
+        commands, snapshot = tick.calls[0]
+        result = await PositionBatchSchedulerService(Decider()).prepare(
+            (PositionWorkItem(commands[0], False),), snapshot
+        )
+        assert result[0].decision.reason_code == "NO_THRESHOLD"
+        assert snapshot.created_at == evaluation_at
+        assert snapshot.expires_at == min(NOW, book_at) + timedelta(seconds=2)
 
     asyncio.run(scenario())

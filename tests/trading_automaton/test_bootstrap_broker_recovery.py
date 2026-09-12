@@ -1,10 +1,11 @@
-"""Bootstrap broker failures must reach the runtime's bounded retry owner."""
+"""Portfolio adoption and trading commission failures share the runtime retry owner."""
 
 import asyncio
 
 import pytest
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
+from sentinel_contracts.trading import AutomationState
 from tests.trading_automaton.services.test_broker_tick_preparation_service import (
     AdoptedBroker,
     Bootstrap,
@@ -28,10 +29,10 @@ from trading_automaton.services.broker_tick_preparation import BrokerTickPrepara
         (2, False, 1, []),
     ],
 )
-def test_bootstrap_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_permanent_error(
+def test_preparation_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_permanent_error(
     monkeypatch, failure_phase, retry_limit, retryable, expected_calls, expected_delays
 ):
-    """Catch swallowed SDK errors that otherwise restart HOLD bootstrap on every ordinary tick."""
+    """Adoption skips commission lookup; later trading preparation must still bound SDK retries."""
 
     async def scenario():
         attempts = []
@@ -84,6 +85,14 @@ def test_bootstrap_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_permane
             retry_limit=retry_limit,
         )
         await runtime.replace_commands((value,))
+        if failure_phase == "commission":
+            # Adoption must succeed without consulting the failing commission provider.
+            await runtime.run_once()
+            assert bootstrap.calls == [value]
+            assert attempts == []
+            assert tick.calls == []
+            # Core acknowledgement subsequently authorizes regular preparation.
+            await runtime.replace_commands((value.model_copy(update={"state": AutomationState.IN_WORK}),))
         task = asyncio.create_task(runtime.run())
         try:
             for _ in range(30):
@@ -91,7 +100,7 @@ def test_bootstrap_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_permane
             assert len(attempts) == expected_calls
             assert delays == expected_delays
             assert not task.done()
-            assert bootstrap.calls == []
+            assert bootstrap.calls == ([value] if failure_phase == "commission" else [])
             assert hydration.calls == []
             assert tick.calls == []
         finally:

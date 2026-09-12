@@ -34,8 +34,8 @@ class PositionBootstrapService:
         snapshot = command.bootstrap
         if snapshot is None:
             return BootstrapResult(applied=False, emitted_facts=0)
-        if command.state is not AutomationState.HOLD:
-            raise ValueError("Broker-position bootstrap command must remain HOLD until acknowledgement.")
+        if command.state not in {AutomationState.HOLD, AutomationState.IN_QUEUE}:
+            raise ValueError("Broker-position bootstrap requires a pending HOLD or IN_QUEUE command.")
         if snapshot.currency.upper() != command.currency.upper():
             raise ValueError("Broker-position bootstrap currency does not match the instrument.")
         expected_invested = snapshot.average_price * Decimal(command.lot_size) * snapshot.quantity_lots

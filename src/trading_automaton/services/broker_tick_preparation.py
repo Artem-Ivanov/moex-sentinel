@@ -3,11 +3,11 @@
 import asyncio
 import logging
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from sentinel_contracts.broker_execution import BrokerPosition, OrderBookSnapshot
+from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.streaming_market import MarketBatchSnapshot
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -16,7 +16,6 @@ from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequ
 from trading_automaton.services.account_commission_profile import (
     AccountCommissionProfileService,
 )
-from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
 from trading_automaton.storage.repository import AccountCommissionProfileKey
 
@@ -86,15 +85,19 @@ class BrokerTickPreparationService:
         commands: tuple[AutomationCommand, ...],
         snapshot: MarketBatchSnapshot,
     ) -> None:
-        pending = tuple(item for item in commands if item.state is AutomationState.HOLD and item.bootstrap is not None)
+        pending = tuple(
+            item
+            for item in commands
+            if item.state in {AutomationState.HOLD, AutomationState.IN_QUEUE} and item.bootstrap is not None
+        )
         regular = tuple(item for item in commands if item not in pending)
         if regular:
             await self._prepare_regular(regular, snapshot)
         for command in pending:
             try:
-                await self._prepare_adopted(command, snapshot)
+                await self._prepare_adopted(command)
             except ValueError:
-                LOGGER.warning("Position bootstrap remains HOLD", extra={"reason_code": "BOOTSTRAPPING"})
+                LOGGER.warning("Position bootstrap remains pending", extra={"reason_code": "BOOTSTRAPPING"})
 
     async def _prepare_regular(
         self,
@@ -109,11 +112,13 @@ class BrokerTickPreparationService:
         await asyncio.gather(*(self._prepare_command(item, snapshot) for item in commands))
         await self._hydration.hydrate(commands)
 
-    async def _prepare_adopted(self, command: AutomationCommand, snapshot: MarketBatchSnapshot) -> None:
+    async def _prepare_adopted(self, command: AutomationCommand) -> None:
         bootstrap = self._position_bootstrap
         expected = command.bootstrap
-        if bootstrap is None or expected is None or not self._bootstrap_market_ready(command, snapshot):
+        if bootstrap is None or expected is None:
             return
+        # Adoption records an existing broker position. Quote freshness and order
+        # commissions gate subsequent trading, not this accounting transaction.
         await self._load_account(command.account_id)
         position = await self._portfolio.position(command.account_id, command.external_instrument_id)
         if (
@@ -123,35 +128,7 @@ class BrokerTickPreparationService:
             or position.currency.upper() != expected.currency.upper()
         ):
             return
-        await self._load_cash((command,))
-        await self._prepare_command(command, snapshot)
-        key = AccountCommissionProfileKey(str(command.broker_id), command.account_id, "SHARE", command.currency)
-        if self._commissions.schedule(key, snapshot_at=self._now()) is None:
-            return
-        if not self._bootstrap_market_ready(command, snapshot):
-            return
         await asyncio.to_thread(bootstrap.ensure, command, self._strategy_settings)
-
-    def _bootstrap_market_ready(self, command: AutomationCommand, snapshot: MarketBatchSnapshot) -> bool:
-        market = snapshot.instruments.get(command.external_instrument_id)
-        now = self._now()
-        if snapshot.expires_at is not None and not snapshot.created_at <= now <= snapshot.expires_at:
-            return False
-        max_age = timedelta(seconds=2)
-        if market is None or market.order_book is None or not market.is_tradeable(now, max_age):
-            return False
-        book = market.order_book
-        if not book.best_bid.price.is_finite() or not book.best_ask.price.is_finite():
-            return False
-        return (
-            OrderBookValidationService()
-            .validate(
-                OrderBookSnapshot(book.bids, book.asks, book.captured_at),
-                now=now,
-                max_age=max_age,
-            )
-            .valid
-        )
 
     async def _load_account(self, account_id: str) -> None:
         positions = await self._broker.get_positions(account_id)

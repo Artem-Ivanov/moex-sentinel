@@ -165,7 +165,7 @@ def test_claims_syncs_and_assigns_commands_to_one_broker_runtime() -> None:
     assert bundle.closed
 
 
-@pytest.mark.parametrize("local_state", [AutomationState.HOLD, AutomationState.IN_WORK])
+@pytest.mark.parametrize("local_state", [AutomationState.HOLD, AutomationState.IN_QUEUE, AutomationState.IN_WORK])
 @pytest.mark.parametrize("core_state", ["HOLD", "CLOSED", "IN_QUEUE", None])
 def test_restored_bootstrap_hold_is_prepared_without_claim_or_early_activation(local_state, core_state) -> None:
     class BootstrapRepository(Repository):
@@ -174,7 +174,7 @@ def test_restored_bootstrap_hold_is_prepared_without_claim_or_early_activation(l
             self.active = [bootstrap_command().model_copy(update={"state": local_state})]
 
         def list_active(self):
-            return [value for value in self.active if value.state is AutomationState.IN_WORK]
+            return [value for value in self.active if value.state is not AutomationState.HOLD]
 
         def synchronize_core_state(self, automation_id, **values):
             return self.active[0]
@@ -214,7 +214,12 @@ def test_restored_bootstrap_hold_is_prepared_without_claim_or_early_activation(l
     repository, bundle = asyncio.run(scenario())
 
     assert repository.events == []
-    assert bundle.commands == ([(bootstrap_command(),), (bootstrap_command(),)] if core_state == "HOLD" else [])
+    expected = (
+        [(bootstrap_command().model_copy(update={"state": AutomationState(core_state)}),)] * 2
+        if core_state in {"HOLD", "IN_QUEUE"}
+        else []
+    )
+    assert bundle.commands == expected
 
 
 def test_closed_adopted_automation_keeps_uncertain_intent_supervision_after_bootstrap_ack(tmp_path) -> None:

@@ -89,7 +89,7 @@ class AutomationCommandRepository:
         bootstrap = None
         if (
             automation.bootstrap_position_cycle_id is not None
-            and automation.state == AutomationState.HOLD.value
+            and automation.state in {AutomationState.HOLD.value, AutomationState.IN_QUEUE.value}
             and automation.last_sequence_number == 0
         ):
             required = (

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -91,13 +92,14 @@ def test_runtime_hold_without_resume_is_not_claimed() -> None:
     assert repo.claim(10) == []
 
 
-def test_hold_command_contains_immutable_broker_position_snapshot() -> None:
+@pytest.mark.parametrize("state", [AutomationState.HOLD, AutomationState.IN_QUEUE])
+def test_unfinished_bootstrap_command_contains_immutable_broker_position_snapshot(state: AutomationState) -> None:
     repo, factory = repository()
     cycle_id = "00000000-0000-4000-8000-000000000150"
     lot_id = "00000000-0000-4000-8000-000000000151"
     with factory.begin() as session:
         automation = session.get_one(TradingAutomationModel, AUTOMATION_ID)
-        automation.state = AutomationState.HOLD.value
+        automation.state = state.value
         automation.hold_reason = "BOOTSTRAPPING"
         automation.bootstrap_position_cycle_id = cycle_id
         automation.bootstrap_position_lot_id = lot_id

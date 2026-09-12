@@ -233,7 +233,9 @@ class AnalyticsBrokerRuntime:
     def _market_snapshot(
         self, frame: AnalyticsSnapshot | None, instruments: dict[str, AnalyticsInstrument]
     ) -> MarketBatchSnapshot:
-        at = frame.captured_at if frame is not None else self._now()
+        # Worker guards evaluate the admitted market at the current wall clock.
+        # The source timestamp remains the expiry anchor, never refreshed by receipt.
+        at = self._now()
         snapshot = MarketBatchSnapshot.immutable(
             frame.snapshot_id if frame is not None else "analytics-unavailable",
             at,
@@ -242,7 +244,7 @@ class AnalyticsBrokerRuntime:
         if frame is not None and instruments:
             ttl = timedelta(milliseconds=min(frame.ttl_ms, 2000))
             deadline = min(
-                at + ttl,
+                frame.captured_at + ttl,
                 *(item.market.order_book.captured_at + ttl for item in instruments.values() if item.market.order_book),
             )
             snapshot = snapshot.model_copy(update={"expires_at": deadline})

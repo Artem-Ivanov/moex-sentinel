@@ -1,8 +1,47 @@
 # Initial bootstrap readiness — implementation acceptance
 
 Implemented on 2026-09-08 against the accepted clean-slate bootstrap design.
+Readiness amended on 2026-09-12 to separate position accounting from permission
+to submit new orders. Historical verification below describes the original
+2026-09-08 implementation; the current change has separate evidence below.
 
-## Changes
+## Current accounting readiness — 2026-09-12
+
+An unfinished authoritative bootstrap (`last_sequence_number=0`) remains part
+of the Worker command in either HOLD or IN_QUEUE. Resuming before bootstrap
+completion must not discard the existing broker-position snapshot. Core accepts
+the complete cycle/lot/audit/activation quartet from either pending state, with
+the same exact snapshot, sequence, revision and replay checks. Completed
+bootstrap metadata does not re-enable bootstrap after resume; ordinary runtime
+HOLD and terminal CLOSED retain their lifecycle guards.
+
+Worker obtains a fresh portfolio response and checks quantity, average price
+and currency against the authoritative snapshot before adoption. Quote, candle,
+cash and commission readiness belong to subsequent trading preparation and do
+not block recording an already existing position. Quartet delivery and ACK
+still precede normal decisions; bootstrap creates no broker intent, order or
+execution. IN_WORK means the position has been adopted, not that its market is
+currently open. Analytics outages, stale/invalid books and unavailable API
+trading continue to prevent market ticks and new orders after ACK.
+
+A legacy RECONCILED lot can be replaced atomically by the authoritative
+bootstrap lot only when it is the sole lot, its original and remaining quantity
+and entry price match the snapshot, its commission is zero and no trade intent
+exists. Executed, partially consumed or conflicting ledgers are not replaced.
+Rollback preserves the previous lot if quartet persistence fails. A previously
+rejected speculative activation uses the existing Core reconciliation and
+re-claim path before the corrected quartet is created.
+
+Evidence: isolated Core/Worker SQLite tests cover legacy IN_WORK/revision3/
+sequence1 recovery through rejection, re-claim, quartet and ACK; matching-lot
+adoption and rollback; HOLD/IN_QUEUE routing; and real Analytics runtime with
+unavailable, stale, closed and crossed market data, with no tick/order/execution.
+The selected eight-file suite passed **114 tests**. RED evidence is recorded in
+`develop/reports/trading-audit-2026-09-12/bootstrap-fix-red.txt`,
+`bootstrap-runtime-fix-red.txt` and `bootstrap-accounting-fix-red.txt`; GREEN in
+`bootstrap-fix-green.txt` in that same directory.
+
+## Original changes — 2026-09-08 (historical)
 
 - `src/trading_automaton/services/streaming_runtime_coordinator.py`: claimed
   bootstrap commands no longer generate activation facts immediately. Persisted

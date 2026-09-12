@@ -217,10 +217,10 @@ class StreamingRuntimeCoordinatorService:
                     if active_intent is None:
                         continue
                     command = command.model_copy(update={"state": AutomationState.CLOSED})
-                elif core_state not in {"HOLD", "IN_WORK"}:
+                elif core_state not in {"HOLD", "IN_QUEUE", "IN_WORK"}:
                     continue
-                elif core_state == "HOLD":
-                    command = command.model_copy(update={"state": AutomationState.HOLD})
+                elif core_state in {"HOLD", "IN_QUEUE"}:
+                    command = command.model_copy(update={"state": AutomationState(core_state)})
             grouped.setdefault(str(command.broker_id), []).append(command)
         await self._replace_broker_commands(grouped)
         self._schedule_heartbeat()

@@ -272,7 +272,7 @@ def test_bootstrap_preparation_skips_normal_recovery_and_allows_regular_commands
         "recovery",
     ],
 )
-def test_bootstrap_failure_keeps_hold_without_activation_or_normal_hydration(failure) -> None:
+def test_bootstrap_requires_matching_portfolio_but_not_market_or_commission_readiness(failure) -> None:
     class FailingCommissions(ReadyCommissions):
         async def refresh_if_due(self, request, provider, *, now):
             if failure == "commission":
@@ -319,25 +319,22 @@ def test_bootstrap_failure_keeps_hold_without_activation_or_normal_hydration(fai
             snapshot = bootstrap_market(
                 trading_status=state.trading_status.model_copy(update={"api_trade_available": False})
             )
-        if failure == "commission":
-            with pytest.raises(TInvestAdapterError, match="Unavailable"):
-                await service.prepare((bootstrap_command(),), snapshot)
-        else:
-            await service.prepare((bootstrap_command(),), snapshot)
+        await service.prepare((bootstrap_command(),), snapshot)
         return bootstrap, hydration, reconciliation
 
     bootstrap, hydration, reconciliation = asyncio.run(scenario())
-    assert bootstrap.calls == []
+    assert bootstrap.calls == ([] if failure in {"portfolio", "recovery"} else [bootstrap_command()])
     assert hydration.calls == []
     assert reconciliation.calls == []
 
 
-def test_ready_bootstrap_is_atomic_idempotent_and_hydrates_only_after_ack(tmp_path) -> None:
+@pytest.mark.parametrize("state", [AutomationState.HOLD, AutomationState.IN_QUEUE])
+def test_ready_bootstrap_is_atomic_idempotent_and_hydrates_only_after_ack(tmp_path, state) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'worker.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
     repository = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW))
-    value = bootstrap_command()
+    value = bootstrap_command().model_copy(update={"state": state})
     repository.cache_command(value)
 
     class Candles(Bootstrap):
