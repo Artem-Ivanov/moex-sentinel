@@ -20,12 +20,11 @@ from sentinel_contracts.trading_facts import (
     FactIngressErrorCode,
     TradeAuditRecordedEnvelope,
 )
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 from tests.services.test_trading_fact_ingress import AUTOMATION_A, INSTRUMENT_A, SCOPE_ID, service, state_fact
 from tests.storage.test_envelope_lookup import TestEnvelopeLookup as _LookupContract
 from tests.storage.test_envelope_lookup import envelope_session as _shared_envelope_session
-from tests.storage.test_trading_facts_models import automation_model
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 
 pytestmark = pytest.mark.postgresql
 envelope_session = _shared_envelope_session

@@ -17,11 +17,10 @@ from trading_automaton.domain.dtos import (
     PositionWorkItem,
     TradeDecision,
 )
-from trading_automaton.services.decision import TradeDecisionService
-from trading_automaton.services.decision_context import DecisionContextService
-from trading_automaton.storage.repository import (
+from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfileKey,
 )
+from trading_automaton.services.decision_context import DecisionContextService
 
 
 class HydratedPositionStatePort(Protocol):
@@ -48,21 +47,23 @@ class DecisionCashPort(Protocol):
 
 
 class StreamingPositionDecisionService:
+    """Evaluate hydrated positions with explicit decision and context dependencies."""
+
     def __init__(
         self,
         states: HydratedPositionStatePort,
         commissions: CachedCommissionPort,
         *,
         cash: DecisionCashPort | None = None,
-        decisions: PositionDecisionPort | None = None,
-        contexts: DecisionContextService | None = None,
+        decisions: PositionDecisionPort,
+        contexts: DecisionContextService,
         now: Callable[[], datetime],
     ) -> None:
         self._states = states
         self._commissions = commissions
-        self._decisions = decisions or TradeDecisionService()
+        self._decisions = decisions
         self._cash = cash
-        self._contexts = contexts or DecisionContextService()
+        self._contexts = contexts
         self._now = now
 
     async def decide(

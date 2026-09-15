@@ -103,22 +103,22 @@ def _event(response: Any) -> MarketStreamEvent | None:
         )
     if status := getattr(response, "trading_status", None):
         return StreamTradingStatus(
-            status.instrument_uid,
-            enum_name(status.trading_status),
-            bool(status.limit_order_available_flag),
-            True,
-            status.time,
+            instrument_id=status.instrument_uid,
+            status=enum_name(status.trading_status),
+            limit_order_available=bool(status.limit_order_available_flag),
+            api_trade_available=True,
+            captured_at=status.time,
         )
     if candle := getattr(response, "candle", None):
         return StreamCandle(
-            candle.instrument_uid,
-            quotation_to_decimal(candle.open),
-            quotation_to_decimal(candle.high),
-            quotation_to_decimal(candle.low),
-            quotation_to_decimal(candle.close),
-            candle.volume,
-            candle.time,
-            True,
-            candle.last_trade_ts or candle.time,
+            instrument_id=candle.instrument_uid,
+            open=quotation_to_decimal(candle.open),
+            high=quotation_to_decimal(candle.high),
+            low=quotation_to_decimal(candle.low),
+            close=quotation_to_decimal(candle.close),
+            volume=candle.volume,
+            started_at=candle.time,
+            is_complete=True,
+            captured_at=candle.last_trade_ts or candle.time,
         )
     return None

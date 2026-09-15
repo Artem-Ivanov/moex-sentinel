@@ -57,14 +57,14 @@ class MarketDataBootstrapService:
         if not candle.is_complete:
             return
         historic = HistoricCandle(
-            candle.instrument_id,
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            candle.volume,
-            candle.started_at,
-            True,
+            instrument_id=candle.instrument_id,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            volume=candle.volume,
+            started_at=candle.started_at,
+            is_complete=True,
         )
         async with self._lock:
             current = self._completed.get(candle.instrument_id, ())

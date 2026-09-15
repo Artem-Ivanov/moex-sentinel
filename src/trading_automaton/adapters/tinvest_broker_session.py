@@ -157,14 +157,14 @@ class BrokerSdkSession:
         )
         return tuple(
             HistoricCandle(
-                instrument_id,
-                quotation_to_decimal(item.open),
-                quotation_to_decimal(item.high),
-                quotation_to_decimal(item.low),
-                quotation_to_decimal(item.close),
-                item.volume,
-                item.time,
-                item.is_complete,
+                instrument_id=instrument_id,
+                open=quotation_to_decimal(item.open),
+                high=quotation_to_decimal(item.high),
+                low=quotation_to_decimal(item.low),
+                close=quotation_to_decimal(item.close),
+                volume=item.volume,
+                started_at=item.time,
+                is_complete=item.is_complete,
             )
             for item in response.candles
         )

@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -11,10 +11,17 @@ from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import Broker, BrokerField
 from moex_sentinel.domain.portfolio import AccountPortfolio, BrokerAccount, ExternalOperation, Money, OperationsPage
 from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerState
-from moex_sentinel.services.portfolio_snapshot_collection import PortfolioSnapshotCollector
+from moex_sentinel.services.portfolio_snapshot_collection import (
+    AdapterFactory,
+    PortfolioSnapshotCollectionService,
+    Sleep,
+)
+from moex_sentinel.services.ports import BrokerRepositoryPort
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
-from moex_sentinel.storage.models import Base, PortfolioSnapshotModel
+from moex_sentinel.storage.models import Base, PortfolioSnapshotModel, PortfolioSnapshotRunModel
+from moex_sentinel.storage.portfolio_snapshot_collection import PortfolioSnapshotCollectionStore
 from moex_sentinel.storage.repositories.portfolio_snapshots import PortfolioSnapshotRepository
+from moex_sentinel.usecases.portfolio_snapshots import CollectPortfolioSnapshotsUsecase
 from tests.storage.trading_facts_helpers import user_broker_model
 
 NOW = datetime(2026, 8, 15, 10, tzinfo=UTC)
@@ -88,10 +95,58 @@ def broker(broker_id: str = "broker-1", account_id: str = "account-1") -> Broker
     )
 
 
+def build_collector(
+    brokers: BrokerRepositoryPort,
+    adapter_factory: AdapterFactory,
+    factory: sessionmaker[Session],
+    engine: Engine,
+    *,
+    clock: Callable[[], datetime],
+    retry_limit: int = 2,
+    retry_base_seconds: float = 1.0,
+    sleep: Sleep = asyncio.sleep,
+) -> CollectPortfolioSnapshotsUsecase:
+    store = PortfolioSnapshotCollectionStore(factory, engine)
+    collection = PortfolioSnapshotCollectionService(
+        brokers,
+        adapter_factory,
+        store,
+        clock=clock,
+        retry_limit=retry_limit,
+        retry_base_seconds=retry_base_seconds,
+        sleep=sleep,
+    )
+    return CollectPortfolioSnapshotsUsecase(collection, store, clock=clock)
+
+
+def test_failed_commit_rolls_back_run_and_snapshots(database: tuple[Engine, sessionmaker[Session]]) -> None:
+    class FailingCommitSession(Session):
+        def commit(self) -> None:
+            self.flush()
+            raise RuntimeError("synthetic commit failure")
+
+    engine, factory = database
+    failing_factory = sessionmaker(bind=engine, class_=FailingCommitSession)
+    collector = build_collector(
+        BrokerRepository([broker()]),
+        lambda _broker: PortfolioAdapter(),
+        failing_factory,
+        engine,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic commit failure"):
+        asyncio.run(collector.execute())
+
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(PortfolioSnapshotRunModel)) == 0
+        assert session.scalar(select(func.count()).select_from(PortfolioSnapshotModel)) == 0
+
+
 def test_first_snapshot_starts_at_zero(database: tuple[Engine, sessionmaker[Session]]) -> None:
     engine, factory = database
     adapter = PortfolioAdapter()
-    collector = PortfolioSnapshotCollector(
+    collector = build_collector(
         BrokerRepository([broker()]),
         lambda _broker: adapter,
         factory,
@@ -99,7 +154,7 @@ def test_first_snapshot_starts_at_zero(database: tuple[Engine, sessionmaker[Sess
         clock=lambda: NOW,
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     with factory() as session:
         saved = PortfolioSnapshotRepository(session).latest("broker-1", "account-1", "RUB")
@@ -127,17 +182,15 @@ def test_next_snapshot_excludes_cash_movements_but_includes_commission_loss(
 ) -> None:
     engine, factory = database
     adapter = PortfolioAdapter()
-    first = PortfolioSnapshotCollector(
-        BrokerRepository([broker()]), lambda _broker: adapter, factory, engine, clock=lambda: NOW
-    )
-    asyncio.run(first.collect_once())
+    first = build_collector(BrokerRepository([broker()]), lambda _broker: adapter, factory, engine, clock=lambda: NOW)
+    asyncio.run(first.execute())
     adapter.total_value = Decimal("173")
     adapter.operations = (
         external_operation("deposit", "OPERATION_TYPE_INPUT", "100"),
         external_operation("withdrawal", "OPERATION_TYPE_OUTPUT", "-25"),
         external_operation("commission", "OPERATION_TYPE_BROKER_FEE", "-2"),
     )
-    second = PortfolioSnapshotCollector(
+    second = build_collector(
         BrokerRepository([broker()]),
         lambda _broker: adapter,
         factory,
@@ -145,7 +198,7 @@ def test_next_snapshot_excludes_cash_movements_but_includes_commission_loss(
         clock=lambda: NOW + timedelta(minutes=1),
     )
 
-    asyncio.run(second.collect_once())
+    asyncio.run(second.execute())
 
     with factory() as session:
         saved = PortfolioSnapshotRepository(session).latest("broker-1", "account-1", "RUB")
@@ -159,22 +212,18 @@ def test_previous_capture_boundary_operation_is_not_counted_twice(
     engine, factory = database
     adapter = PortfolioAdapter()
     repository = BrokerRepository([broker()])
-    asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
-    )
+    asyncio.run(build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute())
     adapter.operations = (external_operation("boundary", "OPERATION_TYPE_INPUT", "100"),)
     adapter.operations = (adapter.operations[0].model_copy(update={"occurred_at": NOW}),)
 
     asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=1),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -189,9 +238,9 @@ def test_cash_movements_are_read_from_every_operations_page(
     engine, factory = database
     adapter = PortfolioAdapter()
     asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker()]), lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
+        ).execute()
     )
     adapter.total_value = Decimal("173")
     adapter.pages = {
@@ -200,13 +249,13 @@ def test_cash_movements_are_read_from_every_operations_page(
     }
 
     asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker()]),
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=1),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -242,7 +291,7 @@ def test_unreadable_portfolio_skips_only_that_account(
         "broker-1": PartiallyFailingAdapter(),
         "broker-2": HealthyAdapter(),
     }
-    collector = PortfolioSnapshotCollector(
+    collector = build_collector(
         BrokerRepository([broker("broker-1", "account-2"), broker("broker-2", "account-3")]),
         lambda value: adapters[value.id],
         factory,
@@ -250,7 +299,7 @@ def test_unreadable_portfolio_skips_only_that_account(
         clock=lambda: NOW,
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     with factory() as session:
         repository = PortfolioSnapshotRepository(session)
@@ -284,21 +333,17 @@ def test_unreadable_cash_operations_do_not_create_a_new_snapshot(
     engine, factory = database
     adapter = OperationsFailingAdapter()
     repository = BrokerRepository([broker()])
-    asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
-    )
+    asyncio.run(build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute())
     adapter.total_value = Decimal("101")
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=1),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -329,7 +374,7 @@ def test_retryable_broker_error_uses_bounded_exponential_backoff(
     engine, factory = database
     adapter = RetryAdapter()
     delays: list[float] = []
-    collector = PortfolioSnapshotCollector(
+    collector = build_collector(
         BrokerRepository([broker()]),
         lambda _broker: adapter,
         factory,
@@ -340,7 +385,7 @@ def test_retryable_broker_error_uses_bounded_exponential_backoff(
         sleep=record_sleep,
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     assert result.saved == 1
     assert adapter.attempts == 3
@@ -376,14 +421,10 @@ def test_retryable_operations_page_is_retried_before_skipping_account(
     engine, factory = database
     adapter = RetryOperationsAdapter()
     repository = BrokerRepository([broker()])
-    asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
-    )
+    asyncio.run(build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute())
     adapter.total_value = Decimal("101")
     delays: list[float] = []
-    collector = PortfolioSnapshotCollector(
+    collector = build_collector(
         repository,
         lambda _broker: adapter,
         factory,
@@ -394,7 +435,7 @@ def test_retryable_operations_page_is_retried_before_skipping_account(
         sleep=record_sleep,
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     assert result.saved == 1
     assert result.errors == ()
@@ -414,7 +455,7 @@ def test_unreadable_broker_account_list_does_not_block_other_brokers(
         session.add(user_broker_model("broker-2", "account-2"))
         session.commit()
     adapters = {"broker-1": FailingAccountsAdapter(), "broker-2": PortfolioAdapter()}
-    collector = PortfolioSnapshotCollector(
+    collector = build_collector(
         BrokerRepository([broker("broker-1"), broker("broker-2")]),
         lambda value: adapters[value.id],
         factory,
@@ -422,7 +463,7 @@ def test_unreadable_broker_account_list_does_not_block_other_brokers(
         clock=lambda: NOW,
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     with factory() as session:
         saved = PortfolioSnapshotRepository(session).latest("broker-2", "account-1", "RUB")
@@ -446,13 +487,13 @@ def test_invalid_broker_configuration_does_not_block_other_brokers(
         return PortfolioAdapter()
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker("broker-1"), broker("broker-2")]),
             adapter_factory,
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     assert result.saved == 1
@@ -475,13 +516,13 @@ def test_incompatible_portfolio_currency_is_reported_and_not_persisted(
 
     engine, factory = database
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker()]),
             lambda _broker: MixedCurrencyAdapter(),
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     assert result.saved == 0
@@ -499,13 +540,13 @@ def test_cash_movement_after_run_timestamp_rejects_first_snapshot(
     moments = iter((NOW, NOW + timedelta(seconds=10), NOW + timedelta(seconds=40)))
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker()]),
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: next(moments),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -521,11 +562,7 @@ def test_cash_movement_after_run_timestamp_rejects_followup_snapshot(
     engine, factory = database
     adapter = PortfolioAdapter()
     repository = BrokerRepository([broker()])
-    asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
-    )
+    asyncio.run(build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute())
     adapter.total_value = Decimal("200")
     adapter.operations = (
         external_operation("late-deposit", "OPERATION_TYPE_INPUT", "100").model_copy(
@@ -536,13 +573,13 @@ def test_cash_movement_after_run_timestamp_rejects_followup_snapshot(
     moments = iter((run_at, run_at + timedelta(seconds=5), run_at + timedelta(seconds=30)))
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: next(moments),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -596,13 +633,13 @@ def test_unstorable_account_amount_does_not_block_valid_account(
     }
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker("broker-1"), broker("broker-2", "account-2")]),
             lambda value: adapters[value.id],
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -621,18 +658,16 @@ def test_repeated_collection_in_same_minute_reports_skip_without_duplicates(
     adapter = PortfolioAdapter()
     repository = BrokerRepository([broker()])
     first = asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
+        build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute()
     )
     second = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(seconds=30),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -651,29 +686,27 @@ def test_stale_bucket_returns_the_existing_run_without_collecting_duplicate(
     adapter = PortfolioAdapter()
     repository = BrokerRepository([broker()])
     first = asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
+        build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute()
     )
     asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=1),
-        ).collect_once()
+        ).execute()
     )
     adapter.total_value = Decimal("999")
 
     stale = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(seconds=30),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -691,30 +724,26 @@ def test_unseen_stale_bucket_returns_latest_run_without_building_from_future(
     engine, factory = database
     adapter = PortfolioAdapter()
     repository = BrokerRepository([broker()])
-    asyncio.run(
-        PortfolioSnapshotCollector(
-            repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW
-        ).collect_once()
-    )
+    asyncio.run(build_collector(repository, lambda _broker: adapter, factory, engine, clock=lambda: NOW).execute())
     latest = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=2),
-        ).collect_once()
+        ).execute()
     )
     adapter.total_value = Decimal("999")
 
     stale = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             repository,
             lambda _broker: adapter,
             factory,
             engine,
             clock=lambda: NOW + timedelta(minutes=1),
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -739,13 +768,13 @@ def test_collection_only_reads_the_configured_external_account(
 
     engine, factory = database
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([broker(account_id="account-1")]),
             lambda _broker: MultiAccountAdapter(),
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -772,13 +801,13 @@ def test_draft_user_broker_is_not_collected(database: tuple[Engine, sessionmaker
     )
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([draft]),
             lambda _broker: PortfolioAdapter(),
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     assert result.saved == 0
@@ -802,13 +831,13 @@ def test_active_production_user_broker_collects_its_external_account(
     )
 
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository([active]),
             lambda _broker: PortfolioAdapter(),
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:
@@ -832,7 +861,7 @@ def test_two_scopes_with_shared_account_visibility_are_not_double_counted(
         session.add(user_broker_model("broker-2", "account-2"))
         session.commit()
     result = asyncio.run(
-        PortfolioSnapshotCollector(
+        build_collector(
             BrokerRepository(
                 [
                     broker("broker-1", "account-1"),
@@ -843,7 +872,7 @@ def test_two_scopes_with_shared_account_visibility_are_not_double_counted(
             factory,
             engine,
             clock=lambda: NOW,
-        ).collect_once()
+        ).execute()
     )
 
     with factory() as session:

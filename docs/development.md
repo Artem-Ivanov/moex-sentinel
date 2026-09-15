@@ -150,3 +150,27 @@ docker compose config --quiet
 ```
 
 PostgreSQL integration запускается только с отдельной тестовой БД через `POSTGRES_TEST_DATABASE_URL`. Runtime-проверка переключения находится в [clean-slate-cutover.md](clean-slate-cutover.md).
+
+
+## Правила тестового setup и прикладных границ
+
+Общие builders располагаются в тематических helper-модулях, а владение engine,
+Session и HTTP client — в function-scoped fixtures с гарантированным закрытием.
+Начальное торговое состояние задаётся в тесте явно. Длинная последовательность
+reopen/replay/ACK остаётся одним сценарием; независимые endpoints и операции SDK
+проверяются отдельно. Одинаковые варианты используют именованную параметризацию.
+
+Pydantic DTO изменяются через явный конструктор, когда нужна повторная валидация.
+`model_copy(update=...)` не заменяет её. Глобальных подмен `dataclasses.replace`
+и `dataclasses.asdict` в pytest нет. Positional constructor compatibility DTO пока
+сохранена; длинные production-вызовы используют именованные поля.
+
+При проверке архитектуры оцениваются направление зависимостей, владельцы
+транзакций и ресурсов, а также поведение внедрённых зависимостей. Новые тесты
+AST/import-графа не добавляются. Разовые скрипты миграции и инвентаризации находятся
+в `develop/`, их результаты не являются runtime-тестами архитектуры.
+
+План и свидетельства текущего упрощения:
+[план](superpowers/plans/2026-09-15-code-and-test-simplification.md),
+[код](audits/2026-09-15-code-simplification.md),
+[тесты](audits/2026-09-15-test-simplification.md).

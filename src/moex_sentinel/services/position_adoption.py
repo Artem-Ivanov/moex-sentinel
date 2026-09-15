@@ -1,5 +1,6 @@
 """Validation and orchestration for clean-start broker positions."""
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol
@@ -13,7 +14,40 @@ from moex_sentinel.domain.position_adoption import (
     PositionAdoptionResult,
     PositionAdoptionWriteResult,
 )
+from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerState
 from moex_sentinel.services.portfolio_ports import PositionAdoptionBrokerPort
+
+
+class PositionAdoptionServicePort(Protocol):
+    async def adopt(
+        self, user_broker_id: str, account_id: str, broker: PositionAdoptionBrokerPort
+    ) -> PositionAdoptionResult: ...
+
+
+class ConfiguredPositionAdoptionPort(Protocol):
+    async def adopt(self, user_broker_id: str) -> PositionAdoptionResult: ...
+
+
+class ConfiguredPositionAdoptionService:
+    """Resolve a configured broker and validate its account before adopting positions."""
+
+    def __init__(
+        self,
+        service: PositionAdoptionServicePort,
+        broker_loader: Callable[[str], UserBroker],
+        adapter_factory: Callable[[UserBroker], PositionAdoptionBrokerPort],
+    ) -> None:
+        self._service = service
+        self._broker_loader = broker_loader
+        self._adapter_factory = adapter_factory
+
+    async def adopt(self, user_broker_id: str) -> PositionAdoptionResult:
+        """Adopt positions for an ACTIVE account; reject invalid configuration before adapter creation."""
+        broker = self._broker_loader(user_broker_id)
+        account_id = broker.external_account_id
+        if broker.state is not UserBrokerState.ACTIVE or not account_id:
+            raise ValueError("Position adoption requires an active broker account.")
+        return await self._service.adopt(user_broker_id, str(account_id), self._adapter_factory(broker))
 
 
 class PositionAdoptionRepositoryPort(Protocol):
@@ -97,4 +131,6 @@ class PositionAdoptionService:
                     adopted += 1
                 else:
                     existing += 1
-        return PositionAdoptionResult(adopted, existing, held, skipped, tuple(diagnostics))
+        return PositionAdoptionResult(
+            adopted=adopted, existing=existing, held=held, skipped=skipped, diagnostics=tuple(diagnostics)
+        )

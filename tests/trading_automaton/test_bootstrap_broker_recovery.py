@@ -6,6 +6,7 @@ import pytest
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from sentinel_contracts.trading import AutomationState
+from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.services.test_broker_tick_preparation_service import (
     AdoptedBroker,
     Bootstrap,
@@ -16,7 +17,7 @@ from tests.trading_automaton.services.test_broker_tick_preparation_service impor
 )
 from tests.trading_automaton.services.test_streaming_runtime_coordinator_service import bootstrap_command
 from tests.trading_automaton.test_analytics_runtime import FALLBACK, NOW, Source, Tick, frame
-from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache
+from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
 
 
@@ -74,7 +75,7 @@ def test_preparation_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_perma
             position_bootstrap=bootstrap,
             now=lambda: NOW,
         )
-        runtime = AnalyticsBrokerRuntime(
+        runtime = build_analytics_runtime(
             Source(frame()),
             tick,
             preparation=preparation,

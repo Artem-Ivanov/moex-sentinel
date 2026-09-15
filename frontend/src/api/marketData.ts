@@ -1,3 +1,5 @@
+import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+
 export interface MarketLastPrice {
   price: string
   captured_at: string
@@ -41,7 +43,7 @@ export class MarketDataApiError extends Error {
   constructor(
     public readonly code: string,
     message: string,
-    public readonly fields: Array<{ path: string; code: string; message: string }> = [],
+    public readonly fields: ApiFieldError[] = [],
   ) {
     super(message)
   }
@@ -49,15 +51,10 @@ export class MarketDataApiError extends Error {
 
 async function ensureSuccess(response: Response): Promise<Response> {
   if (response.ok) return response
-  try {
-    const payload = (await response.json()) as {
-      detail?: { code?: string; message?: string; fields?: Array<{ path: string; code: string; message: string }> }
-    }
-    if (payload.detail?.code && payload.detail.message) {
-      throw new MarketDataApiError(payload.detail.code, payload.detail.message, payload.detail.fields ?? [])
-    }
-  } catch (error: unknown) {
-    if (error instanceof MarketDataApiError) throw error
+  const payload = await readErrorPayload(response)
+  const detail = payload?.detail
+  if (detail?.code && detail.message) {
+    throw new MarketDataApiError(detail.code, detail.message, detail.fields ?? [])
   }
   throw new MarketDataApiError("MARKET_DATA_API_ERROR", "Не удалось получить рыночные данные.")
 }

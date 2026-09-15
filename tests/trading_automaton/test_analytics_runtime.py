@@ -15,9 +15,10 @@ from sentinel_contracts.analytics import (
 from sentinel_contracts.broker_execution import OrderBookLevel
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook, StreamTradingStatus
 from sentinel_contracts.trading import DecisionKind
+from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.command_factory import command
 from trading_automaton.domain.dtos import PositionEvaluationResult, PositionWorkItem, TradeDecision
-from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache
+from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
 
 NOW = datetime(2026, 9, 9, 12, tzinfo=UTC)
@@ -88,7 +89,7 @@ def runtime(source, *, now=lambda: NOW, after=lambda: None):
     metrics = AnalyticsMetricsCache()
     preparation = Preparation(metrics, after)
     tick = Tick()
-    result = AnalyticsBrokerRuntime(
+    result = build_analytics_runtime(
         source,
         tick,
         preparation=preparation,
@@ -214,3 +215,72 @@ def test_runtime_and_scheduler_share_evaluation_time_without_extending_source_tt
         assert snapshot.expires_at == min(NOW, book_at) + timedelta(seconds=2)
 
     asyncio.run(scenario())
+
+
+def test_command_replaced_during_preparation_cannot_start_old_decision():
+    async def scenario():
+        service, preparation, tick = runtime(Source(frame()))
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = command()
+
+        async def prepare(commands, snapshot):
+            entered.set()
+            await release.wait()
+
+        preparation.prepare = prepare
+        await service.replace_commands((original,))
+        iteration = asyncio.create_task(service.run_once())
+        try:
+            await entered.wait()
+            replacement = original.model_copy(update={"revision": original.revision + 1})
+            await service.replace_commands((replacement,))
+            release.set()
+            await iteration
+            assert tick.calls == []
+            await service.run_once()
+            assert tick.calls[0][0] == (replacement,)
+        finally:
+            release.set()
+            await iteration
+            await service.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))
+
+
+def test_close_waits_for_preparation_and_prevents_tick_before_closing_source():
+    async def scenario():
+        source = Source(frame())
+        service, preparation, tick = runtime(source)
+        entered, release, source_closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def prepare(commands, snapshot):
+            entered.set()
+            await release.wait()
+
+        async def close_source():
+            source_closed.set()
+
+        source.close = close_source
+        preparation.prepare = prepare
+        await service.replace_commands((command(),))
+        iteration = asyncio.create_task(service.run_once())
+        closing = None
+        try:
+            await entered.wait()
+            closing = asyncio.create_task(service.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            assert not source_closed.is_set()
+            release.set()
+            await asyncio.gather(iteration, closing)
+            assert tick.calls == []
+            assert source_closed.is_set()
+        finally:
+            release.set()
+            await iteration
+            if closing is not None:
+                await closing
+            else:
+                await service.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=2))

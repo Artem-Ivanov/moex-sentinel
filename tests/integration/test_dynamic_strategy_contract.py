@@ -21,7 +21,7 @@ from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUni
 from sentinel_contracts.analytics import MarketSourceSnapshot
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerOrderState, BrokerPosition
 from tests.integration.test_analytics_worker_contract import ExecutionSession
-from tests.market_analytics.test_app import NOW, Source, instrument
+from tests.market_analytics.market_source_helpers import NOW, Source, instrument
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 from tests.trading_automaton.command_factory import command
 from trading_automaton.adapters.analytics_client import AnalyticsClient

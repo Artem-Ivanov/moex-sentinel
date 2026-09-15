@@ -15,9 +15,10 @@ from moex_sentinel.domain.instrument_catalog import (
 )
 from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.services.instrument_catalog import (
-    CATEGORY_LABELS,
+    InstrumentCategoryError,
     InstrumentLotPriceRangeError,
 )
+from moex_sentinel.services.position_adoption import ConfiguredPositionAdoptionPort
 from moex_sentinel.usecases.errors import UseCaseError
 
 
@@ -40,30 +41,48 @@ class InstrumentCatalogServicePort(Protocol):
     def set_selected(self, broker_id: str, instrument_id: str, selected: bool) -> CatalogInstrument: ...
 
 
-class PositionAdoptionUsecasePort(Protocol):
-    async def execute(self, broker_id: str) -> object: ...
-
-
 class SynchronizeBrokerInstrumentsUsecase:
+    """Synchronize the catalog and optional adoption, preserving declared application errors."""
+
     def __init__(
         self,
         service: InstrumentCatalogServicePort,
-        position_adoption: PositionAdoptionUsecasePort | None = None,
+        position_adoption: ConfiguredPositionAdoptionPort | None = None,
     ) -> None:
         self._service = service
         self._position_adoption = position_adoption
 
     async def execute(self, broker_id: str) -> CatalogReconciliationResult:
+        """Return catalog reconciliation after optional adoption; translate known service failures."""
         try:
             result = await self._service.synchronize(broker_id)
             if self._position_adoption is not None:
-                await self._position_adoption.execute(broker_id)
+                await self._position_adoption.adopt(broker_id)
             return result
-        except Exception as error:
-            raise _catalog_error(error) from error
+        except CatalogInstrumentNotFoundError as error:
+            raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except InstrumentLotPriceRangeError as error:
+            raise UseCaseError(
+                "INVALID_LOT_PRICE_RANGE",
+                str(error),
+                (
+                    FieldError("lot_price_from", "INVALID_RANGE", str(error)),
+                    FieldError("lot_price_to", "INVALID_RANGE", str(error)),
+                ),
+            ) from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error
 
 
 class ViewBrokerInstrumentsUsecase:
+    """Read catalog selections with stable category, range and broker error payloads."""
+
     def __init__(self, service: InstrumentCatalogServicePort) -> None:
         self._service = service
 
@@ -77,12 +96,7 @@ class ViewBrokerInstrumentsUsecase:
         lot_price_to: Decimal | None,
         currency: str = "RUB",
     ) -> CatalogListView:
-        if category is not None and category not in CATEGORY_LABELS:
-            raise UseCaseError(
-                "INVALID_INSTRUMENT_CATEGORY",
-                "Неизвестная категория инструментов.",
-                (FieldError("category", "UNSUPPORTED", "Выберите доступную категорию."),),
-            )
+        """Return filtered catalog instruments; report invalid filters and known broker failures."""
         try:
             return await self._service.list(
                 broker_id,
@@ -93,50 +107,90 @@ class ViewBrokerInstrumentsUsecase:
                 lot_price_to,
                 currency,
             )
-        except Exception as error:
-            raise _catalog_error(error) from error
+        except InstrumentCategoryError as error:
+            raise UseCaseError(
+                "INVALID_INSTRUMENT_CATEGORY",
+                "Неизвестная категория инструментов.",
+                (FieldError("category", "UNSUPPORTED", "Выберите доступную категорию."),),
+            ) from error
+        except CatalogInstrumentNotFoundError as error:
+            raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except InstrumentLotPriceRangeError as error:
+            raise UseCaseError(
+                "INVALID_LOT_PRICE_RANGE",
+                str(error),
+                (
+                    FieldError("lot_price_from", "INVALID_RANGE", str(error)),
+                    FieldError("lot_price_to", "INVALID_RANGE", str(error)),
+                ),
+            ) from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error
 
 
 class ViewInstrumentDetailsUsecase:
+    """Read catalog details and translate declared lookup or broker failures."""
+
     def __init__(self, service: InstrumentCatalogServicePort) -> None:
         self._service = service
 
     async def execute(self, broker_id: str, instrument_id: str) -> InstrumentDetailsView:
+        """Return catalog instrument details; translate known lookup and broker failures."""
         try:
             return await self._service.details(broker_id, instrument_id)
-        except Exception as error:
-            raise _catalog_error(error) from error
+        except CatalogInstrumentNotFoundError as error:
+            raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except InstrumentLotPriceRangeError as error:
+            raise UseCaseError(
+                "INVALID_LOT_PRICE_RANGE",
+                str(error),
+                (
+                    FieldError("lot_price_from", "INVALID_RANGE", str(error)),
+                    FieldError("lot_price_to", "INVALID_RANGE", str(error)),
+                ),
+            ) from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error
 
 
 class SetInstrumentSelectionUsecase:
+    """Update catalog selection and translate declared service failures."""
+
     def __init__(self, service: InstrumentCatalogServicePort) -> None:
         self._service = service
 
     def execute(self, broker_id: str, instrument_id: str, selected: bool) -> CatalogInstrument:
+        """Return the updated catalog instrument; translate known lookup and broker failures."""
         try:
             return self._service.set_selected(broker_id, instrument_id, selected)
-        except Exception as error:
-            raise _catalog_error(error) from error
-
-
-def _catalog_error(error: Exception) -> UseCaseError:
-    if isinstance(error, CatalogInstrumentNotFoundError):
-        return UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.")
-    if isinstance(error, BrokerRecordNotFoundError):
-        return UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.")
-    if isinstance(error, TInvestAdapterError):
-        return UseCaseError(error.code, str(error))
-    if isinstance(error, EnvironmentMismatchError):
-        return UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.")
-    if isinstance(error, InstrumentLotPriceRangeError):
-        return UseCaseError(
-            "INVALID_LOT_PRICE_RANGE",
-            str(error),
-            (
-                FieldError("lot_price_from", "INVALID_RANGE", str(error)),
-                FieldError("lot_price_to", "INVALID_RANGE", str(error)),
-            ),
-        )
-    if isinstance(error, ValueError):
-        return UseCaseError("BROKER_CONFIGURATION", str(error))
-    raise error
+        except CatalogInstrumentNotFoundError as error:
+            raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except InstrumentLotPriceRangeError as error:
+            raise UseCaseError(
+                "INVALID_LOT_PRICE_RANGE",
+                str(error),
+                (
+                    FieldError("lot_price_from", "INVALID_RANGE", str(error)),
+                    FieldError("lot_price_to", "INVALID_RANGE", str(error)),
+                ),
+            ) from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error

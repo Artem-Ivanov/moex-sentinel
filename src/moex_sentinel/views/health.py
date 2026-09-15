@@ -1,13 +1,12 @@
 """Public health View."""
 
-from collections.abc import Callable
 from typing import Literal, cast
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import ConfigDict, Field
-from sqlalchemy import Engine
 
 from moex_sentinel import __version__
+from moex_sentinel.usecases.health import CheckReadinessUsecase
 from sentinel_contracts.base import PositionalModel
 
 router = APIRouter()
@@ -28,38 +27,14 @@ class HealthResponse(PositionalModel):
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request, response: Response) -> HealthResponse:
     """Report HTTP and database readiness without leaking connection errors."""
-    engine = cast(Engine, request.app.state.database_engine)
-    checker = cast(Callable[[Engine], bool], request.app.state.database_checker)
-    try:
-        database_ok = checker(engine)
-    except Exception:
-        database_ok = False
-
-    if not database_ok:
+    usecase = cast(CheckReadinessUsecase, request.app.state.readiness_usecase)
+    readiness = usecase.execute()
+    ready = readiness.database_ok and readiness.schema_ok
+    if not ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return HealthResponse(
-            status="error",
-            version=__version__,
-            database="error",
-            schema="incompatible",
-        )
-
-    schema_checker = cast(Callable[[Engine], bool], request.app.state.schema_checker)
-    try:
-        schema_ok = schema_checker(engine)
-    except Exception:
-        schema_ok = False
-    if not schema_ok:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return HealthResponse(
-            status="error",
-            version=__version__,
-            database="ok",
-            schema="incompatible",
-        )
     return HealthResponse(
-        status="ok",
+        status="ok" if ready else "error",
         version=__version__,
-        database="ok",
-        schema="compatible",
+        database="ok" if readiness.database_ok else "error",
+        schema="compatible" if readiness.schema_ok else "incompatible",
     )

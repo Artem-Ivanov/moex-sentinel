@@ -12,8 +12,7 @@ from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.automations import AutomationRepository, RevisionConflictError
 from sentinel_contracts.trading import AutomationState
 from tests.storage.test_automation_command_repository import AUTOMATION_ID, repository
-from tests.storage.test_trading_facts_models import automation_model
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 
 
 def test_public_state_write_rejects_stale_revision() -> None:

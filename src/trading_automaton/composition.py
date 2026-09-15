@@ -17,14 +17,22 @@ from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
 from trading_automaton.config import AutomatonSettings, StrategySettings
 from trading_automaton.domain.core_contracts import AutomationStatusesResult
+from trading_automaton.runtime.analytics_broker import AnalyticsBrokerRuntime, AnalyticsPort
+from trading_automaton.runtime.streaming_coordinator import (
+    CoordinatorCorePort,
+    RuntimePort,
+    StreamingRuntimeCoordinator,
+)
 from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.account_commission_profile import AccountCommissionProfileService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
-from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache, AnalyticsPort
+from trading_automaton.services.analytics_frame import AnalyticsFrameService, AnalyticsMetricsCache
+from trading_automaton.services.automation_lifecycle import WorkerAutomationLifecycleService
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
 from trading_automaton.services.broker_rate_limit import BrokerRateLimitService
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
 from trading_automaton.services.business_audit import BusinessAuditService
+from trading_automaton.services.decision import TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
 from trading_automaton.services.decision_materialization import DecisionMaterializerService
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
@@ -41,21 +49,23 @@ from trading_automaton.services.position_state_hydration import (
     PositionStateCacheService,
     PositionStateHydrationService,
 )
+from trading_automaton.services.recovery import RecoveryService
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import StreamingPositionDecisionService
-from trading_automaton.services.streaming_runtime_coordinator import (
-    CoordinatorCorePort,
-    CoordinatorSynchronizationPort,
-    RuntimePort,
-    StreamingRuntimeCoordinatorService,
-)
+from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
 )
 from trading_automaton.storage.database import create_worker_engine
 from trading_automaton.storage.models import Base
 from trading_automaton.storage.repository import LocalAutomationRepository
+from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
+from trading_automaton.usecases.recover_worker_run import RecoverWorkerRunUsecase
+from trading_automaton.usecases.synchronize_runtime import (
+    CoordinatorSynchronizationPort,
+    SynchronizeTradingRuntimeUsecase,
+)
 
 
 class BrokerSessionClosePort(Protocol):
@@ -136,6 +146,7 @@ async def build_broker_runtime(
     analytics_url: str = "http://analytics:8001",
     analytics_client: AnalyticsPort | None = None,
 ) -> BrokerRuntimeBundle:
+    """Assemble a broker bundle whose close releases Analytics and the started SDK session."""
     if connection.adapter_code != "TINVEST_SANDBOX" or not connection.is_test:
         raise ValueError("Only T-Invest Sandbox brokers are enabled in this MVP.")
     session = session_factory(connection)
@@ -160,17 +171,19 @@ async def build_broker_runtime(
         now=now,
         prepared_metrics=metrics,
     )
+    order_books = OrderBookValidationService()
     decider = StreamingPositionDecisionService(
         position_states,
         commission_profiles,
         cash=cash,
         contexts=DecisionContextService(strategy_settings),
+        decisions=TradeDecisionService(),
         now=now,
     )
     scheduler = PositionBatchSchedulerService(
         decider,
         rate_limit=BrokerRateLimitService(capacity=2, refill_per_second=2.0),
-        order_books=OrderBookValidationService(),
+        order_books=order_books,
         active_intents=active_intents,
     )
     tracking = OrderTrackingService(
@@ -197,13 +210,13 @@ async def build_broker_runtime(
     tick = StreamingBatchTickService(
         scheduler,
         position_states,
-        commission_profiles,
         batch,
         cash=cash,
-        cycles=StreamingCycleTransitionService(now=now),
+        cycles=StreamingCycleTransitionService(now=now, cycles=TradingCycleService(), order_books=order_books),
         now=now,
         audit=business_audit,
         materializer=DecisionMaterializerService(settings=strategy_settings),
+        order_books=order_books,
     )
     preparation = BrokerTickPreparationService(
         session,
@@ -225,8 +238,8 @@ async def build_broker_runtime(
         now=now,
     )
     analytics = analytics_client or AnalyticsClient(httpx.AsyncClient(base_url=analytics_url, timeout=1.0))
-    runtime = AnalyticsBrokerRuntime(
-        analytics,
+    iteration = RunBrokerIterationUsecase(
+        AnalyticsFrameService(analytics, now=now, order_books=order_books),
         tick,
         preparation=preparation,
         metrics=metrics,
@@ -237,21 +250,32 @@ async def build_broker_runtime(
             "STRATEGY",
         ),
         persistence_failure=PersistenceFailureService(repository),
-        now=now,
+    )
+    runtime = AnalyticsBrokerRuntime(
+        analytics,
+        iteration,
         tick_seconds=tick_seconds,
         retry_limit=retry_limit,
     )
     return BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
 
 
+def build_worker_recovery(repository: LocalAutomationRepository, worker_id: str) -> RecoverWorkerRunUsecase:
+    """Compose startup recovery around the same durable repository used by the runtime."""
+    return RecoverWorkerRunUsecase(repository, RecoveryService(repository), worker_id=worker_id)
+
+
 def build_streaming_runtime(
     settings: AutomatonSettings,
     strategy_settings: StrategySettings,
 ) -> tuple[
-    StreamingRuntimeCoordinatorService,
+    StreamingRuntimeCoordinator,
     LocalAutomationRepository,
     httpx.Client,
 ]:
+    """Return the coordinator, repository and Core HTTP client.
+
+    The caller closes the coordinator, finishes its run marker and closes HTTP."""
     engine = create_worker_engine(settings.database_url)
     Base.metadata.create_all(engine)
     repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
@@ -283,9 +307,16 @@ def build_streaming_runtime(
             analytics_url=settings.analytics_url,
         )
 
-    runtime = StreamingRuntimeCoordinatorService(
+    iteration = SynchronizeTradingRuntimeUsecase(
         repository,
         synchronization,
+        coordinator_core,
+        WorkerAutomationLifecycleService(repository),
+        worker_id=settings.worker_id,
+        now=now,
+    )
+    runtime = StreamingRuntimeCoordinator(
+        iteration,
         coordinator_core,
         builder,
         worker_id=settings.worker_id,

@@ -61,6 +61,7 @@ from trading_automaton.domain.storage_dtos import (
     TradeLotRecord,
     TradingCycleState,
 )
+from trading_automaton.domain.trading_cycle import mark_buy, mark_sell
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import (
     AccountCommissionProfileModel,
@@ -368,16 +369,20 @@ class LocalAutomationRepository:
     def _finalize_trading_cycle(
         self, session: Session, intent: LocalIntentModel, finalization: ExecutionFinalization
     ) -> None:
-        # Imported here because the service's public state alias lives in this repository.
-        from trading_automaton.services.trading_cycle import TradingCycleService  # noqa: PLC0415
-
+        """Write the execution transition in the caller's transaction, keeping monotonic time markers."""
         model = session.get(TradingCycleStateModel, intent.automation_id)
         state = (
             self._cycle_record(model)
             if model is not None
-            else TradingCycleState(intent.automation_id, None, None, True, None, finalization.occurred_at)
+            else TradingCycleState(
+                automation_id=intent.automation_id,
+                pending_low=None,
+                last_buy_candle_at=None,
+                sell_armed=True,
+                last_sell_price=None,
+                updated_at=finalization.occurred_at,
+            )
         )
-        service = TradingCycleService()
         now = max(state.updated_at, finalization.occurred_at)
         if intent.side == "BUY":
             candle_at = (finalization.executed_at or finalization.occurred_at).replace(second=0, microsecond=0)
@@ -386,9 +391,9 @@ class LocalAutomationRepository:
                 candle_at = datetime.fromisoformat(stored_candle)
             if state.last_buy_candle_at is not None:
                 candle_at = max(candle_at, state.last_buy_candle_at)
-            state = service.mark_buy(state, candle_at, now=now)
+            state = mark_buy(state, candle_at, now=now)
         else:
-            state = service.mark_sell(state, finalization.executed_price, now=now)
+            state = mark_sell(state, finalization.executed_price, now=now)
         if model is None:
             model = TradingCycleStateModel(automation_id=intent.automation_id)
             session.add(model)
@@ -1487,13 +1492,13 @@ class LocalAutomationRepository:
                 commission = max(intent.estimated_commission, Decimal(decision_commission or 0))
                 reservations.append(
                     ActiveBuyIntentReservation(
-                        intent.idempotency_key,
-                        str(command.broker_id),
-                        command.account_id,
-                        command.currency,
-                        intent.limit_price * command.lot_size * intent.quantity_lots + commission,
-                        intent.side,
-                        intent.state,
+                        intent_id=intent.idempotency_key,
+                        broker_id=str(command.broker_id),
+                        account_id=command.account_id,
+                        currency=command.currency,
+                        amount=intent.limit_price * command.lot_size * intent.quantity_lots + commission,
+                        side=intent.side,
+                        state=intent.state,
                     )
                 )
             return tuple(reservations)
@@ -2028,25 +2033,25 @@ class LocalAutomationRepository:
     @staticmethod
     def _lot_record(model: TradeLotModel, source_intent_kind: str | None = None) -> TradeLotRecord:
         return TradeLotRecord(
-            model.id,
-            model.automation_id,
-            model.source_intent_id,
-            model.source,
-            model.original_lots,
-            model.remaining_lots,
-            model.entry_price,
-            model.entry_commission,
-            model.opened_at,
-            source_intent_kind,
+            id=model.id,
+            automation_id=model.automation_id,
+            source_intent_id=model.source_intent_id,
+            source=model.source,
+            original_lots=model.original_lots,
+            remaining_lots=model.remaining_lots,
+            entry_price=model.entry_price,
+            entry_commission=model.entry_commission,
+            opened_at=model.opened_at,
+            source_intent_kind=source_intent_kind,
         )
 
     @staticmethod
     def _cycle_record(model: TradingCycleStateModel) -> TradingCycleState:
         return TradingCycleState(
-            model.automation_id,
-            model.pending_low,
-            model.last_buy_candle_at,
-            model.sell_armed,
-            model.last_sell_price,
-            model.updated_at,
+            automation_id=model.automation_id,
+            pending_low=model.pending_low,
+            last_buy_candle_at=model.last_buy_candle_at,
+            sell_armed=model.sell_armed,
+            last_sell_price=model.last_sell_price,
+            updated_at=model.updated_at,
         )

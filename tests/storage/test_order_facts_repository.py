@@ -1,7 +1,5 @@
 """Baseline order facts repository tests."""
 
-from collections.abc import Iterator
-
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
@@ -15,21 +13,17 @@ from moex_sentinel.domain.trading_facts import (
     TradingFactErrorCode,
     TradingFactPersistenceError,
 )
-from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.order_facts import OrderFactsRepository
-from tests.domain.test_trading_facts import all_fact_drafts
-from tests.storage.test_trading_facts_models import automation_model, seed_cycle
+from tests.domain.trading_facts_helpers import all_fact_drafts
+from tests.storage.trading_facts_helpers import automation_model, seed_cycle
 
 
 @pytest.fixture
-def database() -> Iterator[tuple[Engine, Session]]:
-    engine = create_database_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_cycle(session)
-        yield engine, session
-    engine.dispose()
+def database(core_database: tuple[Engine, Session]) -> tuple[Engine, Session]:
+    """Seed the cycle required by these order-fact scenarios."""
+    _, session = core_database
+    seed_cycle(session)
+    return core_database
 
 
 def fact_value(value_type):

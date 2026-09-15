@@ -9,12 +9,12 @@ from typing import Protocol
 from sentinel_contracts.broker_execution import BrokerOrderState
 from trading_automaton.domain.dtos import BatchTickResult, CommittedCashReservation, DispatchRequest
 from trading_automaton.domain.errors import DurableDecisionPersistenceError
-from trading_automaton.services.active_intent_gate import ActiveIntentGateService
-from trading_automaton.services.trading_sla import TradingSlaService
-from trading_automaton.storage.repository import (
+from trading_automaton.domain.storage_dtos import (
     BatchPersistResult,
     DecisionBatchItem,
 )
+from trading_automaton.services.active_intent_gate import ActiveIntentGateService
+from trading_automaton.services.trading_sla import TradingSlaService
 
 
 class BatchRepositoryPort(Protocol):
@@ -130,18 +130,16 @@ class BatchTradingRuntimeService:
         items: tuple[DecisionBatchItem, ...],
         requests: tuple[DispatchRequest, ...],
     ) -> dict[str, DispatchRequest]:
-        intent_items = tuple(item for item in items if item.intent is not None)
-        intent_ids = tuple(item.intent.idempotency_key for item in intent_items if item.intent is not None)
+        """Require matching intent/request fields and a bijection before persistence; otherwise raise ValueError."""
+        intent_items = tuple((item, item.intent) for item in items if item.intent is not None)
+        intent_ids = tuple(intent.idempotency_key for _, intent in intent_items)
         request_ids = tuple(request.idempotency_key for request in requests)
         if len(intent_ids) != len(set(intent_ids)) or len(request_ids) != len(set(request_ids)):
             raise ValueError("intent request mapping contains duplicate identifiers")
         if set(intent_ids) != set(request_ids):
             raise ValueError("intent request mapping is not bijective")
         request_by_id = {request.idempotency_key: request for request in requests}
-        for item in intent_items:
-            intent = item.intent
-            if intent is None:
-                continue
+        for item, intent in intent_items:
             request = request_by_id[intent.idempotency_key]
             expected_cash = (
                 intent.limit_price * item.lot_size * intent.quantity_lots + item.estimated_commission

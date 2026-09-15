@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
+from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from sentinel_contracts.broker_execution import BrokerOrderState
 from sentinel_contracts.business_audit import BusinessAuditStage
 from trading_automaton.domain.dtos import DispatchRequest
@@ -29,6 +30,8 @@ class DispatchRepositoryPort(IntentUpdatePort, Protocol):
 
 
 class OrderDispatchService:
+    """Dispatch durable intents and reconcile ambiguous failures without repeating submission."""
+
     def __init__(
         self,
         repository: DispatchRepositoryPort,
@@ -47,6 +50,7 @@ class OrderDispatchService:
         request: DispatchRequest,
         started: "asyncio.Future[datetime]",
     ) -> BrokerOrderState:
+        """Record submission, then return or reconcile its result; unresolved intents become UNCERTAIN."""
         dispatched_at = self._now()
         if self._market_expired(request):
             return self._cancel_expired(request, started)
@@ -101,6 +105,12 @@ class OrderDispatchService:
                 )
             return response
         except Exception as error:
+            # Submission may have reached the broker even when local persistence fails.
+            # Reconcile every ambiguous result; only declared port errors carry safe text.
+            broker_error_code = error.code if isinstance(error, TInvestAdapterError) else None
+            broker_error_details = (
+                str(error) if isinstance(error, TInvestAdapterError) else "Unexpected dispatch failure"
+            )
             reconciled, position, operations = await asyncio.gather(
                 self._broker.find_by_idempotency_key(request.account_id, request.idempotency_key),
                 self._broker.inspect_position(request.account_id, request.instrument_id),
@@ -130,8 +140,8 @@ class OrderDispatchService:
                         broker_order_state=reconciled.status,
                         broker_order_id=reconciled.broker_order_id,
                         exception_type=type(error).__name__,
-                        broker_error_code=_error_code(error),
-                        broker_error_details=_error_details(error),
+                        broker_error_code=broker_error_code,
+                        broker_error_details=broker_error_details,
                         position_snapshot=None if isinstance(position, Exception) else position,
                         recent_operations=[] if isinstance(operations, BaseException) else list(operations),
                     )
@@ -155,8 +165,8 @@ class OrderDispatchService:
                     critical=True,
                     broker_order_state="UNCERTAIN",
                     exception_type=type(error).__name__,
-                    broker_error_code=_error_code(error),
-                    broker_error_details=_error_details(error),
+                    broker_error_code=broker_error_code,
+                    broker_error_details=broker_error_details,
                     reconciliation_error=(type(reconciled).__name__ if isinstance(reconciled, Exception) else None),
                     position_snapshot=None if isinstance(position, Exception) else position,
                     recent_operations=[] if isinstance(operations, BaseException) else list(operations),
@@ -189,17 +199,3 @@ class OrderDispatchService:
             executed_commission=Decimal(),
             currency=request.reservation_currency,
         )
-
-
-def _error_code(error: Exception) -> str | None:
-    code = getattr(error, "code", None)
-    if not callable(code):
-        return None
-    value = code()
-    return getattr(value, "name", None) or str(value)
-
-
-def _error_details(error: Exception) -> str:
-    details = getattr(error, "details", None)
-    value = details() if callable(details) else str(error)
-    return str(value)[:1000]

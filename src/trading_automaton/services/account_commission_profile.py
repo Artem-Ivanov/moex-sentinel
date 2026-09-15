@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Protocol
 
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, CommissionSchedule
-from trading_automaton.storage.repository import (
+from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfile,
     AccountCommissionProfileKey,
 )

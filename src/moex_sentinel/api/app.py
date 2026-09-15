@@ -3,7 +3,8 @@
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import cast
+from functools import partial
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from fastapi import FastAPI, Request, Response
@@ -16,6 +17,8 @@ from moex_sentinel.config import Settings
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
 from moex_sentinel.usecases.errors import UseCaseError
+from moex_sentinel.usecases.health import CheckReadinessUsecase
+from moex_sentinel.usecases.market_snapshot import GetMarketSnapshotUsecase
 from moex_sentinel.views.automations import router as automation_router
 from moex_sentinel.views.brokers import router as broker_router
 from moex_sentinel.views.errors import render_usecase_error, render_validation_error
@@ -35,6 +38,9 @@ from sentinel_contracts.audit import (
 
 LOGGER = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
+
 
 def build_application_usecases(factory: object) -> object:
     """Load concrete dependencies only when the application lifespan starts."""
@@ -49,7 +55,7 @@ def check_database(engine: Engine) -> bool:
         return cast(int, connection.scalar(text("SELECT 1"))) == 1
 
 
-def build_market_snapshot_gateway(factory: object, *, retry_limit: int = 5) -> object:
+def build_market_snapshot_gateway(factory: object, *, retry_limit: int = 5) -> "MarketSnapshotGateway":
     """Construct the lazy market source owner without opening a broker connection."""
     from moex_sentinel.composition import build_market_snapshot_gateway as build  # noqa: PLC0415
 
@@ -82,18 +88,20 @@ def create_app(
         application.state.database_engine = engine
         application.state.session_factory = create_session_factory(engine)
         application.state.usecases = build_application_usecases(application.state.session_factory)
-        application.state.market_snapshot_gateway = build_market_snapshot_gateway(
+        market_gateway = build_market_snapshot_gateway(
             application.state.session_factory, retry_limit=settings.sandbox_retry_limit
         )
-        application.state.database_checker = database_checker
-        application.state.schema_checker = schema_checker
+        application.state.market_snapshot_usecase = GetMarketSnapshotUsecase(market_gateway)
+        application.state.readiness_usecase = CheckReadinessUsecase(
+            partial(database_checker, engine), partial(schema_checker, engine)
+        )
         with business_process():
             audit_event(LOGGER, "APPLICATION_STARTED", "Backend application started")
         try:
             yield
         finally:
             try:
-                await application.state.market_snapshot_gateway.close()
+                await market_gateway.close()
             finally:
                 with business_process():
                     audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")

@@ -21,7 +21,7 @@ from sentinel_contracts.trading_facts import (
 )
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 
 repair = importlib.import_module("develop.scripts.repair_decision_candle_facts")
 

@@ -22,7 +22,7 @@ def test_successful_catalog_sync_invokes_position_adoption_after_commit() -> Non
             return "synchronized"
 
     class Adoption:
-        async def execute(self, broker_id: str):
+        async def adopt(self, broker_id: str):
             calls.append("adoption")
 
     result = asyncio.run(SynchronizeBrokerInstrumentsUsecase(Catalog(), Adoption()).execute("broker-1"))
@@ -39,7 +39,7 @@ def test_failed_catalog_sync_never_invokes_position_adoption() -> None:
             raise ValueError("catalog failed")
 
     class Adoption:
-        async def execute(self, broker_id: str):
+        async def adopt(self, broker_id: str):
             nonlocal called
             called = True
 

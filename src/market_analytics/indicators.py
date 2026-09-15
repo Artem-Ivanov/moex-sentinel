@@ -39,17 +39,17 @@ class MarketIndicatorsService:
         range_low = min((item.low for item in completed), default=None)
         range_high = max((item.high for item in completed), default=None)
         return MarketIndicators(
-            thresholds.averaging_step_percent,
-            thresholds.minimum_net_profit_percent,
-            thresholds.source,
-            mean_5,
-            mean_20,
-            change_10,
-            completed[-1].started_at if completed else None,
-            completed[-1].open if completed else None,
-            completed[-1].close if completed else None,
-            range_low,
-            range_high,
+            averaging_step_percent=thresholds.averaging_step_percent,
+            minimum_net_profit_percent=thresholds.minimum_net_profit_percent,
+            source=thresholds.source,
+            mean_5=mean_5,
+            mean_20=mean_20,
+            change_10_percent=change_10,
+            last_candle_at=completed[-1].started_at if completed else None,
+            last_candle_open=completed[-1].open if completed else None,
+            last_candle_close=completed[-1].close if completed else None,
+            range_low=range_low,
+            range_high=range_high,
         )
 
     @staticmethod

@@ -16,7 +16,7 @@ from moex_sentinel.storage.database import create_database_engine
 from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.automation_facts import AutomationFactsRepository
 from sentinel_contracts.trading import AutomationState
-from tests.domain.test_trading_facts import all_fact_drafts
+from tests.domain.trading_facts_helpers import all_fact_drafts
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 
 FactDraftT = TypeVar("FactDraftT", bound=TradingAutomationDraft)

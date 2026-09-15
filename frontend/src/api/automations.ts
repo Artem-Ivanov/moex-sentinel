@@ -1,3 +1,5 @@
+import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+
 export interface Automation {
   id: string
   broker_id: string
@@ -37,16 +39,14 @@ export interface AutomationDetails {
 export class ApiError extends Error {
   constructor(
     message: string,
-    readonly fields: Array<{ path: string; code: string; message: string }> = [],
+    readonly fields: ApiFieldError[] = [],
   ) { super(message) }
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init)
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as {
-      detail?: { message?: string; fields?: Array<{ path: string; code: string; message: string }> }
-    }
+    const payload = await readErrorPayload(response)
     throw new ApiError(payload.detail?.message ?? "Не удалось выполнить запрос.", payload.detail?.fields)
   }
   if (response.status === 204) return undefined as T

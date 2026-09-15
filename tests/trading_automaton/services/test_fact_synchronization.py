@@ -17,7 +17,7 @@ from sentinel_contracts.trading_facts import (
     FactGroupFailure,
     FactIngressErrorCode,
 )
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 from trading_automaton.domain.storage_dtos import FactOutboxRecord
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 

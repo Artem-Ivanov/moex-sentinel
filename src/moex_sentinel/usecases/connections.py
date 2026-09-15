@@ -14,17 +14,20 @@ class ConnectionServicePort(Protocol):
 
 
 class CheckBrokerConnectionUsecase:
+    """Check a broker connection, distinguishing environment and configuration errors."""
+
     def __init__(self, service: ConnectionServicePort) -> None:
         self._service = service
 
     async def execute(self, broker_id: str) -> BrokerConnectionStatus:
+        """Return connection status; translate known broker, environment and configuration failures."""
         try:
             return await self._service.check(broker_id)
         except TInvestAdapterError as error:
             raise UseCaseError(error.code, str(error)) from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except ValueError as error:
-            if isinstance(error, EnvironmentMismatchError):
-                raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
             raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error

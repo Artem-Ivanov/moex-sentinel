@@ -15,7 +15,7 @@ from moex_sentinel.domain.trading_facts import (
 )
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
-from tests.domain.test_trading_facts import all_fact_drafts
+from tests.domain.trading_facts_helpers import all_fact_drafts
 from tests.services.test_trading_fact_ingress import (
     AUTOMATION_A,
     AUTOMATION_B,
@@ -25,8 +25,7 @@ from tests.services.test_trading_fact_ingress import (
     assert_cancelled_orders_without_broker_ids_replay,
     assert_cycle_instrument_lineage_rejects_group_atomically,
 )
-from tests.storage.test_trading_facts_models import automation_model
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 
 
 def fact_value(value_type):

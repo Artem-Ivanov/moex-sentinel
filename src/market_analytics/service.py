@@ -5,12 +5,10 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from market_analytics.indicators import MarketIndicatorsService
-from market_analytics.market_source import MarketSourcePort
 from sentinel_contracts.analytics import (
     AnalyticsInstrument,
     AnalyticsSnapshot,
     AnalyticsSnapshotRequest,
-    MarketSnapshotRequest,
     MarketSourceInstrument,
     MarketSourceSnapshot,
 )
@@ -19,13 +17,14 @@ from sentinel_contracts.streaming_market import InstrumentMarketState, StreamCan
 
 
 class AnalyticsService:
-    def __init__(self, market_source: MarketSourcePort, *, now: Callable[[], datetime]) -> None:
-        self._source = market_source
-        self._now = now
-        self._indicators = MarketIndicatorsService()
+    """Calculate market analytics from supplied data without fetching external state."""
 
-    async def snapshot(self, request: AnalyticsSnapshotRequest) -> AnalyticsSnapshot:
-        source = await self._source.snapshot(MarketSnapshotRequest(request.source_id, request.instrument_ids))
+    def __init__(self, indicators: MarketIndicatorsService, *, now: Callable[[], datetime]) -> None:
+        self._now = now
+        self._indicators = indicators
+
+    def calculate(self, request: AnalyticsSnapshotRequest, source: MarketSourceSnapshot) -> AnalyticsSnapshot:
+        """Calculate one immutable batch, rejecting unexpected instruments or invalid arithmetic."""
         now = self._now()
         instruments = {item.instrument_id: item for item in source.instruments}
         if set(instruments) - set(request.instrument_ids):

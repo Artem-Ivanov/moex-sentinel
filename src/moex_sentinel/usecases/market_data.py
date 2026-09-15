@@ -31,10 +31,13 @@ class MarketDataServicePort(Protocol):
 
 
 class SearchMarketInstrumentsUsecase:
+    """Search broker instruments with stable query and connection error payloads."""
+
     def __init__(self, service: MarketDataServicePort) -> None:
         self._service = service
 
     async def execute(self, broker_id: str, query: str, limit: int = 20) -> tuple[InstrumentMarketSnapshot, ...]:
+        """Return matching broker instruments; report an invalid query or known broker failure."""
         normalized = query.strip()
         if len(normalized) < 2:
             raise UseCaseError(
@@ -50,22 +53,39 @@ class SearchMarketInstrumentsUsecase:
             )
         try:
             return await self._service.search(broker_id, normalized, limit)
-        except Exception as error:
-            raise _market_error(error) from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error
 
 
 class ViewMarketInstrumentUsecase:
+    """Read a broker instrument by external ID and translate declared failures."""
+
     def __init__(self, service: MarketDataServicePort) -> None:
         self._service = service
 
     async def execute(self, broker_id: str, instrument_id: str) -> InstrumentMarketSnapshot:
+        """Return a snapshot by external instrument ID; translate known broker failures."""
         try:
             return await self._service.instrument(broker_id, instrument_id)
-        except Exception as error:
-            raise _market_error(error) from error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error
 
 
 class ViewHistoricCandlesUsecase:
+    """Read an external instrument candle interval with stable range and broker errors."""
+
     def __init__(self, service: MarketDataServicePort) -> None:
         self._service = service
 
@@ -77,6 +97,7 @@ class ViewHistoricCandlesUsecase:
         end: datetime,
         interval: CandleInterval,
     ) -> tuple[HistoricCandle, ...]:
+        """Return candles by external instrument ID; reject an invalid range or known broker failure."""
         if start.tzinfo is None or end.tzinfo is None or start >= end or end - start > timedelta(days=31):
             raise UseCaseError(
                 "INVALID_CANDLE_RANGE",
@@ -85,17 +106,11 @@ class ViewHistoricCandlesUsecase:
             )
         try:
             return await self._service.candles(broker_id, instrument_id, start, end, interval)
-        except Exception as error:
-            raise _market_error(error) from error
-
-
-def _market_error(error: Exception) -> UseCaseError:
-    if isinstance(error, TInvestAdapterError):
-        return UseCaseError(error.code, str(error))
-    if isinstance(error, BrokerRecordNotFoundError):
-        return UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.")
-    if isinstance(error, EnvironmentMismatchError):
-        return UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.")
-    if isinstance(error, ValueError):
-        return UseCaseError("BROKER_CONFIGURATION", str(error))
-    raise error
+        except TInvestAdapterError as error:
+            raise UseCaseError(error.code, str(error)) from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except ValueError as error:
+            raise UseCaseError("BROKER_CONFIGURATION", str(error)) from error

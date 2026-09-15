@@ -17,6 +17,7 @@ from tests.trading_automaton.services.test_position_state_hydration_service impo
     Repository,
     command,
 )
+from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import (
     PositionConsistencyResult,
     PositionEvaluationResult,
@@ -101,7 +102,15 @@ def test_hydration_decision_dispatch_and_durable_audit_share_process(tmp_path, k
         engine.dispose()
 
 
-async def materialize(state, kind=DecisionKind.BUY_MORE):
+async def materialize(
+    state,
+    kind=DecisionKind.BUY_MORE,
+    *,
+    cash=None,
+    pending_cash=None,
+    id_factory=lambda: FALLBACK_ID,
+    intent_id=INTENT_ID,
+):
     actionable = kind is not DecisionKind.WAIT
     prepared = PreparedDecision(
         command(),
@@ -119,15 +128,15 @@ async def materialize(state, kind=DecisionKind.BUY_MORE):
             "instrument", (OrderBookLevel(Decimal("100"), 10),), (OrderBookLevel(Decimal("101"), 10),), NOW, True
         ),
     )
-    return await DecisionMaterializerService(id_factory=lambda: FALLBACK_ID).materialize(
+    return await DecisionMaterializerService(id_factory=id_factory, settings=StrategySettings()).materialize(
         prepared,
         PositionWorkItem(command(), False),
         market,
         None,
-        cash=None,
-        pending_cash={},
+        cash=cash,
+        pending_cash={} if pending_cash is None else pending_cash,
         snapshot_at=NOW,
-        intent_id=INTENT_ID,
+        intent_id=intent_id,
     )
 
 
@@ -157,3 +166,37 @@ def test_active_intent_wait_does_not_publish_pre_execution_cycle():
         return await materialize(state, DecisionKind.WAIT)
 
     assert asyncio.run(scenario()).item.cycle_state is None
+
+
+def test_intent_id_failure_does_not_reserve_pending_cash():
+    class Cash:
+        async def available(self, account_id, currency):
+            return Decimal("100000")
+
+        async def reserved(self, account_id, currency):
+            return Decimal()
+
+    failure = RuntimeError("ID generation failed")
+    pending_cash = {(command().account_id, command().currency.upper()): Decimal("10")}
+    before = pending_cash.copy()
+
+    def fail_id():
+        raise failure
+
+    async def scenario():
+        cache = PositionStateCacheService()
+        hydration = PositionStateHydrationService(Repository(), Portfolio(), Candles(), cache, now=lambda: NOW)
+        await hydration.hydrate((command(),))
+        state = await cache.get(str(command().automation_id))
+        await materialize(
+            state.model_copy(update={"process_id": HYDRATION_ID}),
+            cash=Cash(),
+            pending_cash=pending_cash,
+            id_factory=fail_id,
+            intent_id=None,
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(scenario())
+    assert caught.value is failure
+    assert pending_cash == before

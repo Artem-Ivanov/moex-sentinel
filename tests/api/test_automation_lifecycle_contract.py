@@ -11,8 +11,7 @@ from moex_sentinel.storage.database import create_database_engine, create_sessio
 from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.usecases.automations import CloseAutomationUsecase, HoldAutomationUsecase, ResumeAutomationUsecase
-from tests.storage.test_trading_facts_models import automation_model
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 
 
 @pytest.mark.parametrize("command", ["hold", "resume"])

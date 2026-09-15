@@ -27,12 +27,13 @@ from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
 from moex_sentinel.services.market_data import BrokerMarketDataService
 from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
 from moex_sentinel.services.portfolio import PortfolioAggregationService
-from moex_sentinel.services.portfolio_snapshot_collection import PortfolioSnapshotCollector
-from moex_sentinel.services.position_adoption import PositionAdoptionService
+from moex_sentinel.services.portfolio_snapshot_collection import PortfolioSnapshotCollectionService
+from moex_sentinel.services.position_adoption import ConfiguredPositionAdoptionService, PositionAdoptionService
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
 from moex_sentinel.services.trading_fact_mapping import TradingFactMapper
 from moex_sentinel.services.trading_sessions import TradingSessionService
 from moex_sentinel.services.trading_summary import TradingSummaryService
+from moex_sentinel.storage.portfolio_snapshot_collection import PortfolioSnapshotCollectionStore
 from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.storage.repositories.portfolio_snapshots import PortfolioSnapshotRepository
@@ -77,7 +78,7 @@ from moex_sentinel.usecases.portfolio import (
     ViewPortfolioSummaryUsecase,
     ViewRecentOperationsUsecase,
 )
-from moex_sentinel.usecases.position_adoption import AdoptBrokerPositionsUsecase
+from moex_sentinel.usecases.portfolio_snapshots import CollectPortfolioSnapshotsUsecase
 from moex_sentinel.usecases.trading_fact_ingress import (
     ClaimAutomationCommandsUsecase,
     PublishTradingFactsUsecase,
@@ -141,19 +142,20 @@ def build_portfolio_snapshot_collector(
     settings: Settings,
     *,
     clock=utc_now_ms,
-) -> PortfolioSnapshotCollector:
-    """Build the Core-owned periodic portfolio collector."""
+) -> CollectPortfolioSnapshotsUsecase:
+    """Build one portfolio collection operation with short sessions and a run lock."""
     repository = UserBrokerRepository(factory)
     adapter_factory = PortfolioAdapterFactory(TInvestPortfolioAdapter)
-    return PortfolioSnapshotCollector(
+    store = PortfolioSnapshotCollectionStore(factory, engine)
+    collection = PortfolioSnapshotCollectionService(
         repository,
         adapter_factory.create,
-        factory,
-        engine,
+        store,
         clock=clock,
         retry_limit=settings.portfolio_snapshot_retry_limit,
         retry_base_seconds=settings.portfolio_snapshot_retry_base_seconds,
     )
+    return CollectPortfolioSnapshotsUsecase(collection, store, clock=clock)
 
 
 def build_market_snapshot_gateway(factory: sessionmaker[Session], *, retry_limit: int = 5) -> MarketSnapshotGateway:
@@ -171,6 +173,7 @@ def build_market_snapshot_gateway(factory: sessionmaker[Session], *, retry_limit
 
 
 def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUsecases:
+    """Assemble application actors sharing configured services and the supplied session factory."""
     repository = UserBrokerRepository(factory)
     registry = BrokerAdapterRegistry()
     broker_service = BrokerConfigurationService(repository, registry)
@@ -180,7 +183,7 @@ def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUse
     portfolio_service = PortfolioAggregationService(repository, adapter_factory.create, None, instrument_repository)
     market_data_factory = MarketDataAdapterFactory(TInvestMarketDataAdapter)
     market_data_service = BrokerMarketDataService(repository, market_data_factory.create)
-    position_adoption = AdoptBrokerPositionsUsecase(
+    position_adoption = ConfiguredPositionAdoptionService(
         PositionAdoptionService(PositionAdoptionRepository(factory)),
         repository.get,
         lambda broker: TInvestOrderExecutionAdapter(
@@ -215,7 +218,7 @@ def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUse
         view_trading_automation=ViewTradingAutomationUsecase(automation_service),
         view_trading_automation_statuses=ViewTradingAutomationStatusesUsecase(automation_service),
         view_trading_automation_details=ViewTradingAutomationDetailsUsecase(
-            automation_service, portfolio_service, market_data_service
+            automation_service, portfolio_service, instrument_catalog_service
         ),
         view_trading_automations=ViewTradingAutomationsUsecase(automation_service),
         hold_automation=HoldAutomationUsecase(automation_service),

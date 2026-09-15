@@ -16,11 +16,14 @@ from sentinel_contracts.streaming_market import (
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.config import StrategySettings
 from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService, PostCommitBatchError
 from trading_automaton.services.decision import TradeDecision
+from trading_automaton.services.decision_materialization import DecisionMaterializerService
 from trading_automaton.services.market_indicators import MarketIndicators
+from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_batch_scheduler import (
     PositionBatchSchedulerService,
     PositionEvaluationResult,
@@ -30,6 +33,7 @@ from trading_automaton.services.position_state_hydration import PositionStateCac
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import HydratedPositionState
+from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.storage.repository import IntentHistory, TradingCycleState
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
@@ -47,7 +51,14 @@ def test_remote_snapshot_expiry_prevents_durable_batch(after_load):
                 return value
 
         batch = Batch()
-        service = StreamingBatchTickService(Scheduler(), DelayedStates(), Commissions(), batch, now=lambda: clock[0])
+        service = StreamingBatchTickService(
+            Scheduler(),
+            DelayedStates(),
+            batch,
+            now=lambda: clock[0],
+            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            order_books=OrderBookValidationService(),
+        )
         snapshot = MarketBatchSnapshot.immutable("remote", NOW, {}).model_copy(
             update={"expires_at": NOW + timedelta(seconds=2)}
         )
@@ -74,10 +85,13 @@ def test_invalid_book_isolated_from_valid_position_batch(invalid: str, caplog, m
         tick = StreamingBatchTickService(
             PositionBatchSchedulerService(WaitDecider()),
             states,
-            Commissions(),
             batch,
-            cycles=StreamingCycleTransitionService(now=lambda: NOW),
+            cycles=StreamingCycleTransitionService(
+                now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
+            ),
             now=lambda: NOW,
+            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            order_books=OrderBookValidationService(),
         )
         valid_book = StreamOrderBook(
             "instrument", (OrderBookLevel(Decimal("99"), 1),), (OrderBookLevel(Decimal("100"), 1),), NOW, True
@@ -125,10 +139,15 @@ def test_snapshot_clock_is_shared_by_cycle_and_decision() -> None:
         service = StreamingBatchTickService(
             Scheduler(),
             states,
-            Commissions(),
             batch,
-            cycles=StreamingCycleTransitionService(now=lambda: NOW + timedelta(seconds=3)),
+            cycles=StreamingCycleTransitionService(
+                now=lambda: NOW + timedelta(seconds=3),
+                cycles=TradingCycleService(),
+                order_books=OrderBookValidationService(),
+            ),
             now=lambda: NOW + timedelta(seconds=3),
+            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            order_books=OrderBookValidationService(),
         )
         market = InstrumentMarketState(
             "instrument",
@@ -222,12 +241,12 @@ def test_assembles_decision_intent_and_dispatch_from_one_snapshot() -> None:
         service = StreamingBatchTickService(
             Scheduler(),
             States(),
-            Commissions(),
             batch,
             cash=cash,
             now=lambda: NOW,
             audit=audit,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot-1",
@@ -296,11 +315,11 @@ def test_batch_reuses_prepared_commission_for_persistence_dispatch_and_audit() -
         service = StreamingBatchTickService(
             Scheduler(),
             States(),
-            ForbiddenCommissionEstimate(),
             batch,
             now=lambda: NOW,
             audit=audit,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot-1",
@@ -362,11 +381,11 @@ def test_batch_never_reestimates_prepared_buy_or_sell_commission() -> None:
         service = StreamingBatchTickService(
             BuyAndSellScheduler(),
             States(),
-            ForbiddenCommissionEstimate(),
             batch,
             now=lambda: NOW,
             audit=audit,
-            id_factory=lambda: next(ids),
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot-1",
@@ -412,11 +431,11 @@ def test_applies_cycle_transition_before_decision_and_persists_updated_cycle() -
         service = StreamingBatchTickService(
             Scheduler(),
             states,
-            Commissions(),
             batch,
             cycles=Cycles(),
             now=lambda: NOW,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -464,11 +483,11 @@ def test_batch_rollback_does_not_publish_cycle_transition_to_hot_state() -> None
         service = StreamingBatchTickService(
             Scheduler(),
             states,
-            Commissions(),
             FailingBatch(),
             cycles=Cycles(),
             now=lambda: NOW,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -516,11 +535,11 @@ def test_postcommit_failure_publishes_committed_cycle_before_propagating() -> No
         service = StreamingBatchTickService(
             Scheduler(),
             states,
-            Commissions(),
             PostCommitFailingBatch(),
             cycles=Cycles(),
             now=lambda: NOW,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -583,12 +602,12 @@ def test_budgets_parallel_buy_intents_without_publishing_precommit_reservation()
         service = StreamingBatchTickService(
             TwoBuyScheduler(),
             MultiStates(),
-            Commissions(),
             batch,
             cash=cash,
             now=lambda: NOW,
             audit=audit,
-            id_factory=lambda: next(ids),
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            order_books=OrderBookValidationService(),
         )
         second = baseline_command(automation="automation-2", instrument="instrument-2")
 
@@ -633,11 +652,11 @@ def test_does_not_publish_decision_audit_when_batch_persistence_fails() -> None:
         service = StreamingBatchTickService(
             Scheduler(),
             States(),
-            Commissions(),
             FailingBatch(),
             now=lambda: NOW,
             audit=audit,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -697,11 +716,11 @@ def test_does_not_read_cash_for_non_buy_decisions(kind: DecisionKind) -> None:
         service = StreamingBatchTickService(
             NonBuyScheduler(),
             States(),
-            Commissions(),
             Batch(),
             cash=ForbiddenCash(),
             now=lambda: NOW,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -748,11 +767,13 @@ def test_serializes_concurrent_ticks_before_cash_budgeting() -> None:
         service = StreamingBatchTickService(
             Scheduler(),
             States(),
-            Commissions(),
             batch,
             cash=cash,
             now=lambda: NOW,
-            id_factory=lambda: f"id-{next(counter)}",
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(), id_factory=lambda: f"id-{next(counter)}"
+            ),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -801,10 +822,10 @@ def test_marks_position_as_having_active_intent_immediately_after_persistence() 
         service = StreamingBatchTickService(
             Scheduler(),
             states,
-            Commissions(),
             PersistingBatch(),
             now=lambda: NOW,
-            id_factory=lambda: "intent-1",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",
@@ -897,10 +918,10 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
         tick = StreamingBatchTickService(
             scheduler,
             states,
-            Commissions(),
             batch,
             now=lambda: NOW,
-            id_factory=lambda: next(ids),
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
             "snapshot",

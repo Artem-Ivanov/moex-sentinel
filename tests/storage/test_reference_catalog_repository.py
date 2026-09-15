@@ -1,6 +1,5 @@
 """Behavior tests for the user-broker-scoped instrument catalog."""
 
-from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -13,19 +12,15 @@ from moex_sentinel.domain.instrument_catalog import (
     UserBrokerCatalogInstrumentDraft,
 )
 from moex_sentinel.domain.user_brokers import UserBrokerDraft, UserBrokerState
-from moex_sentinel.storage.database import create_database_engine, create_session_factory
-from moex_sentinel.storage.models import Base
+from moex_sentinel.storage.database import create_session_factory
 from moex_sentinel.storage.repositories.reference_catalog import ReferenceCatalogRepository
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
 
 
 @pytest.fixture
-def database() -> Iterator[tuple[Engine, sessionmaker[Session]]]:
-    engine = create_database_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    factory = create_session_factory(engine)
-    yield engine, factory
-    engine.dispose()
+def database(core_engine: Engine) -> tuple[Engine, sessionmaker[Session]]:
+    """Create a session factory; each repository operation owns its session."""
+    return core_engine, create_session_factory(core_engine)
 
 
 def user_broker_draft(account_id: str) -> UserBrokerDraft:

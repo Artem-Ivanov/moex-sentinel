@@ -12,7 +12,7 @@ from moex_sentinel.storage.repositories.trading_audit import TradingAuditReposit
 
 
 class TradingFactsUnitOfWork:
-    """Commit one complete fact batch or roll every aggregate back."""
+    """Commit one automation fact group or roll its aggregate changes back."""
 
     automations: AutomationFactsRepository
     orders: OrderFactsRepository

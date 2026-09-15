@@ -9,7 +9,8 @@ from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook
 from sentinel_contracts.trading import DecisionKind
 from tests.trading_automaton.command_factory import command, decision_item
-from tests.trading_automaton.storage.test_local_repository import NOW, filled_buy, repository
+from tests.trading_automaton.storage.worker_storage_helpers import NOW, filled_buy
+from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import (
     HydratedPositionState,
     MarketIndicators,
@@ -37,8 +38,9 @@ def test_terminal_and_next_tick_net_agree_after_buy_partial_sell_and_close(
     buy_net,
     partial_net,
     closed_net,
+    worker_repository_factory,
 ):
-    repo, factory = repository()
+    repo, factory = worker_repository_factory()
     cmd = command(broker="broker-1", account="account-1", instrument="instrument-1", lot_size=lot_size)
     automation_id = str(cmd.automation_id)
     repo.cache_command(cmd)
@@ -97,7 +99,7 @@ def test_terminal_and_next_tick_net_agree_after_buy_partial_sell_and_close(
                 Decimal(),
             ),
         )
-        result = await DecisionMaterializerService().materialize(
+        result = await DecisionMaterializerService(settings=StrategySettings()).materialize(
             prepared,
             PositionWorkItem(cmd, False),
             InstrumentMarketState(
@@ -117,20 +119,17 @@ def test_terminal_and_next_tick_net_agree_after_buy_partial_sell_and_close(
         )
         return result.item.position_snapshot
 
-    try:
-        bought = execute(BUY, "BUY", 4, "100", entry_fee)
-        assert Decimal(bought["net_pnl"]) == Decimal(buy_net)
-        assert Decimal(asyncio.run(next_tick(bought, "100"))["net_pnl"]) == Decimal(buy_net)
+    bought = execute(BUY, "BUY", 4, "100", entry_fee)
+    assert Decimal(bought["net_pnl"]) == Decimal(buy_net)
+    assert Decimal(asyncio.run(next_tick(bought, "100"))["net_pnl"]) == Decimal(buy_net)
 
-        partial = execute(PART, "SELL", 1, "110", exit_fee)
-        assert partial["quantity_lots"] == 3
-        assert Decimal(partial["net_pnl"]) == Decimal(partial_net)
-        assert Decimal(asyncio.run(next_tick(partial, "110"))["net_pnl"]) == Decimal(partial_net)
+    partial = execute(PART, "SELL", 1, "110", exit_fee)
+    assert partial["quantity_lots"] == 3
+    assert Decimal(partial["net_pnl"]) == Decimal(partial_net)
+    assert Decimal(asyncio.run(next_tick(partial, "110"))["net_pnl"]) == Decimal(partial_net)
 
-        closed = execute(CLOSE, "SELL", 3, "110", str(Decimal(exit_fee) * 3))
-        assert closed["quantity_lots"] == 0
-        assert Decimal(closed["net_pnl"]) == Decimal(closed_net)
-        assert Decimal(closed["net_pnl"]) == Decimal(closed["realized_pnl"])
-        assert Decimal(asyncio.run(next_tick(closed, "110"))["net_pnl"]) == Decimal(closed_net)
-    finally:
-        factory.kw["bind"].dispose()
+    closed = execute(CLOSE, "SELL", 3, "110", str(Decimal(exit_fee) * 3))
+    assert closed["quantity_lots"] == 0
+    assert Decimal(closed["net_pnl"]) == Decimal(closed_net)
+    assert Decimal(closed["net_pnl"]) == Decimal(closed["realized_pnl"])
+    assert Decimal(asyncio.run(next_tick(closed, "110"))["net_pnl"]) == Decimal(closed_net)

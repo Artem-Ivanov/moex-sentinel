@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from grpc import StatusCode
+from grpc.aio import AioRpcError
 
 from moex_sentinel.adapters.tinvest.portfolio import (
     SANDBOX_TARGET,
@@ -92,24 +93,43 @@ def adapter_with(services: object) -> TInvestPortfolioAdapter:
     )
 
 
-def test_adapter_maps_accounts_portfolio_positions_and_operations() -> None:
+@pytest.fixture
+def portfolio_adapter() -> tuple[TInvestPortfolioAdapter, FakeOperationsService]:
     operations = FakeOperationsService()
     services = SimpleNamespace(sandbox=FakeSandboxService(), operations=operations)
-    adapter = adapter_with(services)
+    return adapter_with(services), operations
 
+
+def test_adapter_maps_accounts(portfolio_adapter: tuple[TInvestPortfolioAdapter, FakeOperationsService]) -> None:
+    adapter, _operations = portfolio_adapter
     accounts = asyncio.run(adapter.list_accounts())
+
+    assert accounts[0].account_id == "account-1"
+
+
+def test_adapter_maps_portfolio(portfolio_adapter: tuple[TInvestPortfolioAdapter, FakeOperationsService]) -> None:
+    adapter, _operations = portfolio_adapter
     portfolio = asyncio.run(adapter.get_portfolio("account-1"))
+
+    assert portfolio.total_amount == Money(Decimal("100.5"), "RUB")
+    assert portfolio.free_cash == Money(Decimal("40.25"), "RUB")
+    assert portfolio.realized_pnl is None
+
+
+def test_adapter_maps_positions(portfolio_adapter: tuple[TInvestPortfolioAdapter, FakeOperationsService]) -> None:
+    adapter, _operations = portfolio_adapter
     positions = asyncio.run(adapter.get_positions("account-1"))
+
+    assert positions[0].quantity_lots == Decimal("2")
+    assert positions[0].average_price == Money(Decimal("50.25"), "RUB")
+
+
+def test_adapter_maps_operations(portfolio_adapter: tuple[TInvestPortfolioAdapter, FakeOperationsService]) -> None:
+    adapter, operations = portfolio_adapter
     from_at = datetime(2026, 8, 4, tzinfo=UTC)
     to_at = datetime(2026, 8, 5, tzinfo=UTC)
     page = asyncio.run(adapter.get_operations("account-1", "cursor", 50, from_at=from_at, to_at=to_at))
 
-    assert accounts[0].account_id == "account-1"
-    assert portfolio.total_amount == Money(Decimal("100.5"), "RUB")
-    assert portfolio.free_cash == Money(Decimal("40.25"), "RUB")
-    assert portfolio.realized_pnl is None
-    assert positions[0].quantity_lots == Decimal("2")
-    assert positions[0].average_price == Money(Decimal("50.25"), "RUB")
     assert page.items[0].payment == Money(Decimal("-50.5"), "RUB")
     assert page.items[0].instrument_id == "instrument-1"
     assert page.next_cursor == "next"
@@ -163,13 +183,9 @@ def test_portfolio_free_cash_uses_the_portfolio_valuation_currency() -> None:
     ],
 )
 def test_adapter_maps_transport_errors_safely(status, code: str, retryable: bool) -> None:
-    class TransportError(Exception):
-        def code(self):
-            return status
-
     class FailingSandbox:
         async def get_sandbox_accounts(self):
-            raise TransportError("transport detail")
+            raise AioRpcError(status, details="transport detail synthetic-token")
 
     adapter = adapter_with(SimpleNamespace(sandbox=FailingSandbox()))
 

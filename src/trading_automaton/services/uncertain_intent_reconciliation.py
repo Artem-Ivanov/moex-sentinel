@@ -260,16 +260,16 @@ class UncertainIntentReconciliationService:
         commission = abs(_decimal(operation.get("commission")))
         executed_amount = price * expected_units
         return BrokerOrderState(
-            str(operation.get("operation_id") or intent.idempotency_key),
-            intent.idempotency_key,
-            "FILLED",
-            intent.quantity_lots,
-            intent.quantity_lots,
-            intent.limit_price * expected_units,
-            executed_amount,
-            intent.estimated_commission,
-            commission,
-            str(operation.get("currency") or command.currency),
+            broker_order_id=str(operation.get("operation_id") or intent.idempotency_key),
+            idempotency_key=intent.idempotency_key,
+            status="FILLED",
+            requested_lots=intent.quantity_lots,
+            executed_lots=intent.quantity_lots,
+            requested_amount=intent.limit_price * expected_units,
+            executed_amount=executed_amount,
+            estimated_commission=intent.estimated_commission,
+            executed_commission=commission,
+            currency=str(operation.get("currency") or command.currency),
             executed_price=price,
             executed_at=occurred_at,
         )

@@ -4,40 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import dataclasses
+from contextlib import ExitStack
 
 import pytest
-from sentinel_contracts.base import PositionalModel
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from tests.trading_automaton.storage.worker_storage_helpers import NOW
+from trading_automaton.storage.fact_outbox import FactOutboxWriter
+from trading_automaton.storage.models import Base
+from trading_automaton.storage.repository import LocalAutomationRepository
 
 
-_original_replace = dataclasses.replace
-_original_asdict = dataclasses.asdict
+@pytest.fixture
+def worker_repository_factory():
+    with ExitStack() as resources:
 
+        def create():
+            engine = create_engine("sqlite:///:memory:")
+            resources.callback(engine.dispose)
+            Base.metadata.create_all(engine)
+            factory = sessionmaker(engine, expire_on_commit=False)
+            return LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW)), factory
 
-def _is_legacy_positional(obj: object) -> bool:
-    return isinstance(obj, PositionalModel)
-
-
-def _replace(model: object, /, **changes: object) -> object:
-    if _is_legacy_positional(model):
-        if not changes:
-            return model
-        return model.__class__(**{**model.model_dump(), **changes})
-    return _original_replace(model, **changes)
-
-
-def _asdict(model: object) -> dict:
-    if _is_legacy_positional(model):
-        return model.model_dump()
-    return _original_asdict(model)
-
-
-if not getattr(dataclasses.replace, "_legacy_positional_compat", False):
-    dataclasses.replace = _replace
-    dataclasses.replace._legacy_positional_compat = True  # type: ignore[attr-defined]
-if not getattr(dataclasses.asdict, "_legacy_positional_compat", False):
-    dataclasses.asdict = _asdict
-    dataclasses.asdict._legacy_positional_compat = True  # type: ignore[attr-defined]
+        yield create
 
 
 def pytest_configure(config: pytest.Config) -> None:

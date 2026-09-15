@@ -7,14 +7,23 @@ from threading import Event, Thread, current_thread
 from uuid import UUID
 
 import pytest
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from sentinel_contracts.automation_lifecycle import InvalidAutomationTransition
 from sentinel_contracts.business_audit import BusinessAuditEvent, BusinessAuditLevel, BusinessAuditStage
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import BrokerPositionBootstrap, FactKind
-from tests.trading_automaton.command_factory import command, decision_item
+from tests.trading_automaton.command_factory import decision_item
+from tests.trading_automaton.storage.worker_storage_helpers import (
+    AUDIT_ID,
+    AUDIT_PROCESS_ID,
+    INTENT_ID,
+    NOW,
+    SELL_INTENT_ID,
+    baseline_command,
+    filled_buy,
+)
 from trading_automaton.storage.database import create_worker_engine
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import (
@@ -28,54 +37,9 @@ from trading_automaton.storage.models import (
 )
 from trading_automaton.storage.repository import ExecutionFinalization, IntentBatchItem, LocalAutomationRepository
 
-NOW = datetime(2026, 8, 13, 12, tzinfo=UTC)
-INTENT_ID = "00000000-0000-4000-8000-000000000405"
-AUDIT_ID = "00000000-0000-4000-8000-000000000407"
-AUDIT_PROCESS_ID = "00000000-0000-4000-8000-000000000408"
-SELL_INTENT_ID = "00000000-0000-4000-8000-000000000410"
 
-
-def repository() -> tuple[LocalAutomationRepository, sessionmaker[Session]]:
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(engine, expire_on_commit=False)
-    return LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW)), factory
-
-
-def baseline_command():
-    return command(broker="broker-1", account="account-1", instrument="instrument-1")
-
-
-def filled_buy() -> ExecutionFinalization:
-    command_value = baseline_command()
-    return ExecutionFinalization(
-        intent_id=INTENT_ID,
-        automation_id=str(command_value.automation_id),
-        broker_id=str(command_value.broker_id),
-        account_id=command_value.account_id,
-        instrument_id=command_value.external_instrument_id,
-        side="BUY",
-        quantity_lots=1,
-        requested_price=Decimal("100"),
-        currency="RUB",
-        state="FILLED",
-        occurred_at=NOW + timedelta(milliseconds=10),
-        broker_order_id="synthetic-order",
-        requested_amount=Decimal("1000"),
-        executed_amount=Decimal("1000"),
-        estimated_commission=Decimal("1"),
-        executed_commission=Decimal("2"),
-        executed_lots=1,
-        executed_price=Decimal("100"),
-        executed_at=NOW + timedelta(milliseconds=10),
-        terminal_at=NOW + timedelta(milliseconds=10),
-        lot_size=10,
-        process_id="00000000-0000-4000-8000-000000000406",
-    )
-
-
-def test_cache_round_trip_uses_strategy_free_baseline_command() -> None:
-    repo, _factory = repository()
+def test_cache_round_trip_uses_strategy_free_baseline_command(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
 
     assert repo.cache_command(command_value) is True
@@ -86,8 +50,8 @@ def test_cache_round_trip_uses_strategy_free_baseline_command() -> None:
     assert restored[0].currency == "RUB"
 
 
-def test_decision_batch_emits_typed_decision_and_order_facts() -> None:
-    repo, _factory = repository()
+def test_decision_batch_emits_typed_decision_and_order_facts(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
 
@@ -104,8 +68,8 @@ def test_decision_batch_emits_typed_decision_and_order_facts() -> None:
     assert facts[1].payload["decision_id"] == facts[0].payload["decision_id"]
 
 
-def test_order_state_fact_preserves_recorded_order_intent_snapshot() -> None:
-    repo, factory = repository()
+def test_order_state_fact_preserves_recorded_order_intent_snapshot(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
     position_cycle_id = "00000000-0000-4000-8000-000000000409"
@@ -147,8 +111,8 @@ def test_order_state_fact_preserves_recorded_order_intent_snapshot() -> None:
             assert changed[field] == recorded[field]
 
 
-def test_active_buy_reservation_uses_cached_command_currency() -> None:
-    repo, _factory = repository()
+def test_active_buy_reservation_uses_cached_command_currency(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
     repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
@@ -159,8 +123,8 @@ def test_active_buy_reservation_uses_cached_command_currency() -> None:
     assert reservation.amount == Decimal("1001")
 
 
-def test_terminal_buy_is_idempotent_and_emits_restart_safe_execution_graph() -> None:
-    repo, _factory = repository()
+def test_terminal_buy_is_idempotent_and_emits_restart_safe_execution_graph(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -262,8 +226,8 @@ def test_decision_fact_sequence_uses_terminal_facts_committed_after_stale_cache_
         assert sequences == list(range(1, len(sequences) + 1))
 
 
-def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger() -> None:
-    repo, factory = repository()
+def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -339,8 +303,8 @@ def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger() -
         )
 
 
-def test_audit_is_journaled_once_and_delivered_only_as_typed_fact() -> None:
-    repo, factory = repository()
+def test_audit_is_journaled_once_and_delivered_only_as_typed_fact(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -368,8 +332,8 @@ def test_audit_is_journaled_once_and_delivered_only_as_typed_fact() -> None:
         assert session.scalar(select(func.count()).select_from(BusinessAuditEventModel)) == 1
 
 
-def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows() -> None:
-    repo, factory = repository()
+def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -389,8 +353,8 @@ def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows() -> None:
         assert session.scalar(select(func.count()).select_from(TradeLotModel)) == 1
 
 
-def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime() -> None:
-    repo, _factory = repository()
+def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -403,8 +367,8 @@ def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime(
     assert [fact.fact_kind for fact in facts] == [FactKind.AUTOMATION_STATE_CHANGED.value]
 
 
-def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged() -> None:
-    repo, factory = repository()
+def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command().model_copy(update={"state": AutomationState.HOLD})
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -423,8 +387,8 @@ def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged() -> No
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_repeated_worker_state_is_a_noop_without_revision_or_fact() -> None:
-    repo, factory = repository()
+def test_repeated_worker_state_is_a_noop_without_revision_or_fact(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -442,8 +406,8 @@ def test_repeated_worker_state_is_a_noop_without_revision_or_fact() -> None:
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_worker_hold_requires_a_nonblank_reason_before_outbox_write() -> None:
-    repo, factory = repository()
+def test_worker_hold_requires_a_nonblank_reason_before_outbox_write(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -549,8 +513,8 @@ def test_stale_worker_state_proposal_cannot_overwrite_authoritative_closed(
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact() -> None:
-    repo, factory = repository()
+def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)
@@ -575,8 +539,8 @@ def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact() -> Non
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_rejected_stale_fact_does_not_replace_authoritative_closed_state() -> None:
-    repo, _factory = repository()
+def test_rejected_stale_fact_does_not_replace_authoritative_closed_state(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
     repo.cache_command(command_value)

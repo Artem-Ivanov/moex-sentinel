@@ -16,7 +16,7 @@ from sentinel_contracts.trading_facts import (
     FactBatchRequest,
     FactBatchResult,
 )
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 from trading_automaton.adapters.core_client import CoreClient
 
 

@@ -78,3 +78,23 @@ def test_http_process_id_is_inherited_when_header_is_valid(tmp_path: Path) -> No
         response = client.get("/api/health", headers={"X-Process-ID": process_id})
 
     assert response.headers["X-Process-ID"] == process_id
+
+
+def test_unavailable_database_skips_schema_probe() -> None:
+    schema_calls = []
+
+    def schema_probe(_engine: Engine) -> bool:
+        schema_calls.append("schema")
+        return True
+
+    application = create_app(
+        database_url="sqlite:///:memory:",
+        database_checker=lambda _engine: False,
+        schema_checker=schema_probe,
+    )
+    with TestClient(application) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 503
+    assert response.json()["database"] == "error"
+    assert schema_calls == []

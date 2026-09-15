@@ -39,6 +39,8 @@ class PositionOperationsServicePort(Protocol):
 
 
 class PositionMarketDataServicePort(Protocol):
+    """Position chart data addressed by broker-scoped internal catalog IDs."""
+
     async def candles(
         self,
         broker_id: str,
@@ -46,33 +48,53 @@ class PositionMarketDataServicePort(Protocol):
         start: datetime,
         end: datetime,
         interval: CandleInterval,
-    ) -> tuple[HistoricCandle, ...]: ...
+    ) -> tuple[HistoricCandle, ...]:
+        """Resolve the internal instrument ID before querying broker candles."""
+        ...
 
 
 class CreateTradingAutomationUsecase:
+    """Create an automation and expose known lifecycle failures as stable application errors."""
+
     def __init__(self, service: AutomationServicePort) -> None:
         self._service = service
 
     async def execute(self, broker_id: str, account_id: str, instrument_id: str) -> AutomationRecord:
+        """Return the created automation; translate known lifecycle failures to UseCaseError."""
         try:
             return self._service.create(
                 broker_id=broker_id,
                 account_id=account_id,
                 instrument_id=instrument_id,
             )
-        except Exception as error:
-            raise _automation_error(error) from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
 
 
 class ViewTradingAutomationUsecase:
+    """Read one automation without intercepting unexpected service failures."""
+
     def __init__(self, service: AutomationServicePort) -> None:
         self._service = service
 
     def execute(self, automation_id: str) -> AutomationRecord:
+        """Return one automation; translate known lookup and lifecycle failures to UseCaseError."""
         try:
             return self._service.get(automation_id)
-        except Exception as error:
-            raise _automation_error(error) from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
 
 
 class ViewTradingAutomationStatusesUsecase:
@@ -97,6 +119,8 @@ class ViewTradingAutomationsUsecase:
 
 
 class ViewTradingAutomationDetailsUsecase:
+    """Read an automation with independent, explicitly reported operations and candle failures."""
+
     def __init__(
         self,
         automations: AutomationServicePort,
@@ -111,10 +135,17 @@ class ViewTradingAutomationDetailsUsecase:
         self._now = now
 
     async def execute(self, automation_id: str) -> TradingAutomationDetails:
+        """Return details with independent source errors; fail if the automation cannot be read."""
         try:
             automation = self._automations.get(automation_id)
-        except Exception as error:
-            raise _automation_error(error) from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
         end = self._now()
         start = end - timedelta(hours=2)
         operations: tuple[BrokerOperation, ...] = ()
@@ -157,45 +188,60 @@ class ViewTradingAutomationDetailsUsecase:
 
 
 class HoldAutomationUsecase:
+    """Request HOLD and preserve typed lifecycle conflict errors."""
+
     def __init__(self, service: AutomationServicePort) -> None:
         self._service = service
 
     def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the automation after HOLD; translate known lifecycle failures to UseCaseError."""
         try:
             return self._service.hold(automation_id, "User requested hold")
-        except Exception as error:
-            raise _automation_error(error) from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
 
 
 class ResumeAutomationUsecase:
+    """Request RESUME and preserve typed lifecycle conflict errors."""
+
     def __init__(self, service: AutomationServicePort) -> None:
         self._service = service
 
     def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the resumed automation; translate known lifecycle failures to UseCaseError."""
         try:
             return self._service.resume(automation_id)
-        except Exception as error:
-            raise _automation_error(error) from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
 
 
 class CloseAutomationUsecase:
+    """Request closure and preserve typed lifecycle conflict errors."""
+
     def __init__(self, service: AutomationServicePort) -> None:
         self._service = service
 
     def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the automation after requesting closure; translate known lifecycle failures."""
         try:
             return self._service.close(automation_id)
-        except Exception as error:
-            raise _automation_error(error) from error
-
-
-def _automation_error(error: Exception) -> UseCaseError:
-    if isinstance(error, RecordNotFoundError):
-        return UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.")
-    if isinstance(error, DuplicateRecordError):
-        return UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.")
-    if isinstance(error, RevisionConflictError):
-        return UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.")
-    if isinstance(error, AutomationStateConflictError):
-        return UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.")
-    raise error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error

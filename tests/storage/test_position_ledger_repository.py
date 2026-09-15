@@ -1,6 +1,5 @@
 """Baseline position ledger repository tests."""
 
-from collections.abc import Iterator
 from datetime import timedelta
 
 import pytest
@@ -15,22 +14,18 @@ from moex_sentinel.domain.trading_facts import (
     TradingFactErrorCode,
     TradingFactPersistenceError,
 )
-from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import Base, ExecutionLotAllocationModel, PositionCycleModel
+from moex_sentinel.storage.models import ExecutionLotAllocationModel, PositionCycleModel
 from moex_sentinel.storage.repositories.position_ledger import PositionLedgerRepository
-from tests.domain.test_trading_facts import all_fact_drafts
-from tests.storage.test_trading_facts_models import seed_buy_and_sell_executions
-from tests.storage.trading_facts_helpers import instrument_model
+from tests.domain.trading_facts_helpers import all_fact_drafts
+from tests.storage.trading_facts_helpers import instrument_model, seed_buy_and_sell_executions
 
 
 @pytest.fixture
-def database() -> Iterator[tuple[Engine, Session]]:
-    engine = create_database_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_buy_and_sell_executions(session)
-        yield engine, session
-    engine.dispose()
+def database(core_database: tuple[Engine, Session]) -> tuple[Engine, Session]:
+    """Seed the BUY/SELL history used by this repository's scenarios."""
+    _, session = core_database
+    seed_buy_and_sell_executions(session)
+    return core_database
 
 
 def fact_value(value_type):

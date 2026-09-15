@@ -10,7 +10,13 @@ from moex_sentinel.usecases.errors import UseCaseError
 
 
 async def render_usecase_error(_request: Request, exception: Exception) -> JSONResponse:
+    """Render application failures, preserving the internal market string-detail contract."""
     error = cast(UseCaseError, exception)
+    if error.code in {"INTERNAL_MARKET_SOURCE_NOT_FOUND", "INTERNAL_MARKET_SOURCE_UNAVAILABLE"}:
+        return JSONResponse(
+            status_code=404 if error.code == "INTERNAL_MARKET_SOURCE_NOT_FOUND" else 409,
+            content={"detail": error.message},
+        )
     status_code = (
         404
         if error.code

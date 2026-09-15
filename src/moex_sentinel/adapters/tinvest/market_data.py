@@ -3,6 +3,7 @@
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+from decimal import InvalidOperation
 from typing import Any
 
 from t_tech.invest import AsyncClient
@@ -10,8 +11,13 @@ from t_tech.invest.schemas import CandleInterval as SdkCandleInterval
 from t_tech.invest.schemas import InstrumentIdType, InstrumentStatus
 
 from moex_sentinel.adapters.tinvest.converters import enum_name, quotation_to_decimal
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.adapters.tinvest.portfolio import SANDBOX_TARGET
+from moex_sentinel.adapters.tinvest.request_errors import (
+    SDK_REQUEST_ERRORS,
+    invalid_response_error,
+    map_request_error,
+    request_status,
+)
 from moex_sentinel.domain.market_data import (
     CandleInterval,
     HistoricCandle,
@@ -50,6 +56,7 @@ class TInvestMarketDataAdapter:
         self._client_factory = client_factory
 
     async def list_instruments(self) -> tuple[MarketInstrument, ...]:
+        """Read every catalog group before converting the complete broker snapshot."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
                 responses = []
@@ -62,6 +69,9 @@ class TInvestMarketDataAdapter:
                 ):
                     response = await self._load_catalog_group(group, loader)
                     responses.append((domain_type, response))
+        except SDK_REQUEST_ERRORS as error:
+            raise map_request_error(error) from error
+        try:
             return tuple(
                 self._instrument(
                     item,
@@ -71,8 +81,8 @@ class TInvestMarketDataAdapter:
                 for domain_type, response in responses
                 for item in response.instruments
             )
-        except Exception as error:
-            raise self._map_error(error) from error
+        except (ValueError, InvalidOperation) as error:
+            raise invalid_response_error() from error
 
     @staticmethod
     async def _load_catalog_group(
@@ -82,8 +92,7 @@ class TInvestMarketDataAdapter:
         try:
             response = await loader(instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE)
         except Exception as error:
-            code_method = getattr(error, "code", None)
-            grpc_status = enum_name(code_method()) if callable(code_method) else ""
+            grpc_status = request_status(error).name if isinstance(error, SDK_REQUEST_ERRORS) else ""
             logger.warning(
                 "T-Invest catalog request failed: group=%s error_type=%s grpc_status=%s",
                 group,
@@ -108,32 +117,44 @@ class TInvestMarketDataAdapter:
         return response
 
     async def search_instruments(self, query: str) -> tuple[MarketInstrument, ...]:
+        """Return broker search matches without assigning a catalog currency."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
                 response = await services.instruments.find_instrument(query=query)
+        except SDK_REQUEST_ERRORS as error:
+            raise map_request_error(error) from error
+        try:
             return tuple(self._instrument(item, currency=None) for item in response.instruments)
-        except Exception as error:
-            raise self._map_error(error) from error
+        except (ValueError, InvalidOperation) as error:
+            raise invalid_response_error() from error
 
     async def get_instrument(self, instrument_id: str) -> MarketInstrument:
+        """Resolve one broker UID and preserve its quoted currency."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
                 response = await services.instruments.get_instrument_by(
                     id_type=InstrumentIdType.INSTRUMENT_ID_TYPE_UID,
                     id=instrument_id,
                 )
+        except SDK_REQUEST_ERRORS as error:
+            raise map_request_error(error) from error
+        try:
             item = response.instrument
             currency = str(item.currency).upper() if item.currency else None
             return self._instrument(item, currency=currency)
-        except Exception as error:
-            raise self._map_error(error) from error
+        except (ValueError, InvalidOperation) as error:
+            raise invalid_response_error() from error
 
     async def get_last_prices(self, instrument_ids: tuple[str, ...]) -> tuple[LastPrice, ...]:
+        """Return prices with source timestamps; an empty request performs no I/O."""
         if not instrument_ids:
             return ()
         try:
             async with self._client_factory(self._token, target=self._target) as services:
                 response = await services.market_data.get_last_prices(instrument_id=list(instrument_ids))
+        except SDK_REQUEST_ERRORS as error:
+            raise map_request_error(error) from error
+        try:
             return tuple(
                 LastPrice(
                     instrument_id=item.instrument_uid,
@@ -142,8 +163,8 @@ class TInvestMarketDataAdapter:
                 )
                 for item in response.last_prices
             )
-        except Exception as error:
-            raise self._map_error(error) from error
+        except (ValueError, InvalidOperation) as error:
+            raise invalid_response_error() from error
 
     async def get_candles(
         self,
@@ -152,6 +173,7 @@ class TInvestMarketDataAdapter:
         end: datetime,
         interval: CandleInterval,
     ) -> tuple[HistoricCandle, ...]:
+        """Return source candles for the requested interval without filtering incomplete bars."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
                 response = await services.market_data.get_candles(
@@ -160,6 +182,9 @@ class TInvestMarketDataAdapter:
                     to=end,
                     interval=SDK_INTERVALS[interval],
                 )
+        except SDK_REQUEST_ERRORS as error:
+            raise map_request_error(error) from error
+        try:
             return tuple(
                 HistoricCandle(
                     instrument_id=instrument_id,
@@ -173,8 +198,8 @@ class TInvestMarketDataAdapter:
                 )
                 for item in response.candles
             )
-        except Exception as error:
-            raise self._map_error(error) from error
+        except (ValueError, InvalidOperation) as error:
+            raise invalid_response_error() from error
 
     @staticmethod
     def _instrument(
@@ -183,6 +208,7 @@ class TInvestMarketDataAdapter:
         currency: str | None,
         instrument_type: str | None = None,
     ) -> MarketInstrument:
+        """Convert SDK instrument fields into the validated market contract."""
         resolved_type = instrument_type or enum_name(
             getattr(item, "instrument_kind", None) or getattr(item, "instrument_type", "")
         )
@@ -198,23 +224,6 @@ class TInvestMarketDataAdapter:
             min_price_increment=quotation_to_decimal(item.min_price_increment),
             api_trade_available=bool(item.api_trade_available_flag),
         )
-
-    @staticmethod
-    def _map_error(error: Exception) -> TInvestAdapterError:
-        code_method = getattr(error, "code", None)
-        status = enum_name(code_method()) if callable(code_method) else ""
-        mapping = {
-            "UNAUTHENTICATED": ("BROKER_AUTH_FAILED", "Проверка токена не пройдена.", False),
-            "PERMISSION_DENIED": ("BROKER_FORBIDDEN", "Недостаточно прав доступа.", False),
-            "RESOURCE_EXHAUSTED": ("BROKER_RATE_LIMITED", "Превышен лимит запросов.", True),
-            "UNAVAILABLE": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
-            "DEADLINE_EXCEEDED": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
-        }
-        code, message, retryable = mapping.get(
-            status,
-            ("BROKER_UNAVAILABLE", "Не удалось получить данные площадки.", False),  # noqa: RUF001
-        )
-        return TInvestAdapterError(code, message, retryable=retryable)
 
 
 __all__ = ["TInvestMarketDataAdapter"]

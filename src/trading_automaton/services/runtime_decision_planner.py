@@ -22,11 +22,15 @@ from trading_automaton.domain.dtos import (
     MarketIndicators,
     TradeDecision,
 )
+from trading_automaton.domain.storage_dtos import (
+    IntentHistory,
+    TradeLotRecord,
+    TradingCycleState,
+)
 from trading_automaton.services.decision import TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
 from trading_automaton.services.market_indicators import MarketIndicatorsService
 from trading_automaton.services.volatility_strategy import VolatilityThresholdCache
-from trading_automaton.storage.repository import IntentHistory, TradeLotRecord, TradingCycleState
 
 
 class CandleDataPort(Protocol):

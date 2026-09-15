@@ -11,12 +11,11 @@ from moex_sentinel.adapters.tinvest.order_execution import TInvestOrderExecution
 from moex_sentinel.adapters.tinvest.portfolio import SANDBOX_TARGET
 from sentinel_contracts.broker_execution import OrderSide
 from tests.trading_automaton.command_factory import decision_item
-from tests.trading_automaton.storage.test_local_repository import (
+from tests.trading_automaton.storage.worker_storage_helpers import (
     NOW,
     SELL_INTENT_ID,
     baseline_command,
     filled_buy,
-    repository,
 )
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
 from trading_automaton.domain.dtos import DispatchRequest
@@ -149,41 +148,40 @@ def test_unfilled_state_needs_no_execution_price(adapter_kind, status):
 
 
 @pytest.mark.parametrize("adapter_kind", ["worker", "core"])
-def test_normalized_sell_price_reaches_lifo_net_pnl_without_amount_amplification(adapter_kind):
-    repo, factory = repository()
-    try:
-        command = baseline_command()
-        repo.cache_command(command)
-        repo.save_decision_batch((decision_item(command),), occurred_at=NOW)
-        repo.finalize_execution(filled_buy())
-        sell = decision_item(command, intent_id=SELL_INTENT_ID).model_copy(
+def test_normalized_sell_price_reaches_lifo_net_pnl_without_amount_amplification(
+    adapter_kind, worker_repository_factory
+):
+    repo, factory = worker_repository_factory()
+    command = baseline_command()
+    repo.cache_command(command)
+    repo.save_decision_batch((decision_item(command),), occurred_at=NOW)
+    repo.finalize_execution(filled_buy())
+    sell = decision_item(command, intent_id=SELL_INTENT_ID).model_copy(
+        update={
+            "decision": "SELL_ALL",
+            "limit_price": Decimal("110"),
+            "intent": IntentBatchItem(SELL_INTENT_ID, "SELL_ALL", "SELL", 1, Decimal("110")),
+        }
+    )
+    repo.save_decision_batch((sell,), occurred_at=NOW)
+    value = response(total="1100", lots=1)
+    value.average_position_price = money("110")
+    value.executed_commission = money("1")
+    normalized = asyncio.run(fetch_state(adapter_kind, "get", value))
+    result = repo.finalize_execution(
+        filled_buy().model_copy(
             update={
-                "decision": "SELL_ALL",
-                "limit_price": Decimal("110"),
-                "intent": IntentBatchItem(SELL_INTENT_ID, "SELL_ALL", "SELL", 1, Decimal("110")),
+                "intent_id": SELL_INTENT_ID,
+                "side": "SELL",
+                "requested_price": Decimal("110"),
+                "requested_amount": Decimal("1100"),
+                "executed_amount": normalized.executed_amount,
+                "executed_price": normalized.executed_price,
+                "executed_commission": normalized.executed_commission,
             }
         )
-        repo.save_decision_batch((sell,), occurred_at=NOW)
-        value = response(total="1100", lots=1)
-        value.average_position_price = money("110")
-        value.executed_commission = money("1")
-        normalized = asyncio.run(fetch_state(adapter_kind, "get", value))
-        result = repo.finalize_execution(
-            filled_buy().model_copy(
-                update={
-                    "intent_id": SELL_INTENT_ID,
-                    "side": "SELL",
-                    "requested_price": Decimal("110"),
-                    "requested_amount": Decimal("1100"),
-                    "executed_amount": normalized.executed_amount,
-                    "executed_price": normalized.executed_price,
-                    "executed_commission": normalized.executed_commission,
-                }
-            )
-        )
-        # 10 shares × (110 - 100), less entry commission 2 and exit commission 1.
-        assert Decimal(result.authoritative_position_snapshot["net_pnl"]) == Decimal("97")
-        assert Decimal(result.authoritative_position_snapshot["realized_pnl"]) == Decimal("97")
-        assert repo.list_open_lots(str(command.automation_id)) == []
-    finally:
-        factory.kw["bind"].dispose()
+    )
+    # 10 shares × (110 - 100), less entry commission 2 and exit commission 1.
+    assert Decimal(result.authoritative_position_snapshot["net_pnl"]) == Decimal("97")
+    assert Decimal(result.authoritative_position_snapshot["realized_pnl"]) == Decimal("97")
+    assert repo.list_open_lots(str(command.automation_id)) == []

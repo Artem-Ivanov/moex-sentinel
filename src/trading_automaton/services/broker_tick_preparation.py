@@ -13,11 +13,13 @@ from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest
+from trading_automaton.domain.storage_dtos import (
+    AccountCommissionProfileKey,
+)
 from trading_automaton.services.account_commission_profile import (
     AccountCommissionProfileService,
 )
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
-from trading_automaton.storage.repository import AccountCommissionProfileKey
 
 LOGGER = logging.getLogger(__name__)
 
@@ -162,11 +164,11 @@ class BrokerTickPreparationService:
             await self._portfolio.apply_position_event(
                 command.account_id,
                 BrokerPosition(
-                    command.external_instrument_id,
-                    Decimal(),
-                    Decimal(),
-                    market.order_book.best_ask.price,
-                    command.currency,
+                    instrument_id=command.external_instrument_id,
+                    quantity_lots=Decimal(),
+                    average_price=Decimal(),
+                    current_price=market.order_book.best_ask.price,
+                    currency=command.currency,
                 ),
             )
         if self._bootstrap is not None:

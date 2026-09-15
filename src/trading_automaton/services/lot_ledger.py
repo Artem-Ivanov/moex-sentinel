@@ -3,7 +3,12 @@
 from datetime import datetime
 from decimal import Decimal
 
-from trading_automaton.storage.repository import LocalAutomationRepository, TradeLotRecord
+from trading_automaton.domain.storage_dtos import (
+    TradeLotRecord,
+)
+from trading_automaton.storage.repository import (
+    LocalAutomationRepository,
+)
 
 
 class LotLedgerMismatchError(RuntimeError):

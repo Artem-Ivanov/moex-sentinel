@@ -14,18 +14,23 @@ from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrd
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import PositionLotOpenedPayload
 from tests.trading_automaton.command_factory import decision_item
-from tests.trading_automaton.storage.test_local_repository import (
+from tests.trading_automaton.storage.worker_storage_helpers import (
     INTENT_ID,
     NOW,
     SELL_INTENT_ID,
     baseline_command,
     filled_buy,
 )
+from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import CommissionSchedule, DispatchRequest, PositionWorkItem
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
+from trading_automaton.services.decision import TradeDecisionService
+from trading_automaton.services.decision_context import DecisionContextService
+from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_state_hydration import PositionStateCacheService, PositionStateHydrationService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import StreamingPositionDecisionService
+from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.storage.database import create_worker_engine
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import Base, LocalIntentModel, TradingCycleStateModel
@@ -371,8 +376,17 @@ def test_rehydrated_fill_blocks_same_candle_then_allows_next_candle_reversal(sto
         assert not state.has_active_intent
         assert state.cycle.last_buy_candle_at == CANDLE_AT
 
-        transitions = StreamingCycleTransitionService(now=lambda: NOW)
-        evaluator = StreamingPositionDecisionService(cache, CommissionProfile(), cash=AvailableCash(), now=lambda: NOW)
+        transitions = StreamingCycleTransitionService(
+            now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
+        )
+        evaluator = StreamingPositionDecisionService(
+            cache,
+            CommissionProfile(),
+            cash=AvailableCash(),
+            now=lambda: NOW,
+            decisions=TradeDecisionService(),
+            contexts=DecisionContextService(StrategySettings()),
+        )
 
         def market(price):
             return InstrumentMarketState(

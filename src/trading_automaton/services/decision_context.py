@@ -6,7 +6,7 @@ from sentinel_contracts.broker_execution import BrokerPosition, OrderBookSnapsho
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import CommissionSchedule, DecisionContext, MarketIndicators
-from trading_automaton.storage.repository import (
+from trading_automaton.domain.storage_dtos import (
     IntentHistory,
     TradeLotRecord,
     TradingCycleState,
@@ -14,8 +14,10 @@ from trading_automaton.storage.repository import (
 
 
 class DecisionContextService:
-    def __init__(self, settings: StrategySettings | None = None) -> None:
-        self._settings = settings or StrategySettings()
+    """Build decision inputs using the strategy settings selected by composition."""
+
+    def __init__(self, settings: StrategySettings) -> None:
+        self._settings = settings
 
     def build(
         self,

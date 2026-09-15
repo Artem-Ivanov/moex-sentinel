@@ -190,6 +190,7 @@ button:disabled { opacity: .4; }
 .data-table tbody tr:last-child td { border-bottom: 0; }
 
 main {
+  min-width: 0;
   padding: 32px clamp(24px, 5vw, 72px);
 }
 

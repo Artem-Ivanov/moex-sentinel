@@ -5,6 +5,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from grpc import StatusCode
+from t_tech.invest.exceptions import AioRequestError
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.adapters.tinvest.market_data import TInvestMarketDataAdapter
@@ -189,7 +191,7 @@ def test_catalog_logging_identifies_failed_sdk_group_without_exception_message(
 ) -> None:
     class FailingInstrumentsService(FakeInstrumentsService):
         async def bonds(self, *, instrument_status):
-            raise RuntimeError("transport detail must stay hidden")
+            raise AioRequestError(StatusCode.UNAVAILABLE, "transport detail must stay hidden", metadata=None)
 
     class FailingContext(FakeContext):
         async def __aenter__(self):
@@ -209,6 +211,6 @@ def test_catalog_logging_identifies_failed_sdk_group_without_exception_message(
 
     failure = next(record for record in caplog.records if record.levelno == logging.WARNING)
     assert failure.instrument_group == "bonds"
-    assert failure.error_type == "RuntimeError"
-    assert failure.grpc_status == ""
+    assert failure.error_type == "AioRequestError"
+    assert failure.grpc_status == "UNAVAILABLE"
     assert "transport detail" not in failure.getMessage()

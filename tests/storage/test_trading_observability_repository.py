@@ -1,6 +1,5 @@
 """Baseline trading observability repository tests."""
 
-from collections.abc import Iterator
 from typing import TypeVar
 
 import pytest
@@ -13,23 +12,19 @@ from moex_sentinel.domain.trading_facts import (
     TradingFactErrorCode,
     TradingFactPersistenceError,
 )
-from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.trading_audit import TradingAuditRepository
-from tests.domain.test_trading_facts import all_fact_drafts
-from tests.storage.test_trading_facts_models import automation_model, seed_buy_and_sell_executions
+from tests.domain.trading_facts_helpers import all_fact_drafts
+from tests.storage.trading_facts_helpers import automation_model, seed_buy_and_sell_executions
 
 FactDraftT = TypeVar("FactDraftT", AutomationEnvelopeDraft, TradeAuditEventDraft)
 
 
 @pytest.fixture
-def database() -> Iterator[tuple[Engine, Session]]:
-    engine = create_database_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_buy_and_sell_executions(session)
-        yield engine, session
-    engine.dispose()
+def database(core_database: tuple[Engine, Session]) -> tuple[Engine, Session]:
+    """Seed the BUY/SELL history used by this repository's scenarios."""
+    _, session = core_database
+    seed_buy_and_sell_executions(session)
+    return core_database
 
 
 def fact_value(value_type: type[FactDraftT]) -> FactDraftT:

@@ -34,7 +34,32 @@
 
 `Core view -> usecase -> service -> storage/ports -> repository`
 
-`Trader runtime -> service -> repo -> local runtime db -> core via outbox/audit`
+`Worker runtime -> usecase -> service/domain -> repository -> local SQLite/outbox -> Core`
+
+Конечные операции и владельцы ресурсов:
+
+| Вход | Прикладная операция | Что остаётся вне юзкейса |
+| --- | --- | --- |
+| Core internal market HTTP | `GetMarketSnapshotUsecase` | Gateway владеет рыночными подписками и кэшем |
+| Core readiness HTTP | `CheckReadinessUsecase` | Composition внедряет проверки БД и схемы |
+| Core catalog sync | `SynchronizeBrokerInstrumentsUsecase` | Общий `ConfiguredPositionAdoptionService` вызывается после синхронизации; вложенного юзкейса нет |
+| Portfolio worker tick | `CollectPortfolioSnapshotsUsecase` | Цикл/остановка в worker; короткие Session и run lock в storage adapter; расчёты счетов в collection service |
+| Analytics HTTP | `CalculateAnalyticsSnapshotUsecase` | HTTP client принадлежит lifespan; расчёт показателей выполняется без I/O |
+| Worker startup | `RecoverWorkerRunUsecase` | Signal handling, finish-run marker и закрытие ресурсов остаются в CLI |
+| Worker control iteration | `SynchronizeTradingRuntimeUsecase` | Coordinator владеет broker tasks/bundles и heartbeat |
+| Worker broker iteration | `RunBrokerIterationUsecase` | Runtime владеет периодичностью, retry delay, lock и остановкой |
+
+У каждого изменяемого runtime-состояния один владелец: команды и обработанные
+поколения находятся в broker usecase, event остановки и блокировка — в broker
+runtime. Замена команд во время I/O видна повторной проверке перед решением.
+Остановка ждёт выполняемую итерацию перед закрытием SDK/client. Подготовка
+восстановления выполняется и при недоступной Analytics.
+
+Хранилище Worker применяет чистые domain-переходы торгового цикла в той же
+транзакции, что intent, исполнение, лоты и outbox. Оно не создаёт бизнес-сервис.
+Сборщик портфеля удерживает отдельный run lock во время чтения счетов, но не
+держит data Session через broker awaits; окончательная запись run и снимков
+атомарна. Для SQLite она явно открывает физическую транзакцию перед SAVEPOINT.
 
 - Core не выполняет решение по рынку напрямую.
 - Core поддерживает рыночный поток и историю, Analytics рассчитывает показатели

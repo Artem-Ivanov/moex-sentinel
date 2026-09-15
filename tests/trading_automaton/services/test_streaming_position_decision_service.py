@@ -7,8 +7,10 @@ from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrd
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.config import StrategySettings
 from trading_automaton.services.account_commission_profile import CommissionSchedule
 from trading_automaton.services.decision import TradeDecision
+from trading_automaton.services.decision_context import DecisionContextService
 from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.position_batch_scheduler import PositionWorkItem
 from trading_automaton.services.streaming_position_decision import (
@@ -92,6 +94,7 @@ def test_evaluates_executable_position_once_and_materializes_exact_buy_commissio
         commissions,
         decisions=decisions,
         now=lambda: NOW,
+        contexts=DecisionContextService(StrategySettings()),
     )
 
     # Replaces the historical zero-commission re-evaluation defect.
@@ -114,6 +117,7 @@ def test_materializes_exact_sell_commission_from_its_own_decision_amount() -> No
         Commissions(),
         decisions=decisions,
         now=lambda: NOW,
+        contexts=DecisionContextService(StrategySettings()),
     )
 
     result = asyncio.run(service.decide(work_item(), market()))
@@ -138,6 +142,7 @@ def test_builds_decision_with_current_account_cash_and_reservations_once() -> No
         cash=Cash(),
         decisions=decisions,
         now=lambda: NOW,
+        contexts=DecisionContextService(StrategySettings()),
     )
 
     asyncio.run(service.decide(work_item(), market()))
@@ -152,6 +157,7 @@ def test_missing_hydrated_state_waits_without_strategy_call() -> None:
         Commissions(),
         decisions=decisions,
         now=lambda: NOW,
+        contexts=DecisionContextService(StrategySettings()),
     )
 
     result = asyncio.run(service.decide(PositionWorkItem(command(), False, state=None, snapshot_at=NOW), market()))
@@ -169,6 +175,7 @@ def test_missing_or_expired_schedule_waits_without_strategy_call() -> None:
         commissions,
         decisions=decisions,
         now=lambda: NOW,
+        contexts=DecisionContextService(StrategySettings()),
     )
 
     result = asyncio.run(service.decide(work_item(snapshot_at=NOW + timedelta(days=1)), market()))

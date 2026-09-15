@@ -10,8 +10,8 @@ from moex_sentinel.domain.trading_facts import AutomationEnvelopeDraft
 from moex_sentinel.storage.database import create_database_engine
 from moex_sentinel.storage.models import Base
 from moex_sentinel.storage.repositories.trading_audit import TradingAuditRepository
-from tests.storage.test_trading_facts_models import automation_model, seed_two_scopes
 from tests.storage.test_trading_observability_repository import fact_value
+from tests.storage.trading_facts_helpers import automation_model, seed_two_scopes
 
 
 @pytest.fixture

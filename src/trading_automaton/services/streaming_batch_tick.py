@@ -6,7 +6,6 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, cast
-from uuid import uuid4
 
 from sentinel_contracts.broker_execution import OrderBookSnapshot
 from sentinel_contracts.streaming_market import InstrumentMarketState, MarketBatchSnapshot
@@ -17,7 +16,6 @@ from trading_automaton.domain.storage_dtos import DecisionBatchItem
 from trading_automaton.services.batch_runtime import PostCommitBatchError
 from trading_automaton.services.decision_materialization import (
     DecisionMaterializerPort,
-    DecisionMaterializerService,
 )
 from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
@@ -72,29 +70,31 @@ class CashReservationPort(Protocol):
 
 
 class StreamingBatchTickService:
+    """Coordinate scheduling, position state reads and durable batch dispatch."""
+
     def __init__(
         self,
         scheduler: PositionBatchSchedulerService,
         states: PositionStatePort,
-        commissions: object,
         batch: BatchRuntimePort,
         *,
         cash: CashReservationPort | None = None,
         cycles: CycleTransitionPort | None = None,
         now: Callable[[], datetime],
         audit: BusinessAuditPort | None = None,
-        id_factory: Callable[[], str] = lambda: str(uuid4()),
-        materializer: DecisionMaterializerPort | None = None,
+        materializer: DecisionMaterializerPort,
+        order_books: OrderBookValidationService,
         max_order_book_age: timedelta = timedelta(seconds=2),
     ) -> None:
+        """Wire tick dependencies; commission profiles belong to preparation and decisions."""
         self._scheduler = scheduler
         self._states = states
         self._batch = batch
         self._cash = cash
         self._cycles = cycles
         self._audit = audit
-        self._materializer = materializer or DecisionMaterializerService(id_factory=id_factory)
-        self._order_books = OrderBookValidationService()
+        self._materializer = materializer
+        self._order_books = order_books
         self._max_order_book_age = max_order_book_age
         self._now = now
         # Serializing tick handling makes parallel cash budgeting deterministic.

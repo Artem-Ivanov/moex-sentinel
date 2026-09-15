@@ -60,10 +60,10 @@ class DecisionMaterializerService:
     def __init__(
         self,
         *,
-        settings: StrategySettings | None = None,
+        settings: StrategySettings,
         id_factory: Callable[[], str] = lambda: str(uuid4()),
     ) -> None:
-        self._settings = settings or StrategySettings()
+        self._settings = settings
         self._id_factory = id_factory
 
     async def materialize(
@@ -78,6 +78,9 @@ class DecisionMaterializerService:
         snapshot_at: datetime,
         intent_id: str | None = None,
     ) -> DecisionMaterialization | None:
+        """Build decision, dispatch and audit artifacts; WAIT has no intent.
+
+        Generate the intent ID before changing pending cash for an accepted BUY."""
         state = prepared.evaluation.state
         if state is None or market.order_book is None:
             return None
@@ -92,7 +95,6 @@ class DecisionMaterializerService:
         except ValueError:
             process_id = self._id_factory()
         request: DispatchRequest | None = None
-        resolved_intent_id = intent_id
         audit_cash: dict[str, str] = {}
 
         if decision.kind in {DecisionKind.BUY_MORE, DecisionKind.SELL_PART, DecisionKind.SELL_ALL}:
@@ -119,30 +121,15 @@ class DecisionMaterializerService:
                 if projected_available < required_order_cash:
                     decision = TradeDecision(DecisionKind.WAIT, 0, None, "INSUFFICIENT_FREE_CASH")
                     estimated_commission = Decimal()
-                    audit_cash["estimated_buy_commission"] = str(estimated_commission)
-                else:
-                    resolved_intent_id = resolved_intent_id or self._id_factory()
+            else:
+                required_order_cash = required_order_cash if side is OrderSide.BUY else Decimal()
+                audit_cash["required_order_cash"] = str(required_order_cash)
+
+            if decision.kind is not DecisionKind.WAIT:
+                resolved_intent_id = intent_id or self._id_factory()
+                if side is OrderSide.BUY and cash is not None:
                     pending_cash[cash_key] = pending_cash.get(cash_key, Decimal()) + required_order_cash
                     projected_available -= required_order_cash
-                    request = self._build_request(
-                        resolved_intent_id,
-                        command,
-                        work.instrument_type,
-                        side,
-                        decision.quantity_lots,
-                        limit_price,
-                        process_id,
-                        str(command.broker_id),
-                        command.currency,
-                        required_order_cash,
-                    )
-                audit_cash["estimated_buy_commission"] = str(estimated_commission)
-                audit_cash["available_after_reserve"] = str(projected_available)
-            else:
-                # For SELL action and BUY actions when cash service is unavailable, keep request mandatory.
-                required_order_cash = required_order_cash if side is OrderSide.BUY else Decimal()
-                resolved_intent_id = resolved_intent_id or self._id_factory()
-                audit_cash["required_order_cash"] = str(required_order_cash)
                 request = self._build_request(
                     resolved_intent_id,
                     command,
@@ -155,9 +142,9 @@ class DecisionMaterializerService:
                     command.currency,
                     required_order_cash,
                 )
-                audit_cash["estimated_buy_commission"] = str(
-                    estimated_commission if side is OrderSide.BUY else Decimal()
-                )
+            audit_cash["estimated_buy_commission"] = str(estimated_commission if side is OrderSide.BUY else Decimal())
+            if side is OrderSide.BUY and cash is not None:
+                audit_cash["available_after_reserve"] = str(projected_available)
         elif decision.kind is DecisionKind.NO_ACTION:
             audit_cash["estimated_buy_commission"] = str(Decimal())
             audit_cash["required_order_cash"] = str(Decimal())
@@ -185,14 +172,12 @@ class DecisionMaterializerService:
             )
         intent: IntentBatchItem | None = None
         if request is not None:
-            if resolved_intent_id is None or decision.limit_price is None:
-                raise RuntimeError("Dispatch request is missing its durable intent data.")
             intent = IntentBatchItem(
-                resolved_intent_id,
-                decision.kind.value,
-                "BUY" if decision.kind is DecisionKind.BUY_MORE else "SELL",
-                decision.quantity_lots,
-                decision.limit_price,
+                idempotency_key=request.idempotency_key,
+                kind=decision.kind.value,
+                side=request.side.value,
+                quantity_lots=request.quantity_lots,
+                limit_price=request.limit_price,
             )
 
         item = DecisionBatchItem(

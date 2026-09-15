@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import UTC, datetime
+from time import monotonic as system_monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +14,12 @@ from sentinel_contracts.trading_facts import AutomationCommand, BrokerPositionBo
 from tests.trading_automaton.command_factory import command as baseline_command
 from tests.trading_automaton.command_factory import decision_item
 from trading_automaton.config import StrategySettings
+from trading_automaton.runtime.streaming_coordinator import LOGGER, StreamingRuntimeCoordinator
+from trading_automaton.services.automation_lifecycle import WorkerAutomationLifecycleService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
-from trading_automaton.services.streaming_runtime_coordinator import LOGGER, StreamingRuntimeCoordinatorService
 from trading_automaton.storage.models import Base, LocalIntentModel
 from trading_automaton.storage.repository import LocalAutomationRepository
+from trading_automaton.usecases.synchronize_runtime import SynchronizeTradingRuntimeUsecase
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
 
@@ -134,6 +137,39 @@ class Bundle:
         self.release.set()
 
 
+def build_coordinator(
+    repository,
+    synchronization,
+    core,
+    builder,
+    *,
+    worker_id,
+    now,
+    monotonic=system_monotonic,
+    heartbeat_interval_seconds=3.0,
+    command_limit=100,
+):
+    """Assemble the real control operation and lifecycle with fresh scenario state."""
+    iteration = SynchronizeTradingRuntimeUsecase(
+        repository,
+        synchronization,
+        core,
+        WorkerAutomationLifecycleService(repository),
+        worker_id=worker_id,
+        now=now,
+        command_limit=command_limit,
+    )
+    return StreamingRuntimeCoordinator(
+        iteration,
+        core,
+        builder,
+        worker_id=worker_id,
+        now=now,
+        monotonic=monotonic,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
+
+
 def test_claims_syncs_and_assigns_commands_to_one_broker_runtime() -> None:
     async def scenario():
         repository = Repository()
@@ -144,7 +180,7 @@ def test_claims_syncs_and_assigns_commands_to_one_broker_runtime() -> None:
         async def builder(connection):
             return bundle
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -198,7 +234,7 @@ def test_restored_bootstrap_hold_is_prepared_without_claim_or_early_activation(l
         async def builder(connection):
             return bundle
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -251,7 +287,7 @@ def test_closed_adopted_automation_keeps_uncertain_intent_supervision_after_boot
         async def builder(connection):
             return bundle
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             ClosedCore(),
@@ -288,7 +324,7 @@ def test_flush_makes_one_decision_when_outbox_batch_is_below_deadline() -> None:
         async def builder(connection):
             return Bundle()
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -314,7 +350,7 @@ def test_heartbeat_is_sent_no_more_than_once_per_three_seconds() -> None:
         async def builder(connection):
             return Bundle()
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -369,7 +405,7 @@ def test_hold_is_synchronized_but_not_assigned_to_broker_runtime() -> None:
             builds.append(connection)
             return Bundle()
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -402,7 +438,7 @@ def test_rebuilds_broker_runtime_after_its_task_finishes_with_error() -> None:
         async def builder(connection):
             return next(bundles)
 
-        service = StreamingRuntimeCoordinatorService(
+        service = build_coordinator(
             repository,
             synchronization,
             core,
@@ -464,10 +500,17 @@ def test_held_nonbootstrap_automation_keeps_uncertain_intent_supervision(tmp_pat
         synchronization = Synchronization()
         synchronization.claimed = True
         bundle = Bundle()
+
         async def builder(connection):
             return bundle
-        service = StreamingRuntimeCoordinatorService(
-            repository, synchronization, HeldCore(), builder, worker_id="worker", now=lambda: NOW,
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            HeldCore(),
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
         )
         await service.run_iteration()
         await service.close()

@@ -25,9 +25,8 @@ from sentinel_contracts.trading_facts import (
     FactKind,
     PositionCycleUpdatedEnvelope,
 )
-from tests.contracts.test_trading_facts_contract import all_envelopes
-from tests.storage.test_trading_facts_models import automation_model
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.contracts.trading_facts_helpers import all_envelopes
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.storage.fact_outbox import FactOutboxWriter

@@ -6,20 +6,20 @@ import signal
 from contextlib import suppress
 
 from sentinel_contracts.audit import audit_event, business_process, configure_logging
-from trading_automaton.composition import build_streaming_runtime
+from trading_automaton.composition import build_streaming_runtime, build_worker_recovery
 from trading_automaton.config import AutomatonSettings, StrategySettings
-from trading_automaton.services.recovery import RecoveryService
 
 LOGGER = logging.getLogger(__name__)
 
 
 async def run() -> None:
+    """Recover the Worker, run control iterations, then close runtime, run marker and HTTP."""
     settings = AutomatonSettings()  # type: ignore[call-arg]
     strategy_settings = StrategySettings()
     configure_logging("trading-automaton", level=settings.log_level, format=settings.log_format)
     runtime, repository, http = build_streaming_runtime(settings, strategy_settings)
-    unclean_shutdown = repository.begin_run(settings.worker_id)
-    RecoveryService(repository).recover(unclean_shutdown=unclean_shutdown)
+    recovery = build_worker_recovery(repository, settings.worker_id)
+    recovery.execute()
     stop_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationStateChangedPayload, FactKind, TradeAuditRecordedPayload
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 from trading_automaton.storage.database import create_worker_engine
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import Base, CachedAutomationModel, FactOutboxModel

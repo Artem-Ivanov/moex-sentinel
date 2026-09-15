@@ -15,7 +15,7 @@ from tests.integration.test_core_worker_lifecycle import (
     lifecycle as lifecycle_fixture,
 )
 from tests.trading_automaton.command_factory import decision_item
-from tests.trading_automaton.storage.test_local_repository import INTENT_ID, filled_buy
+from tests.trading_automaton.storage.worker_storage_helpers import INTENT_ID, filled_buy
 
 lifecycle = lifecycle_fixture
 

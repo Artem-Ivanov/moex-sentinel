@@ -306,11 +306,11 @@ class OrderTrackingService:
             await self._portfolio.apply_position_event(
                 request.account_id,
                 BrokerPosition(
-                    request.instrument_id,
-                    Decimal(snapshot["quantity_lots"]),
-                    Decimal(snapshot["average_price"]),
-                    response.executed_price,
-                    response.currency,
+                    instrument_id=request.instrument_id,
+                    quantity_lots=Decimal(snapshot["quantity_lots"]),
+                    average_price=Decimal(snapshot["average_price"]),
+                    current_price=response.executed_price,
+                    currency=response.currency,
                 ),
             )
         await self._audit_stage(

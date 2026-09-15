@@ -12,13 +12,17 @@ from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookSnapshot
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.domain.dtos import MarketIndicators
+from trading_automaton.domain.storage_dtos import (
+    IntentHistory,
+    TradeLotRecord,
+    TradingCycleState,
+)
 from trading_automaton.services.runtime_decision_planner import (
     DecisionEstimatePort,
     DecisionPlan,
     TradingDecisionPlanner,
 )
 from trading_automaton.services.trading_cycle import TradingCycleService
-from trading_automaton.storage.repository import IntentHistory, TradeLotRecord, TradingCycleState
 
 
 class PositionDecisionBundle(PositionalModel):

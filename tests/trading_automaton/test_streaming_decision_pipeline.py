@@ -7,11 +7,15 @@ from sentinel_contracts.streaming_market import StreamOrderBook, StreamTradingSt
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.config import StrategySettings
 from trading_automaton.services.account_commission_profile import CommissionSchedule
 from trading_automaton.services.broker_runtime import BrokerRuntimeService
 from trading_automaton.services.decision import TradeDecision, TradeDecisionService
+from trading_automaton.services.decision_context import DecisionContextService
+from trading_automaton.services.decision_materialization import DecisionMaterializerService
 from trading_automaton.services.hot_market_data import HotMarketDataCacheService
 from trading_automaton.services.market_indicators import MarketIndicators
+from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
 from trading_automaton.services.streaming_position_decision import (
@@ -122,13 +126,14 @@ def test_one_order_book_event_evaluates_each_position_once_before_sdk_dispatch()
                     Schedules(),
                     decisions=TradeDecisionService(strategy),
                     now=lambda: NOW,
+                    contexts=DecisionContextService(StrategySettings()),
                 )
             ),
             states,
-            object(),
             batch,
             now=lambda: NOW,
-            id_factory=lambda: "id",
+            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "id"),
+            order_books=OrderBookValidationService(),
         )
         preparation = Preparation()
         runtime = BrokerRuntimeService(

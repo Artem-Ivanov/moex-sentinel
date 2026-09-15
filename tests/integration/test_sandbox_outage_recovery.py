@@ -17,7 +17,7 @@ from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
 from sentinel_contracts.trading import AutomationState
 from tests.integration.test_analytics_worker_contract import ExecutionSession
 from tests.integration.test_dynamic_strategy_contract import ContractHarness
-from tests.market_analytics.test_app import NOW, instrument
+from tests.market_analytics.market_source_helpers import NOW, instrument
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 from tests.trading_automaton.command_factory import command
 from trading_automaton.config import StrategySettings

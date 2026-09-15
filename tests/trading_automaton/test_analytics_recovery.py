@@ -12,7 +12,7 @@ from tests.trading_automaton.test_analytics_runtime import NOW, Source, frame, r
 
 
 def test_repeated_analytics_transport_failures_log_transitions_only(caplog, monkeypatch):
-    monkeypatch.setattr("trading_automaton.services.analytics_runtime.LOGGER.disabled", False)
+    monkeypatch.setattr("trading_automaton.services.analytics_frame.LOGGER.disabled", False)
 
     async def scenario():
         source = Source(httpx.ReadTimeout("synthetic failure"))
@@ -30,7 +30,7 @@ def test_repeated_analytics_transport_failures_log_transitions_only(caplog, monk
 
     with caplog.at_level(logging.INFO):
         asyncio.run(scenario())
-    records = [r for r in caplog.records if r.name.endswith("analytics_runtime")]
+    records = [r for r in caplog.records if r.name.endswith("analytics_frame")]
     assert [getattr(r, "reason_code", None) for r in records] == [
         "ANALYTICS_UNAVAILABLE",
         "ANALYTICS_TRANSPORT_RECOVERED",
@@ -108,7 +108,7 @@ def test_exhausted_broker_retries_remain_paused_until_restart(monkeypatch, retry
 
 
 def test_permanent_broker_error_waits_for_restart_without_repeating_calls(caplog, monkeypatch):
-    monkeypatch.setattr("trading_automaton.services.analytics_runtime.LOGGER.disabled", False)
+    monkeypatch.setattr("trading_automaton.runtime.analytics_broker.LOGGER.disabled", False)
 
     async def scenario():
         service, preparation, _ = runtime(Source(frame()))

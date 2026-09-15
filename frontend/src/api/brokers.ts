@@ -1,3 +1,5 @@
+import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+
 export interface BrokerField {
   name: string
   value: string
@@ -48,7 +50,7 @@ export class BrokerApiError extends Error {
   constructor(
     public readonly code: string,
     message: string,
-    public readonly fields: Array<{ path: string; code: string; message: string }> = [],
+    public readonly fields: ApiFieldError[] = [],
   ) {
     super(message)
   }
@@ -56,16 +58,10 @@ export class BrokerApiError extends Error {
 
 async function ensureSuccess(response: Response): Promise<Response> {
   if (response.ok) return response
-
-  try {
-    const payload = (await response.json()) as {
-      detail?: { code?: string; message?: string; fields?: Array<{ path: string; code: string; message: string }> }
-    }
-    if (payload.detail?.code && payload.detail.message) {
-      throw new BrokerApiError(payload.detail.code, payload.detail.message, payload.detail.fields ?? [])
-    }
-  } catch (error: unknown) {
-    if (error instanceof BrokerApiError) throw error
+  const payload = await readErrorPayload(response)
+  const detail = payload?.detail
+  if (detail?.code && detail.message) {
+    throw new BrokerApiError(detail.code, detail.message, detail.fields ?? [])
   }
   throw new BrokerApiError("BROKER_API_ERROR", "Не удалось выполнить запрос к backend.")
 }

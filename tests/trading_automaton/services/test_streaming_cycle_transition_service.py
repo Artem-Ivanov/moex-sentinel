@@ -8,8 +8,10 @@ from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrd
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
 from trading_automaton.services.market_indicators import MarketIndicators
+from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import HydratedPositionState
+from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.storage.repository import IntentHistory, TradingCycleState
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
@@ -54,7 +56,9 @@ def state(*, quantity: str, pending_low: Decimal | None) -> HydratedPositionStat
 
 
 def test_flat_position_observes_first_pending_low() -> None:
-    result = StreamingCycleTransitionService(now=lambda: NOW).apply(
+    result = StreamingCycleTransitionService(
+        now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
+    ).apply(
         command(),
         state(quantity="0", pending_low=None),
         market("99"),
@@ -65,7 +69,9 @@ def test_flat_position_observes_first_pending_low() -> None:
 
 
 def test_open_position_moves_pending_low_with_market() -> None:
-    result = StreamingCycleTransitionService(now=lambda: NOW).apply(
+    result = StreamingCycleTransitionService(
+        now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
+    ).apply(
         command(),
         state(quantity="2", pending_low=Decimal("99")),
         market("98"),
@@ -88,7 +94,9 @@ def test_invalid_market_cannot_seed_a_false_low_before_fresh_reversal(invalid: s
         "future": {"captured_at": NOW + timedelta(seconds=1)},
     }
     observed = observed.model_copy(update={"order_book": book.model_copy(update=changes[invalid])})
-    service = StreamingCycleTransitionService(now=lambda: NOW)
+    service = StreamingCycleTransitionService(
+        now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
+    )
 
     rejected = service.apply(command(), initial, observed)
     recovered = service.apply(command(), rejected, market("99"))

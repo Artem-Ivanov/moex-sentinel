@@ -1,24 +1,19 @@
-from collections.abc import Iterator
-
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from moex_sentinel.domain.trading_facts import TradingFactErrorCode, TradingFactPersistenceError
-from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import Base, TradeDecisionModel
+from moex_sentinel.storage.models import TradeDecisionModel
 from moex_sentinel.storage.repositories.trading_facts_support import append_idempotent, flush_or_translate
-from tests.storage.test_trading_facts_models import decision_model, seed_cycle
+from tests.storage.trading_facts_helpers import decision_model, seed_cycle
 
 
 @pytest.fixture
-def database() -> Iterator[tuple[Engine, Session]]:
-    engine = create_database_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_cycle(session)
-        yield engine, session
-    engine.dispose()
+def database(core_database: tuple[Engine, Session]) -> tuple[Engine, Session]:
+    """Seed the cycle required by these idempotent-persistence scenarios."""
+    _, session = core_database
+    seed_cycle(session)
+    return core_database
 
 
 def decision_identity(model: TradeDecisionModel) -> tuple[str, str]:

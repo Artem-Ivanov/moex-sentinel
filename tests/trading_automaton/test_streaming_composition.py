@@ -13,8 +13,8 @@ from trading_automaton import composition
 from trading_automaton.composition import BrokerRuntimeBundle, build_broker_runtime, build_streaming_runtime
 from trading_automaton.config import AutomatonSettings, StrategySettings
 from trading_automaton.domain.dtos import CommissionQuote
+from trading_automaton.runtime.streaming_coordinator import StreamingRuntimeCoordinator
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
-from trading_automaton.services.streaming_runtime_coordinator import StreamingRuntimeCoordinatorService
 from trading_automaton.storage.models import Base
 from trading_automaton.storage.repository import LocalAutomationRepository
 
@@ -122,7 +122,7 @@ def test_composed_preparation_bootstraps_hold_through_real_recovery_service(tmp_
             now=lambda: NOW,
         )
         try:
-            await bundle.runtime._preparation.prepare((value,), bootstrap_market())
+            await bundle.runtime._iteration._preparation.prepare((value,), bootstrap_market())
         finally:
             await bundle.close()
 
@@ -203,7 +203,7 @@ def test_builds_streaming_coordinator_as_production_runtime(tmp_path) -> None:
     runtime, _repository, http = build_streaming_runtime(settings, StrategySettings())
     http.close()
 
-    assert isinstance(runtime, StreamingRuntimeCoordinatorService)
+    assert isinstance(runtime, StreamingRuntimeCoordinator)
 
 
 def test_composition_uses_one_typed_synchronization_path(tmp_path) -> None:
@@ -215,7 +215,7 @@ def test_composition_uses_one_typed_synchronization_path(tmp_path) -> None:
     runtime, _repository, http = build_streaming_runtime(settings, StrategySettings())
     http.close()
 
-    assert isinstance(runtime._synchronization, FactSynchronizationService)
+    assert isinstance(runtime._iteration._synchronization, FactSynchronizationService)
     assert not hasattr(runtime, "_audit_delivery")
 
 

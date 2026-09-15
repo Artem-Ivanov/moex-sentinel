@@ -142,54 +142,94 @@ class ClientContext:
         return None
 
 
-def test_maps_order_book_estimate_submit_state_and_cancel() -> None:
-    asyncio.run(run_order_execution_scenario())
-
-
-async def run_order_execution_scenario() -> None:
+@pytest.fixture
+def execution_adapter() -> tuple[Services, TInvestOrderExecutionAdapter]:
     services = Services()
     adapter = TInvestOrderExecutionAdapter(
         "synthetic-token",
         "sandbox-invest-public-api.tbank.ru:443",
         client_factory=lambda *_args, **_kwargs: ClientContext(services),
     )
+    return services, adapter
 
-    book = await adapter.get_order_book("instrument-1", depth=20)
-    estimate = await adapter.estimate_limit_order("account-1", "instrument-1", OrderSide.BUY, 2, Decimal("100.10"))
-    submitted = await adapter.submit_limit_order(
-        "account-1",
-        "instrument-1",
-        OrderSide.BUY,
-        2,
-        Decimal("100.10"),
-        "00000000-0000-4000-8000-000000000001",
-    )
-    state = await adapter.get_order_state("account-1", "broker-order-1")
-    reconciled = await adapter.find_by_idempotency_key("account-1", "00000000-0000-4000-8000-000000000001")
-    active_orders = await adapter.list_active_orders("account-1", "instrument-1")
-    cancelled_at = await adapter.cancel_order("account-1", "broker-order-1")
-    position = await adapter.get_position("account-1", "instrument-1")
-    trading_status = await adapter.get_trading_status("instrument-1")
+
+def test_maps_order_book(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    book = asyncio.run(adapter.get_order_book("instrument-1", depth=20))
 
     assert book.best_bid.price == Decimal("99.9")
     assert book.best_ask.price == Decimal("100.1")
+
+
+def test_estimates_limit_order(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    estimate = asyncio.run(
+        adapter.estimate_limit_order("account-1", "instrument-1", OrderSide.BUY, 2, Decimal("100.10"))
+    )
+
     assert estimate.total_amount == Decimal("200.2")
     assert estimate.estimated_commission == Decimal("0.6")
+
+
+def test_submits_limit_order(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    services, adapter = execution_adapter
+    submitted = asyncio.run(
+        adapter.submit_limit_order(
+            "account-1", "instrument-1", OrderSide.BUY, 2, Decimal("100.10"), "00000000-0000-4000-8000-000000000001"
+        )
+    )
+
     assert submitted.broker_order_id == "broker-order-1"
     assert services.orders.posted["order_id"] == "00000000-0000-4000-8000-000000000001"
+
+
+def test_maps_order_state(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    state = asyncio.run(adapter.get_order_state("account-1", "broker-order-1"))
+
     assert state.status == "PARTIALLY_FILLED"
     assert state.executed_lots == 1
     assert state.executed_commission == Decimal("0.3")
     assert state.executed_price == Decimal("100.1")
     assert state.executed_at == datetime(2026, 8, 5, 12, 2, tzinfo=UTC)
+
+
+def test_finds_order_by_idempotency_key(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    reconciled = asyncio.run(adapter.find_by_idempotency_key("account-1", "00000000-0000-4000-8000-000000000001"))
+
     assert reconciled is not None
     assert reconciled.broker_order_id == "broker-order-1"
+
+
+def test_lists_active_orders(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    active_orders = asyncio.run(adapter.list_active_orders("account-1", "instrument-1"))
+
     assert active_orders[0].broker_order_id == "broker-order-1"
     assert active_orders[0].status == "EXECUTION_REPORT_STATUS_NEW"
+
+
+def test_cancels_order(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    cancelled_at = asyncio.run(adapter.cancel_order("account-1", "broker-order-1"))
+
     assert cancelled_at == datetime(2026, 8, 5, 12, 1, tzinfo=UTC)
+
+
+def test_maps_position(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    position = asyncio.run(adapter.get_position("account-1", "instrument-1"))
+
     assert position is not None
     assert position.quantity_lots == Decimal("2")
     assert position.current_price == Decimal("102")
+
+
+def test_maps_trading_status(execution_adapter: tuple[Services, TInvestOrderExecutionAdapter]) -> None:
+    _services, adapter = execution_adapter
+    trading_status = asyncio.run(adapter.get_trading_status("instrument-1"))
+
     assert trading_status.limit_order_available is True
     assert trading_status.api_trade_available is True
 

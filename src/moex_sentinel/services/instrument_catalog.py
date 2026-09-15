@@ -19,7 +19,7 @@ from moex_sentinel.domain.instrument_catalog import (
     UserBrokerCatalogReconciliationResult,
     UserBrokerCatalogSyncState,
 )
-from moex_sentinel.domain.market_data import LastPrice
+from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle, LastPrice
 from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.market_data_ports import MarketDataPort
@@ -36,6 +36,10 @@ CATEGORY_LABELS = {
 
 class InstrumentLotPriceRangeError(ValueError):
     pass
+
+
+class InstrumentCategoryError(ValueError):
+    """The requested category is not part of the supported catalog taxonomy."""
 
 
 class InstrumentCatalogRepositoryPort(Protocol):
@@ -111,11 +115,11 @@ class InstrumentCatalogService:
         }
         result = self._catalog.reconcile(broker_id, tuple(unique.values()), self._clock())
         return CatalogReconciliationResult(
-            result.user_broker_id,
-            result.added,
-            result.updated,
-            result.deactivated,
-            result.synchronized_at,
+            broker_id=result.user_broker_id,
+            added=result.added,
+            updated=result.updated,
+            deactivated=result.deactivated,
+            synchronized_at=result.synchronized_at,
         )
 
     async def list(
@@ -128,6 +132,9 @@ class InstrumentCatalogService:
         lot_price_to: Decimal | None,
         currency: str = "RUB",
     ) -> CatalogListView:
+        """List priced catalog entries after validating category and range before any I/O."""
+        if category is not None and category not in CATEGORY_LABELS:
+            raise InstrumentCategoryError("Неизвестная категория инструментов.")
         if lot_price_from is not None and lot_price_from < 0:
             raise InstrumentLotPriceRangeError("Минимальная цена лота не может быть отрицательной.")
         if lot_price_to is not None and lot_price_to < 0:
@@ -174,11 +181,11 @@ class InstrumentCatalogService:
                 )
             )
         return CatalogListView(
-            broker_id,
-            tuple(items),
-            categories,
-            self._sync_state(self._catalog.sync_state(broker_id)),
-            currencies,
+            broker_id=broker_id,
+            items=tuple(items),
+            categories=categories,
+            sync_state=self._sync_state(self._catalog.sync_state(broker_id)),
+            currencies=currencies,
         )
 
     async def details(self, broker_id: str, instrument_id: str) -> InstrumentDetailsView:
@@ -187,12 +194,26 @@ class InstrumentCatalogService:
         instrument = self._instrument(record)
         prices = await self._adapter_factory(broker).get_last_prices((record.external_instrument_id,))
         return InstrumentDetailsView(
-            broker.display_name,
-            instrument,
-            prices[0] if prices else None,
-            None if not prices else prices[0].price * instrument.lot,
-            self._sync_state(self._catalog.sync_state(broker_id)),
+            broker_name=broker.display_name,
+            instrument=instrument,
+            last_price=prices[0] if prices else None,
+            lot_price=None if not prices else prices[0].price * instrument.lot,
+            sync_state=self._sync_state(self._catalog.sync_state(broker_id)),
         )
+
+    async def candles(
+        self,
+        broker_id: str,
+        instrument_id: str,
+        start: datetime,
+        end: datetime,
+        interval: CandleInterval,
+    ) -> tuple[HistoricCandle, ...]:
+        """Read completed candles for an internal catalog ID in the broker scope."""
+        broker = self._broker(broker_id)
+        record = self._catalog.get(broker_id, instrument_id)
+        candles = await self._adapter_factory(broker).get_candles(record.external_instrument_id, start, end, interval)
+        return tuple(candle for candle in candles if candle.is_complete)
 
     def set_selected(self, broker_id: str, instrument_id: str, selected: bool) -> CatalogInstrument:
         self._broker(broker_id)
@@ -237,11 +258,11 @@ class InstrumentCatalogService:
     @staticmethod
     def _sync_state(value: UserBrokerCatalogSyncState) -> CatalogSyncState:
         return CatalogSyncState(
-            value.user_broker_id,
-            value.status,
-            value.last_attempt_at,
-            value.last_success_at,
-            value.safe_error,
+            broker_id=value.user_broker_id,
+            status=value.status,
+            last_attempt_at=value.last_attempt_at,
+            last_success_at=value.last_success_at,
+            safe_error=value.safe_error,
         )
 
     @staticmethod

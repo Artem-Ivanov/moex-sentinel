@@ -3,7 +3,8 @@
 from datetime import datetime
 from decimal import Decimal
 
-from trading_automaton.storage.repository import TradingCycleState
+from trading_automaton.domain.storage_dtos import TradingCycleState
+from trading_automaton.domain.trading_cycle import mark_buy, mark_sell
 
 
 class TradingCycleService:
@@ -47,17 +48,12 @@ class TradingCycleService:
         return state.model_copy(update={"pending_low": low, "updated_at": now})
 
     def mark_buy(self, state: TradingCycleState, candle_at: datetime, *, now: datetime) -> TradingCycleState:
-        return state.model_copy(update={"pending_low": None, "last_buy_candle_at": candle_at, "updated_at": now})
+        """Apply the shared buy transition without persisting the returned state."""
+        return mark_buy(state, candle_at, now=now)
 
     def mark_sell(self, state: TradingCycleState, price: Decimal, *, now: datetime) -> TradingCycleState:
-        return state.model_copy(
-            update={
-                "pending_low": None,
-                "sell_armed": False,
-                "last_sell_price": price,
-                "updated_at": now,
-            }
-        )
+        """Apply the shared sell transition without persisting the returned state."""
+        return mark_sell(state, price, now=now)
 
     def rearm_for_next_sell(
         self,

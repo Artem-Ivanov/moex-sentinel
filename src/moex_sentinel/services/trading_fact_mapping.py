@@ -38,6 +38,7 @@ class TradingFactMapper:
     """Apply one already validated envelope to session-bound repositories."""
 
     def apply(self, uow: TradingFactsUnitOfWorkPort, envelope: FactEnvelope) -> None:
+        """Map an already validated envelope within the supplied UoW without committing it."""
         scope_id = str(envelope.user_broker_id)
         automation_id = str(envelope.automation_id)
         match envelope:
@@ -74,80 +75,8 @@ class TradingFactMapper:
                 )
             case BrokerOrderRecordedEnvelope():
                 uow.orders.append_order(scope_id, self._new_order(envelope))
-            case BrokerOrderStateChangedEnvelope(payload=payload):
-                if payload.order_id != payload.broker_order_id or payload.state != payload.to_state:
-                    raise TradingFactPersistenceError(
-                        TradingFactErrorCode.INVALID_STATE,
-                        entity_type="broker_order_event",
-                    )
-                current = uow.orders.get_order(scope_id, str(payload.broker_order_id))
-                from_state = BrokerOrderStatus(payload.from_state.value) if payload.from_state else None
-                terminal_states = {
-                    BrokerOrderStatus.FILLED,
-                    BrokerOrderStatus.CANCELLED,
-                    BrokerOrderStatus.REJECTED,
-                    BrokerOrderStatus.EXPIRED,
-                    BrokerOrderStatus.FAILED,
-                }
-                to_state = BrokerOrderStatus(payload.to_state.value)
-                terminal_repair = (
-                    from_state is BrokerOrderStatus.UNCERTAIN
-                    and current.state in terminal_states
-                    and to_state is current.state
-                )
-                if (from_state is not current.state and not terminal_repair) or (
-                    current.state in terminal_states and to_state is not current.state
-                ):
-                    raise TradingFactPersistenceError(
-                        TradingFactErrorCode.INVALID_STATE,
-                        entity_type="broker_order_event",
-                    )
-                replacement = BrokerOrderDraft(
-                    id=current.id,
-                    fact_id=current.fact_id,
-                    user_broker_id=scope_id,
-                    automation_id=automation_id,
-                    decision_id=str(payload.decision_id),
-                    position_cycle_id=str(payload.position_cycle_id) if payload.position_cycle_id else None,
-                    instrument_id=str(payload.instrument_id),
-                    idempotency_key=payload.idempotency_key,
-                    external_order_id=payload.external_order_id,
-                    intent_kind=OrderIntentKind(payload.intent_kind.value),
-                    side=payload.side,
-                    order_type=BrokerOrderType(payload.order_type.value),
-                    state=BrokerOrderStatus(payload.state.value),
-                    quantity_lots=payload.quantity_lots,
-                    limit_price=payload.limit_price,
-                    requested_amount=payload.requested_amount,
-                    executed_amount=payload.executed_amount,
-                    estimated_commission=payload.estimated_commission,
-                    executed_commission=payload.executed_commission,
-                    strategy_snapshot=payload.strategy_snapshot,
-                    created_at=current.created_at,
-                    dispatch_started_at=payload.dispatch_started_at,
-                    broker_responded_at=payload.broker_responded_at,
-                    executed_at=payload.executed_at,
-                    terminal_at=payload.terminal_at,
-                    updated_at=payload.updated_at,
-                )
-                uow.orders.replace_order_aggregate(scope_id, replacement)
-                if not terminal_repair:
-                    uow.orders.append_order_event(
-                        scope_id,
-                        BrokerOrderEventDraft(
-                            id=str(payload.order_event_id),
-                            fact_id=str(envelope.event_id),
-                            user_broker_id=scope_id,
-                            automation_id=automation_id,
-                            broker_order_id=str(payload.broker_order_id),
-                            from_state=BrokerOrderStatus(payload.from_state.value) if payload.from_state else None,
-                            to_state=BrokerOrderStatus(payload.to_state.value),
-                            safe_reason=payload.safe_reason,
-                            safe_message=payload.safe_message,
-                            occurred_at=payload.occurred_at,
-                            created_at=payload.created_at,
-                        ),
-                    )
+            case BrokerOrderStateChangedEnvelope():
+                self._apply_order_state_change(uow, envelope)
             case TradeExecutionRecordedEnvelope(payload=payload):
                 uow.orders.append_execution(
                     scope_id,
@@ -172,33 +101,8 @@ class TradingFactMapper:
                         created_at=payload.created_at,
                     ),
                 )
-            case PositionCycleUpdatedEnvelope(payload=payload):
-                cycle = PositionCycleDraft(
-                    id=str(payload.position_cycle_id),
-                    user_broker_id=scope_id,
-                    automation_id=automation_id,
-                    instrument_id=str(payload.instrument_id),
-                    state=PositionCycleState(payload.state.value),
-                    quantity_lots=payload.quantity_lots,
-                    average_entry_price=payload.average_entry_price,
-                    invested_amount=payload.invested_amount,
-                    realized_pnl=payload.realized_pnl,
-                    unrealized_pnl=payload.unrealized_pnl,
-                    net_pnl=payload.net_pnl,
-                    accumulated_commissions=payload.accumulated_commissions,
-                    opened_at=payload.opened_at,
-                    closed_at=payload.closed_at,
-                    created_at=payload.created_at,
-                    updated_at=payload.updated_at,
-                )
-                try:
-                    uow.positions.get_cycle(scope_id, cycle.id)
-                except TradingFactPersistenceError as error:
-                    if error.code is not TradingFactErrorCode.NOT_FOUND:
-                        raise
-                    uow.positions.open_cycle(scope_id, cycle)
-                else:
-                    uow.positions.replace_cycle_aggregate(scope_id, cycle)
+            case PositionCycleUpdatedEnvelope():
+                self._apply_cycle_update(uow, envelope)
             case PositionLotOpenedEnvelope(payload=payload):
                 uow.positions.append_lot(
                     scope_id,
@@ -264,6 +168,117 @@ class TradingFactMapper:
                 )
             case _:
                 raise AssertionError(f"Unsupported fact envelope type: {type(envelope).__name__}")
+
+    @staticmethod
+    def _apply_order_state_change(uow: TradingFactsUnitOfWorkPort, envelope: BrokerOrderStateChangedEnvelope) -> None:
+        """Validate the transition and update its aggregate without duplicating terminal repairs."""
+        payload = envelope.payload
+        scope_id = str(envelope.user_broker_id)
+        automation_id = str(envelope.automation_id)
+        if payload.order_id != payload.broker_order_id or payload.state != payload.to_state:
+            raise TradingFactPersistenceError(
+                TradingFactErrorCode.INVALID_STATE,
+                entity_type="broker_order_event",
+            )
+        current = uow.orders.get_order(scope_id, str(payload.broker_order_id))
+        from_state = BrokerOrderStatus(payload.from_state.value) if payload.from_state else None
+        terminal_states = {
+            BrokerOrderStatus.FILLED,
+            BrokerOrderStatus.CANCELLED,
+            BrokerOrderStatus.REJECTED,
+            BrokerOrderStatus.EXPIRED,
+            BrokerOrderStatus.FAILED,
+        }
+        to_state = BrokerOrderStatus(payload.to_state.value)
+        terminal_repair = (
+            from_state is BrokerOrderStatus.UNCERTAIN and current.state in terminal_states and to_state is current.state
+        )
+        if (from_state is not current.state and not terminal_repair) or (
+            current.state in terminal_states and to_state is not current.state
+        ):
+            raise TradingFactPersistenceError(
+                TradingFactErrorCode.INVALID_STATE,
+                entity_type="broker_order_event",
+            )
+        replacement = BrokerOrderDraft(
+            id=current.id,
+            fact_id=current.fact_id,
+            user_broker_id=scope_id,
+            automation_id=automation_id,
+            decision_id=str(payload.decision_id),
+            position_cycle_id=str(payload.position_cycle_id) if payload.position_cycle_id else None,
+            instrument_id=str(payload.instrument_id),
+            idempotency_key=payload.idempotency_key,
+            external_order_id=payload.external_order_id,
+            intent_kind=OrderIntentKind(payload.intent_kind.value),
+            side=payload.side,
+            order_type=BrokerOrderType(payload.order_type.value),
+            state=BrokerOrderStatus(payload.state.value),
+            quantity_lots=payload.quantity_lots,
+            limit_price=payload.limit_price,
+            requested_amount=payload.requested_amount,
+            executed_amount=payload.executed_amount,
+            estimated_commission=payload.estimated_commission,
+            executed_commission=payload.executed_commission,
+            strategy_snapshot=payload.strategy_snapshot,
+            created_at=current.created_at,
+            dispatch_started_at=payload.dispatch_started_at,
+            broker_responded_at=payload.broker_responded_at,
+            executed_at=payload.executed_at,
+            terminal_at=payload.terminal_at,
+            updated_at=payload.updated_at,
+        )
+        uow.orders.replace_order_aggregate(scope_id, replacement)
+        if not terminal_repair:
+            uow.orders.append_order_event(
+                scope_id,
+                BrokerOrderEventDraft(
+                    id=str(payload.order_event_id),
+                    fact_id=str(envelope.event_id),
+                    user_broker_id=scope_id,
+                    automation_id=automation_id,
+                    broker_order_id=str(payload.broker_order_id),
+                    from_state=BrokerOrderStatus(payload.from_state.value) if payload.from_state else None,
+                    to_state=BrokerOrderStatus(payload.to_state.value),
+                    safe_reason=payload.safe_reason,
+                    safe_message=payload.safe_message,
+                    occurred_at=payload.occurred_at,
+                    created_at=payload.created_at,
+                ),
+            )
+
+    @staticmethod
+    def _apply_cycle_update(uow: TradingFactsUnitOfWorkPort, envelope: PositionCycleUpdatedEnvelope) -> None:
+        """Open a missing cycle or replace its aggregate within the current automation group."""
+        payload = envelope.payload
+        scope_id = str(envelope.user_broker_id)
+        automation_id = str(envelope.automation_id)
+        cycle = PositionCycleDraft(
+            id=str(payload.position_cycle_id),
+            user_broker_id=scope_id,
+            automation_id=automation_id,
+            instrument_id=str(payload.instrument_id),
+            state=PositionCycleState(payload.state.value),
+            quantity_lots=payload.quantity_lots,
+            average_entry_price=payload.average_entry_price,
+            invested_amount=payload.invested_amount,
+            realized_pnl=payload.realized_pnl,
+            unrealized_pnl=payload.unrealized_pnl,
+            net_pnl=payload.net_pnl,
+            accumulated_commissions=payload.accumulated_commissions,
+            opened_at=payload.opened_at,
+            closed_at=payload.closed_at,
+            created_at=payload.created_at,
+            updated_at=payload.updated_at,
+        )
+        try:
+            uow.positions.get_cycle(scope_id, cycle.id)
+        except TradingFactPersistenceError as error:
+            if error.code is not TradingFactErrorCode.NOT_FOUND:
+                raise
+            uow.positions.open_cycle(scope_id, cycle)
+        else:
+            uow.positions.replace_cycle_aggregate(scope_id, cycle)
 
     @staticmethod
     def _new_order(envelope: BrokerOrderRecordedEnvelope) -> BrokerOrderDraft:

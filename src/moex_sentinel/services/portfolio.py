@@ -239,5 +239,17 @@ class PortfolioAggregationService:
         error: TInvestAdapterError | ValueError,
     ) -> BrokerReadError:
         if isinstance(error, TInvestAdapterError):
-            return BrokerReadError(broker.id, broker.display_name, account_id, error.code, str(error))
-        return BrokerReadError(broker.id, broker.display_name, account_id, "BROKER_CONFIGURATION", str(error))
+            return BrokerReadError(
+                broker_id=broker.id,
+                broker_name=broker.display_name,
+                account_id=account_id,
+                code=error.code,
+                message=str(error),
+            )
+        return BrokerReadError(
+            broker_id=broker.id,
+            broker_name=broker.display_name,
+            account_id=account_id,
+            code="BROKER_CONFIGURATION",
+            message=str(error),
+        )

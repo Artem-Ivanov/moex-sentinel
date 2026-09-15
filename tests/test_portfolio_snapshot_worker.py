@@ -16,7 +16,7 @@ class Collector:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def collect_once(self) -> None:
+    async def execute(self) -> None:
         self.calls += 1
 
 
@@ -37,7 +37,7 @@ def test_worker_collects_immediately_then_waits_for_interval() -> None:
 
 def test_worker_continues_after_unexpected_collection_failure() -> None:
     class FlakyCollector(Collector):
-        async def collect_once(self) -> None:
+        async def execute(self) -> None:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("synthetic failure")
@@ -66,7 +66,7 @@ def test_snapshot_collector_composition_persists_an_empty_run() -> None:
         clock=lambda: datetime(2026, 8, 15, 10, tzinfo=UTC),
     )
 
-    result = asyncio.run(collector.collect_once())
+    result = asyncio.run(collector.execute())
 
     with factory() as session:
         persisted = PortfolioSnapshotRepository(session).latest_run()

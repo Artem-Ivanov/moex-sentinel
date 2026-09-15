@@ -18,7 +18,7 @@ from sentinel_contracts.trading_facts import (
     FactBatchResult,
     FactGroupAcknowledgement,
 )
-from tests.contracts.test_trading_facts_contract import all_envelopes
+from tests.contracts.trading_facts_helpers import all_envelopes
 
 SCOPE_ID = UUID("00000000-0000-4000-8000-000000000002")
 AUTOMATION_ID = UUID("00000000-0000-4000-8000-000000000003")

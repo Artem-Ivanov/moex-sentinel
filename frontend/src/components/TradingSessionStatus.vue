@@ -5,14 +5,24 @@ import { fetchTradingSessionsStatus, type TradingSessionsStatus } from "../api/a
 
 const state = ref<TradingSessionsStatus>()
 let timer: ReturnType<typeof setInterval> | undefined
+let disposed = false
 
+/** Refresh session availability, reporting a failed request as unavailable. */
 async function refresh(): Promise<void> {
   try { state.value = await fetchTradingSessionsStatus() }
   catch { state.value = { status: "UNAVAILABLE", total: 0, open: 0, closed: 0, unavailable: 0 } }
 }
 
-onMounted(async () => { await refresh(); timer = setInterval(refresh, 60_000) })
-onUnmounted(() => { if (timer !== undefined) clearInterval(timer) })
+onMounted(async () => {
+  await refresh()
+  // An initial request can finish after the component has been unmounted.
+  if (disposed) return
+  timer = setInterval(refresh, 60_000)
+})
+onUnmounted(() => {
+  disposed = true
+  if (timer !== undefined) clearInterval(timer)
+})
 </script>
 
 <template>

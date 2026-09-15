@@ -124,6 +124,7 @@ class PositionStateHydrationService:
         )
 
     async def _hydrate_one(self, command: AutomationCommand) -> HydratedPositionState | None:
+        """Read one state and audit reconciliation; return None when it must be skipped, without updating the cache."""
         if await asyncio.to_thread(self._repository.has_pending_fact_outbox, str(command.automation_id)):
             return None
         position, durable = await asyncio.gather(
@@ -153,17 +154,17 @@ class PositionStateHydrationService:
                 broker_lots=broker_lots,
                 average_price=position.average_price,
             )
-            if not bool(getattr(consistency, "consistent", False)):
+            if not consistency.consistent:
                 await self._audit_reconciliation(
                     command,
                     process_id,
                     BusinessAuditStage.POSITION_RECONCILIATION_FAILED,
                     broker_quantity_lots=broker_lots,
                     worker_quantity_lots=sum(item.remaining_lots for item in lots),
-                    reason_code=str(getattr(consistency, "reason_code", "POSITION_RECONCILIATION_REQUIRED")),
+                    reason_code=str(consistency.reason_code),
                 )
                 return None
-            lots = list(getattr(consistency, "lots", ()))
+            lots = list(consistency.lots)
             await self._audit_reconciliation(
                 command,
                 process_id,
@@ -185,11 +186,11 @@ class PositionStateHydrationService:
             candles = () if self._candles is None else await self._candles.completed(command.external_instrument_id)
             indicators = self._indicators.calculate(candles, fallback)  # type: ignore[arg-type]
         return HydratedPositionState(
-            position,
-            history,
-            tuple(lots),
-            cycle,
-            indicators,
+            position=position,
+            history=history,
+            lots=tuple(lots),
+            cycle=cycle,
+            indicators=indicators,
             has_active_intent=active_intent is not None,
             realized_pnl=realized_pnl,
             process_id=process_id,

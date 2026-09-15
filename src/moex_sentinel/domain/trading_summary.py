@@ -173,3 +173,15 @@ def period_from_snapshots(
         latest.captured_at,
         timedelta() <= requested - baseline.captured_at <= timedelta(minutes=1),
     )
+
+
+class PortfolioSnapshotRunResult(PositionalModel):
+    """Safe outcome of one collection attempt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str | None
+    captured_at: datetime
+    saved: int
+    errors: tuple[BrokerReadError, ...]
+    skipped: bool

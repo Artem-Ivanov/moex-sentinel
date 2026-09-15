@@ -6,8 +6,10 @@ from decimal import Decimal
 from typing import Protocol
 
 from trading_automaton.domain.dtos import PositionConsistencyResult
+from trading_automaton.domain.storage_dtos import (
+    TradeLotRecord,
+)
 from trading_automaton.services.lot_ledger import LotLedgerMismatchError
-from trading_automaton.storage.repository import TradeLotRecord
 
 
 class PositionLedgerPort(Protocol):

@@ -35,12 +35,13 @@ from sentinel_contracts.trading_facts import (
     PositionLotSource,
 )
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.command_factory import command
 from tests.trading_automaton.services.test_broker_tick_preparation_service import Hydration, Portfolio
 from tests.trading_automaton.test_analytics_runtime import FALLBACK, Source, Tick, frame
 from tests.trading_automaton.test_analytics_runtime import NOW as MARKET_NOW
 from trading_automaton.config import StrategySettings
-from trading_automaton.services.analytics_runtime import AnalyticsBrokerRuntime, AnalyticsMetricsCache
+from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
@@ -191,7 +192,7 @@ def test_unavailable_market_allows_position_adoption_but_no_tick_or_order(tmp_pa
             position_bootstrap=PositionBootstrapService(worker),
             now=lambda: MARKET_NOW,
         )
-        runtime = AnalyticsBrokerRuntime(
+        runtime = build_analytics_runtime(
             Source(
                 httpx.ReadTimeout("offline analytics unavailable") if market_problem == "unavailable" else source_frame
             ),

@@ -1,6 +1,5 @@
 import asyncio
 from contextlib import suppress
-from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -231,7 +230,7 @@ def test_rejects_invalid_intent_request_mapping_before_commit(case: str) -> None
         _other_item, other_request = batch_pair("intent-2")
         requests = (request, other_request)
     else:
-        requests = (replace(request, quantity_lots=2),)
+        requests = (DispatchRequest(**{**request.model_dump(), "quantity_lots": 2}),)
     repository = Repository()
     service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
 
@@ -251,12 +250,14 @@ def test_rejects_invalid_intent_request_mapping_before_commit(case: str) -> None
 )
 def test_rejects_mismatched_dispatch_fields_before_commit(field: str, value: object) -> None:
     item, request = batch_pair()
-    item = replace(item, strategy_snapshot={"currency": "RUB"})
+    item = DecisionBatchItem(**{**item.model_dump(), "strategy_snapshot": {"currency": "RUB"}})
     repository = Repository()
     service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
 
     with pytest.raises(ValueError, match="intent request mapping fields"):
-        asyncio.run(service.run_batch((item,), (replace(request, **{field: value}),), snapshot_at=NOW))
+        asyncio.run(
+            service.run_batch((item,), (DispatchRequest(**{**request.model_dump(), field: value}),), snapshot_at=NOW)
+        )
 
     assert repository.calls == 0
 
@@ -339,6 +340,8 @@ def test_rejects_wrong_request_identity_before_commit(field: str, value: str) ->
     service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
 
     with pytest.raises(ValueError, match="intent request mapping fields"):
-        asyncio.run(service.run_batch((item,), (replace(request, **{field: value}),), snapshot_at=NOW))
+        asyncio.run(
+            service.run_batch((item,), (DispatchRequest(**{**request.model_dump(), field: value}),), snapshot_at=NOW)
+        )
 
     assert repository.calls == 0

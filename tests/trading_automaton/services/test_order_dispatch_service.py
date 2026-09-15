@@ -4,7 +4,9 @@ from decimal import Decimal
 
 import pytest
 
+from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from sentinel_contracts.broker_execution import BrokerOrderState, OrderSide
+from sentinel_contracts.business_audit import BusinessAuditStage
 from trading_automaton.services.order_dispatch import (
     DispatchRequest,
     OrderDispatchService,
@@ -201,3 +203,66 @@ def test_sdk_failure_recovers_order_by_idempotency_key() -> None:
     assert broker.reconciliation_calls == [("account-1", "intent-1")]
     assert broker.position_calls == [("account-1", "instrument-1")]
     assert broker.operation_calls == [("account-1", "instrument-1", 20)]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_details"),
+    [
+        pytest.param(
+            TInvestAdapterError("BROKER_UNAVAILABLE", "Safe broker message", retryable=True),
+            "BROKER_UNAVAILABLE",
+            "Safe broker message",
+            id="typed-broker-error",
+        ),
+        pytest.param(
+            RuntimeError("SECRET_UNEXPECTED_DISPATCH_DETAIL"),
+            None,
+            "Unexpected dispatch failure",
+            id="unexpected-error",
+        ),
+    ],
+)
+def test_ambiguous_dispatch_audit_preserves_only_safe_error_details(failure, expected_code, expected_details):
+    async def scenario():
+        release = asyncio.Event()
+        release.set()
+        broker = Broker(release, error=failure)
+        records = []
+
+        class OrderedRepository(Repository):
+            def update_intent(self, idempotency_key, **values):
+                if values["state"] == "UNCERTAIN":
+                    assert broker.reconciliation_calls == [("account-1", "intent-1")]
+                    assert broker.position_calls == [("account-1", "instrument-1")]
+                    assert broker.operation_calls == [("account-1", "instrument-1", 20)]
+                super().update_intent(idempotency_key, **values)
+
+        class Audit:
+            def record_order_stage(self, **values):
+                records.append(values)
+
+        repository = OrderedRepository()
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, audit=Audit())
+        value = request().model_copy(update={"process_id": "process"})
+        started = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(type(failure)) as caught:
+            await service.dispatch(value, started)
+
+        assert caught.value is failure
+        assert started.result() == NOW
+        assert [update[1]["state"] for update in repository.updates] == ["SUBMITTING", "UNCERTAIN"]
+        assert [record["stage"] for record in records] == [
+            BusinessAuditStage.BROKER_ORDER_DISPATCH_STARTED,
+            BusinessAuditStage.TRADING_STEP_FAILED,
+        ]
+        failed = records[-1]
+        assert failed["broker_order_state"] == "UNCERTAIN"
+        assert failed["exception_type"] == type(failure).__name__
+        assert failed["broker_error_code"] == expected_code
+        assert failed["broker_error_details"] == expected_details
+        assert failed["position_snapshot"] == {"quantity_lots": "2", "average_price": "100"}
+        assert failed["recent_operations"] == [{"type": "BUY", "state": "EXECUTED", "quantity": "1"}]
+        assert "SECRET_UNEXPECTED_DISPATCH_DETAIL" not in repr(records)
+
+    asyncio.run(scenario())

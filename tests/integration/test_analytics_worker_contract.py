@@ -17,7 +17,7 @@ from moex_sentinel.storage.models import Base as CoreBase
 from moex_sentinel.storage.models import BrokerOrderModel, TradingAutomationModel
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerOrderState, BrokerPosition
-from tests.market_analytics.test_app import NOW, Source, instrument
+from tests.market_analytics.market_source_helpers import NOW, Source, instrument
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 from tests.trading_automaton.command_factory import command
 from trading_automaton.adapters.analytics_client import AnalyticsClient
@@ -187,7 +187,7 @@ def test_two_positions_complete_one_http_batch_and_publish_terminal_facts(tmp_pa
                 assert latest.terminal_at is not None
                 assert repository.get_active_intent(str(value.automation_id)) is None
                 assert len(repository.list_open_lots(str(value.automation_id))) == (0 if expire_after_commit else 1)
-                assert await bundle.runtime._tick._cash.reserved(value.account_id, value.currency) == 0
+                assert await bundle.runtime._iteration._tick._cash.reserved(value.account_id, value.currency) == 0
             assert_core_accepts_facts(repository, values, expected)
             await bundle.runtime.run_once()
             assert len(repository.committed) == 1

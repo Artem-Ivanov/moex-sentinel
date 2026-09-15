@@ -1,7 +1,7 @@
 """Exercise the Analytics HTTP boundary with a market-only upstream."""
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -12,63 +12,9 @@ from fastapi.testclient import TestClient
 from market_analytics.app import create_app
 from market_analytics.market_source import HttpMarketSource
 from sentinel_contracts.analytics import MarketSourceSnapshot
+from tests.market_analytics.market_source_helpers import NOW, Source, instrument
 
-NOW = datetime(2026, 9, 9, 9, tzinfo=UTC)
 SOURCE = UUID("00000000-0000-0000-0000-000000000001")
-
-
-def instrument(identifier="instrument", *, age_ms=0, valid=True):
-    return {
-        "instrument_id": identifier,
-        "available": True,
-        "market": {
-            "instrument_id": identifier,
-            "order_book": {
-                "instrument_id": identifier,
-                "bids": [{"price": "100", "quantity_lots": 2}],
-                "asks": [{"price": "101" if valid else "99", "quantity_lots": 2}],
-                "captured_at": NOW - timedelta(milliseconds=age_ms),
-                "is_consistent": True,
-            },
-            "trading_status": {
-                "instrument_id": identifier,
-                "status": "NORMAL",
-                "limit_order_available": True,
-                "api_trade_available": True,
-                "captured_at": NOW - timedelta(hours=1),
-            },
-        },
-        "candles": [
-            {
-                "instrument_id": identifier,
-                "open": str(100 + index),
-                "high": str(102 + index),
-                "low": str(99 + index),
-                "close": str(101 + index),
-                "volume": 10,
-                "started_at": NOW - timedelta(minutes=20 - index),
-                "is_complete": True,
-                "captured_at": NOW,
-            }
-            for index in range(20)
-        ],
-    }
-
-
-class Source:
-    def __init__(self, instruments=None, *, captured_at=NOW, error=None):
-        self.calls = []
-        self.instruments = [instrument()] if instruments is None else instruments
-        self.captured_at = captured_at
-        self.error = error
-
-    async def snapshot(self, request):
-        self.calls.append(request)
-        if self.error is not None:
-            raise self.error
-        return MarketSourceSnapshot(
-            snapshot_id="generation-1", captured_at=self.captured_at, instruments=self.instruments
-        )
 
 
 def request(ids=("instrument",), *, fallback="0.5"):
@@ -104,7 +50,9 @@ def test_http_batch_computes_exact_metrics_from_one_market_only_request():
 
 
 @pytest.mark.parametrize(
-    ("elapsed", "expected"), [(0, "FRESH"), (1999, "FRESH"), (2000, "FRESH"), (2001, "STALE"), (-1, "STALE")]
+    ("elapsed", "expected"),
+    [(0, "FRESH"), (1999, "FRESH"), (2000, "FRESH"), (2001, "STALE"), (-1, "STALE")],
+    ids=["fresh-now", "fresh-before-deadline", "freshness-exactly-2s", "stale-by-1ms", "future-by-1ms"],
 )
 def test_snapshot_deadline_is_checked_at_receipt(elapsed, expected):
     source = Source()
@@ -153,12 +101,49 @@ def test_old_candle_history_blocks_buy_window_without_disabling_fresh_quotes():
     assert result["metrics"]["source"] == "STRATEGY"
 
 
-@pytest.mark.parametrize("error", [httpx.ReadTimeout("upstream fixture"), ValueError("invalid upstream fixture")])
-def test_upstream_failure_returns_safe_unavailable_response(error):
-    with TestClient(create_app(Source(error=error), now=lambda: NOW)) as client:
+@pytest.mark.parametrize(
+    "upstream_result",
+    [
+        pytest.param(httpx.ReadTimeout("MUST_NOT_ECHO_UPSTREAM"), id="timeout"),
+        pytest.param(httpx.Response(503, text="MUST_NOT_ECHO_UPSTREAM"), id="non-success-status"),
+        pytest.param(httpx.Response(200, content=b"MUST_NOT_ECHO_UPSTREAM"), id="malformed-market-json"),
+    ],
+)
+def test_upstream_failure_returns_safe_unavailable_response(upstream_result):
+    """Exercise unavailable mapping through the actual HTTP market adapter."""
+
+    def handler(_message):
+        if isinstance(upstream_result, Exception):
+            raise upstream_result
+        return upstream_result
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://core") as client:
+            app = create_app(HttpMarketSource(client), now=lambda: NOW)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://analytics") as caller:
+                return await caller.post("/internal/v1/analytics/snapshots", json=request())
+
+    response = asyncio.run(scenario())
+    assert response.status_code == 503
+    assert response.json() == {"detail": "MARKET_SOURCE_UNAVAILABLE"}
+
+
+def test_unrequested_upstream_instrument_returns_safe_unavailable_response():
+    """The actual calculator rejects a source instrument outside the requested batch."""
+    with TestClient(create_app(Source([instrument("unexpected")]), now=lambda: NOW)) as client:
         response = client.post("/internal/v1/analytics/snapshots", json=request())
     assert response.status_code == 503
     assert response.json() == {"detail": "MARKET_SOURCE_UNAVAILABLE"}
+
+
+def test_unexpected_source_error_remains_safe_internal_server_error():
+    """Unexpected source defects are not classified as expected market unavailability."""
+    source = Source(error=RuntimeError("MUST_NOT_ECHO_UPSTREAM"))
+    with TestClient(create_app(source, now=lambda: NOW), raise_server_exceptions=False) as client:
+        response = client.post("/internal/v1/analytics/snapshots", json=request())
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert len(source.calls) == 1
 
 
 def test_market_http_adapter_sends_only_market_request():

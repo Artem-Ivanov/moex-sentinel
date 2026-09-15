@@ -20,6 +20,7 @@ const averagePrice = computed(() => {
 const error = ref("")
 const loading = ref(false)
 
+/** Refresh the selected automation, retaining the existing request overlap guard. */
 async function refresh(): Promise<void> {
   if (loading.value) return
   loading.value = true
@@ -30,11 +31,15 @@ async function refresh(): Promise<void> {
 }
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined
+let disposed = false
 onMounted(async () => {
   await refresh()
+  // Do not recreate polling after cleanup while the first request was pending.
+  if (disposed) return
   refreshTimer = setInterval(refresh, 60_000)
 })
 onBeforeUnmount(() => {
+  disposed = true
   if (refreshTimer !== undefined) clearInterval(refreshTimer)
 })
 
@@ -62,7 +67,7 @@ onBeforeUnmount(() => {
         <div class="candle-panel__header"><strong>Минутные свечи за последние два часа</strong></div>
         <div class="candle-chart-frame">
           <p v-if="details?.errors.some(item => item.source === 'candles')" class="error">{{ details.errors.find(item => item.source === 'candles')?.message }}</p>
-          <p v-if="!loading && details?.candles.length === 0" class="empty">Завершённых свечей за последние два часа нет</p>
+          <p v-if="!loading && details?.candles.length === 0 && !details.errors.some(item => item.source === 'candles')" class="empty">Завершённых свечей за последние два часа нет</p>
           <CandlestickChart v-if="details?.candles.length" :candles="details.candles" :average-price="averagePrice" aria-label="Минутные свечи за последние два часа" />
           <div v-if="loading" class="candle-loading-overlay" role="status" aria-label="Обновление данных"><span class="candle-spinner" aria-hidden="true"></span></div>
         </div>

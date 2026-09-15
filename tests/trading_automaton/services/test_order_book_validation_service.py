@@ -32,6 +32,7 @@ def book(
         (book(Decimal("100.1"), Decimal("100")), "CROSSED_ORDER_BOOK"),
         (book(captured_at=NOW - timedelta(seconds=3)), "STALE_ORDER_BOOK"),
     ],
+    ids=["empty-depth", "zero-bid", "zero-ask", "locked-book", "crossed-book", "stale-by-one-second"],
 )
 def test_rejects_order_book_that_cannot_safely_drive_a_trade(snapshot, reason) -> None:
     result = OrderBookValidationService().validate(
@@ -67,6 +68,15 @@ def test_accepts_positive_non_crossed_fresh_order_book() -> None:
         book().model_copy(update={"asks": (OrderBookLevel(Decimal("101"), 1), OrderBookLevel(Decimal("100"), 1))}),
         book().model_copy(update={"bids": (OrderBookLevel(Decimal("99"), 1), OrderBookLevel(Decimal("99"), 1))}),
     ],
+    ids=[
+        "zero-bid-volume",
+        "negative-ask-volume",
+        "nan-bid",
+        "infinite-ask",
+        "ascending-bids",
+        "descending-asks",
+        "duplicate-bid-price",
+    ],
 )
 def test_rejects_invalid_depth_and_nonfinite_prices(snapshot) -> None:
     result = OrderBookValidationService().validate(snapshot, now=NOW, max_age=timedelta(seconds=2))
@@ -81,6 +91,7 @@ def test_rejects_invalid_depth_and_nonfinite_prices(snapshot) -> None:
         (timedelta(seconds=2, milliseconds=1), False, "STALE_ORDER_BOOK"),
         (timedelta(milliseconds=-1), False, "FUTURE_ORDER_BOOK"),
     ],
+    ids=["freshness-exactly-2s", "stale-by-1ms", "future-by-1ms"],
 )
 def test_order_book_time_boundaries(age, valid, reason) -> None:
     result = OrderBookValidationService().validate(book(captured_at=NOW - age), now=NOW, max_age=timedelta(seconds=2))

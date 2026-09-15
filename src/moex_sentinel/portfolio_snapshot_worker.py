@@ -16,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class CollectorPort(Protocol):
-    async def collect_once(self) -> object: ...
+    async def execute(self) -> object: ...
 
 
 WaitPort = Callable[[asyncio.Event, int], Awaitable[None]]
@@ -40,7 +40,7 @@ async def run_forever(
     """Collect immediately and then repeat until shutdown."""
     while not stop.is_set():
         try:
-            await collector.collect_once()
+            await collector.execute()
         except Exception:
             LOGGER.exception("Portfolio snapshot collection failed")
         await wait(stop, interval_seconds)

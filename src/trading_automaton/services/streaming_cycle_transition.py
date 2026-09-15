@@ -12,16 +12,19 @@ from trading_automaton.services.trading_cycle import TradingCycleService
 
 
 class StreamingCycleTransitionService:
+    """Apply cycle transitions using explicitly supplied cycle rules and book validation."""
+
     def __init__(
         self,
         *,
         now: Callable[[], datetime],
-        cycles: TradingCycleService | None = None,
+        cycles: TradingCycleService,
+        order_books: OrderBookValidationService,
         max_order_book_age: timedelta = timedelta(seconds=2),
     ) -> None:
         self._now = now
-        self._cycles = cycles or TradingCycleService()
-        self._order_books = OrderBookValidationService()
+        self._cycles = cycles
+        self._order_books = order_books
         self._max_order_book_age = max_order_book_age
 
     def apply(
