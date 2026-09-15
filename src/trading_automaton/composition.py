@@ -173,12 +173,10 @@ async def build_broker_runtime(
     )
     order_books = OrderBookValidationService()
     decider = StreamingPositionDecisionService(
-        position_states,
         commission_profiles,
         cash=cash,
         contexts=DecisionContextService(strategy_settings),
         decisions=TradeDecisionService(),
-        now=now,
     )
     scheduler = PositionBatchSchedulerService(
         decider,
@@ -192,7 +190,6 @@ async def build_broker_runtime(
         broker_id=connection.broker_id,
         commission_profiles=commission_profiles,
         broker=session,
-        ledger=ledger,
         portfolio=portfolio,
         audit=business_audit,
         cash=cash,

@@ -26,11 +26,6 @@ def command() -> AutomationCommand:
     return baseline_command()
 
 
-class ForbiddenStateCache:
-    async def get(self, automation_id):
-        raise AssertionError("evaluator must use the prepared work-item state")
-
-
 class Decisions:
     def __init__(self, decision: TradeDecision | None = None) -> None:
         self.contexts = []
@@ -90,11 +85,7 @@ def test_evaluates_executable_position_once_and_materializes_exact_buy_commissio
     commissions = Commissions()
     prepared_state = state()
     service = StreamingPositionDecisionService(
-        ForbiddenStateCache(),
-        commissions,
-        decisions=decisions,
-        now=lambda: NOW,
-        contexts=DecisionContextService(StrategySettings()),
+        commissions, decisions=decisions, contexts=DecisionContextService(StrategySettings())
     )
 
     # Replaces the historical zero-commission re-evaluation defect.
@@ -113,11 +104,7 @@ def test_evaluates_executable_position_once_and_materializes_exact_buy_commissio
 def test_materializes_exact_sell_commission_from_its_own_decision_amount() -> None:
     decisions = Decisions(TradeDecision(DecisionKind.SELL_PART, 2, Decimal("100"), "SELL"))
     service = StreamingPositionDecisionService(
-        ForbiddenStateCache(),
-        Commissions(),
-        decisions=decisions,
-        now=lambda: NOW,
-        contexts=DecisionContextService(StrategySettings()),
+        Commissions(), decisions=decisions, contexts=DecisionContextService(StrategySettings())
     )
 
     result = asyncio.run(service.decide(work_item(), market()))
@@ -137,12 +124,7 @@ def test_builds_decision_with_current_account_cash_and_reservations_once() -> No
 
     decisions = CapturingDecisions()
     service = StreamingPositionDecisionService(
-        ForbiddenStateCache(),
-        Commissions(),
-        cash=Cash(),
-        decisions=decisions,
-        now=lambda: NOW,
-        contexts=DecisionContextService(StrategySettings()),
+        Commissions(), cash=Cash(), decisions=decisions, contexts=DecisionContextService(StrategySettings())
     )
 
     asyncio.run(service.decide(work_item(), market()))
@@ -153,11 +135,7 @@ def test_builds_decision_with_current_account_cash_and_reservations_once() -> No
 def test_missing_hydrated_state_waits_without_strategy_call() -> None:
     decisions = Decisions()
     service = StreamingPositionDecisionService(
-        ForbiddenStateCache(),
-        Commissions(),
-        decisions=decisions,
-        now=lambda: NOW,
-        contexts=DecisionContextService(StrategySettings()),
+        Commissions(), decisions=decisions, contexts=DecisionContextService(StrategySettings())
     )
 
     result = asyncio.run(service.decide(PositionWorkItem(command(), False, state=None, snapshot_at=NOW), market()))
@@ -171,11 +149,7 @@ def test_missing_or_expired_schedule_waits_without_strategy_call() -> None:
     commissions = Commissions(schedule=None)
     commissions.schedule_value = None
     service = StreamingPositionDecisionService(
-        ForbiddenStateCache(),
-        commissions,
-        decisions=decisions,
-        now=lambda: NOW,
-        contexts=DecisionContextService(StrategySettings()),
+        commissions, decisions=decisions, contexts=DecisionContextService(StrategySettings())
     )
 
     result = asyncio.run(service.decide(work_item(snapshot_at=NOW + timedelta(days=1)), market()))

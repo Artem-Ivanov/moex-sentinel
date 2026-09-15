@@ -122,10 +122,8 @@ def test_one_order_book_event_evaluates_each_position_once_before_sdk_dispatch()
         tick = StreamingBatchTickService(
             PositionBatchSchedulerService(
                 StreamingPositionDecisionService(
-                    states,
                     Schedules(),
                     decisions=TradeDecisionService(strategy),
-                    now=lambda: NOW,
                     contexts=DecisionContextService(StrategySettings()),
                 )
             ),

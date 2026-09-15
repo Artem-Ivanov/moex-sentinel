@@ -9,14 +9,8 @@ from trading_automaton.domain.trading_cycle import mark_buy, mark_sell
 
 class TradingCycleService:
     def complete_cycle(self, state: TradingCycleState, exit_price: Decimal, *, now: datetime) -> TradingCycleState:
-        return state.model_copy(
-            update={
-                "pending_low": None,
-                "sell_armed": False,
-                "last_sell_price": exit_price,
-                "updated_at": now,
-            }
-        )
+        """Return the shared sell transition without persisting the completed cycle."""
+        return mark_sell(state, exit_price, now=now)
 
     def observe_flat_entry(
         self,

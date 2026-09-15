@@ -113,14 +113,6 @@ class Broker:
         return self.response
 
 
-class Ledger:
-    def __init__(self) -> None:
-        self.buys = []
-
-    def record_buy_execution(self, **values):
-        self.buys.append(values)
-
-
 class Portfolio:
     def __init__(self) -> None:
         self.value = None
@@ -280,14 +272,12 @@ def test_accepted_order_is_tracked_until_fill_and_atomically_updates_durable_exe
         )
         repository = Repository()
         broker = Broker(filled)
-        ledger = Ledger()
         portfolio = Portfolio()
         cash = Cash()
         tracking = OrderTrackingService(
             repository,
             now=lambda: NOW,
             broker=broker,
-            ledger=ledger,
             portfolio=portfolio,
             cash=cash,
             sleep=lambda _delay: asyncio.sleep(0),
@@ -305,14 +295,13 @@ def test_accepted_order_is_tracked_until_fill_and_atomically_updates_durable_exe
         task = asyncio.create_task(asyncio.sleep(0, result=accepted))
         tracking.track("intent-1", task, request=request)
         await tracking.wait_all()
-        return repository, broker, ledger, portfolio, cash
+        return repository, broker, portfolio, cash
 
-    repository, broker, ledger, portfolio, cash = asyncio.run(scenario())
+    repository, broker, portfolio, cash = asyncio.run(scenario())
 
     assert broker.calls == 1
     assert repository.updates[-1][1]["state"] == "FILLED"
     assert repository.finalizations[0].intent_id == "intent-1"
-    assert ledger.buys == []
     assert portfolio.value.quantity_lots == Decimal("1")
     assert cash.completions == [("intent-1", "FILLED")]
     assert repository.execution_events[0]["automation_id"] == "automation"
@@ -758,12 +747,10 @@ def test_poll_limit_keeps_intent_uncertain_and_holds_automation() -> None:
 def test_filled_without_executed_lots_becomes_uncertain_without_ledger_update() -> None:
     async def scenario():
         repository = Repository()
-        ledger = Ledger()
         cash = Cash()
         tracking = OrderTrackingService(
             repository,
             now=lambda: NOW,
-            ledger=ledger,
             cash=cash,
         )
         response = BrokerOrderState(
@@ -795,12 +782,12 @@ def test_filled_without_executed_lots_becomes_uncertain_without_ledger_update() 
             request=request,
         )
         await tracking.wait_all()
-        return repository, ledger, cash
+        return repository, cash
 
-    repository, ledger, cash = asyncio.run(scenario())
+    repository, cash = asyncio.run(scenario())
 
     assert repository.updates[-1][1]["state"] == "UNCERTAIN"
-    assert ledger.buys == []
+    assert repository.finalizations == []
     assert cash.completions == [("intent-1", "UNCERTAIN")]
 
 

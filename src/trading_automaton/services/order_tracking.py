@@ -16,7 +16,6 @@ from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfileKey,
     ExecutionFinalization,
     ExecutionFinalizationResult,
-    TradeLotRecord,
 )
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 
@@ -45,31 +44,6 @@ class TrackingBrokerPort(Protocol):
     async def get_order_state(self, account_id: str, broker_order_id: str) -> BrokerOrderState: ...
 
 
-class TrackingLedgerPort(Protocol):
-    def record_buy_execution(
-        self,
-        *,
-        automation_id: str,
-        intent_id: str,
-        quantity_lots: int,
-        price: Decimal,
-        commission: Decimal,
-        executed_at: datetime,
-    ) -> TradeLotRecord: ...
-
-    def allocate_sell_execution(
-        self,
-        *,
-        automation_id: str,
-        intent_id: str,
-        quantity_lots: int,
-        price: Decimal,
-        commission: Decimal,
-        executed_at: datetime,
-        lot_size: int,
-    ) -> None: ...
-
-
 class TrackingPortfolioPort(Protocol):
     async def position(self, account_id: str, instrument_id: str) -> BrokerPosition | None: ...
 
@@ -96,7 +70,6 @@ class OrderTrackingService:
         broker_id: str | None = None,
         commission_profiles: CommissionObservationPort | None = None,
         broker: TrackingBrokerPort | None = None,
-        ledger: TrackingLedgerPort | None = None,
         portfolio: TrackingPortfolioPort | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         poll_seconds: float = 0.2,
@@ -105,12 +78,12 @@ class OrderTrackingService:
         cash: TrackingCashPort | None = None,
         active_intents: ActiveIntentGateService | None = None,
     ) -> None:
+        """Track broker outcomes; the repository atomically persists each execution and its ledger changes."""
         self._repository = repository
         self._now = now
         self._broker_id = broker_id
         self._commission_profiles = commission_profiles
         self._broker = broker
-        self._ledger = ledger
         self._portfolio = portfolio
         self._sleep = sleep
         self._poll_seconds = poll_seconds

@@ -380,10 +380,8 @@ def test_rehydrated_fill_blocks_same_candle_then_allows_next_candle_reversal(sto
             now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
         )
         evaluator = StreamingPositionDecisionService(
-            cache,
             CommissionProfile(),
             cash=AvailableCash(),
-            now=lambda: NOW,
             decisions=TradeDecisionService(),
             contexts=DecisionContextService(StrategySettings()),
         )

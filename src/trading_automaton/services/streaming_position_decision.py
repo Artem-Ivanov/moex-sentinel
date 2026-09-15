@@ -1,7 +1,6 @@
 """Pure position decision over state hydrated before the market snapshot."""
 
 import asyncio
-from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
@@ -21,10 +20,6 @@ from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfileKey,
 )
 from trading_automaton.services.decision_context import DecisionContextService
-
-
-class HydratedPositionStatePort(Protocol):
-    async def get(self, automation_id: str) -> HydratedPositionState | None: ...
 
 
 class CachedCommissionPort(Protocol):
@@ -51,20 +46,17 @@ class StreamingPositionDecisionService:
 
     def __init__(
         self,
-        states: HydratedPositionStatePort,
         commissions: CachedCommissionPort,
         *,
         cash: DecisionCashPort | None = None,
         decisions: PositionDecisionPort,
         contexts: DecisionContextService,
-        now: Callable[[], datetime],
     ) -> None:
-        self._states = states
+        """Use the work item's state and snapshot time with the supplied decision dependencies."""
         self._commissions = commissions
         self._decisions = decisions
         self._cash = cash
         self._contexts = contexts
-        self._now = now
 
     async def decide(
         self,

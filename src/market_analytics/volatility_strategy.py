@@ -19,12 +19,11 @@ class VolatilityStrategyService:
         candles: Sequence[StreamCandle],
         fallback: AdaptiveThresholds,
     ) -> AdaptiveThresholds:
+        """Use median returns from at least 15 positive completed closes, otherwise keep the fallback."""
         closes = [item.close for item in candles if item.is_complete]
         if len(closes) < self.MINIMUM_CANDLES or any(value <= 0 for value in closes):
             return fallback
         returns = [abs((current / previous - Decimal("1")) * Decimal("100")) for previous, current in pairwise(closes)]
-        if not returns:
-            return fallback
         median_return = median(returns)
         return AdaptiveThresholds(
             averaging_step_percent=max(self.MINIMUM_AVERAGING_PERCENT, median_return * Decimal("2")),

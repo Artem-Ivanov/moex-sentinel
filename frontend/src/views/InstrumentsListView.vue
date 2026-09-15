@@ -87,10 +87,6 @@ async function resetFilters(): Promise<void> {
   await loadCatalog()
 }
 
-async function applyLotPriceFilter(): Promise<void> {
-  await loadCatalog()
-}
-
 async function synchronize(): Promise<void> {
   loading.value = true
   error.value = ""
@@ -164,7 +160,7 @@ function openDetails(item?: CatalogInstrument): void {
       <label>Цена лота до
         <input v-model="lotPriceTo" class="lot-price-filter" type="text" inputmode="decimal">
       </label>
-      <button :disabled="loading" @click="applyLotPriceFilter">Применить цену</button>
+      <button :disabled="loading" @click="loadCatalog">Применить цену</button>
       <button :class="{ 'filter-button--active': selectedOnly }" @click="toggleSelectedFilter">Только выделенные</button>
       <button @click="resetFilters">Сбросить фильтры</button>
       <button :disabled="!selectedRow" @click="openDetails()">Подробнее</button>
