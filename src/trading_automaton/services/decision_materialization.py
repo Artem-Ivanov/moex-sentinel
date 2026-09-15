@@ -218,6 +218,7 @@ class DecisionMaterializerService:
             process_id=process_id,
             intent=intent,
             position_snapshot=position_snapshot.to_metadata(),
+            position_snapshot_at=market.order_book.captured_at,
             iteration_id=prepared.snapshot_id,
             cycle_state=(
                 None

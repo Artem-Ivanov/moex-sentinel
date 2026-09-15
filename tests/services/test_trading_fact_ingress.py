@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TypeVar
-from uuid import UUID
+from uuid import NAMESPACE_OID, UUID, uuid5
 
 import pytest
 from pydantic import TypeAdapter
@@ -721,3 +721,70 @@ def test_reused_event_id_with_changed_content_is_rejected_without_reapply(
         assert automation.revision == 2
         assert automation.last_sequence_number == 1
         assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 1
+
+
+def assert_cancelled_orders_without_broker_ids_replay(factory):
+    """A persisted legacy empty ID must not block another instrument's cancellation."""
+    first = complete_fact_sequence()[:4]
+    transition = first[3]
+    first[3] = transition.model_copy(
+        update={
+            "payload": transition.payload.model_copy(
+                update={
+                    "external_order_id": "",
+                    "state": FactBrokerOrderStatus.CANCELLED,
+                    "to_state": FactBrokerOrderStatus.CANCELLED,
+                    "terminal_at": NOW,
+                }
+            )
+        }
+    )
+
+    def other_instrument(value):
+        if isinstance(value, UUID):
+            if value == SCOPE_ID:
+                return value
+            if value == AUTOMATION_A:
+                return AUTOMATION_B
+            if value == INSTRUMENT_A:
+                return INSTRUMENT_B
+            return uuid5(NAMESPACE_OID, str(value))
+        if isinstance(value, dict):
+            return {
+                key: f"{item}-second" if key == "idempotency_key" else other_instrument(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [other_instrument(item) for item in value]
+        return value
+
+    adapter = TypeAdapter(FactEnvelope)
+    second = [adapter.validate_python(other_instrument(fact.model_dump(mode="python"))) for fact in first]
+    assert service(factory).publish(first[:3]).failures == ()
+    with factory.begin() as session:
+        legacy_order = session.get(BrokerOrderModel, str(first[2].payload.order_id))
+        legacy_order.external_order_id = ""
+
+    accepted = service(factory).publish(second)
+    assert accepted.failures == ()
+    assert accepted.results[0].accepted_through_sequence == 4
+    replay = service(factory).publish(second)
+    assert replay.failures == ()
+    assert replay.results[0].accepted_through_sequence == 4
+    assert service(factory).publish(first[3:]).failures == ()
+    assert service(factory).publish(first).failures == ()
+    with factory() as session:
+        orders = session.scalars(select(BrokerOrderModel)).all()
+        assert len(orders) == 2
+        assert all(order.external_order_id is None for order in orders)
+        assert all(order.state == BrokerOrderStatus.CANCELLED.value for order in orders)
+        assert session.scalar(select(func.count()).select_from(BrokerOrderEventModel)) == 2
+        assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 0
+        assert all(
+            automation.last_sequence_number == 4 for automation in session.scalars(select(TradingAutomationModel))
+        )
+
+
+def test_cancelled_orders_without_broker_ids_replay(database):
+    _, factory = database
+    assert_cancelled_orders_without_broker_ids_replay(factory)

@@ -211,3 +211,76 @@ def test_order_aggregate_replacement_rejects_changed_intent_without_mutation(
 
     assert caught.value.code is TradingFactErrorCode.INVALID_STATE
     assert repository.get_order("scope-1", order.id) == order
+
+
+@pytest.mark.parametrize("missing_id", [None, "", "   "])
+def test_order_update_without_external_id_preserves_known_broker_identity(database, missing_id):
+    _, session = database
+    repository = OrderFactsRepository(session)
+    order = fact_value(BrokerOrderDraft).model_copy(update={"external_order_id": "broker-1"})
+    repository.append_decision("scope-1", fact_value(TradeDecisionDraft))
+    repository.append_order("scope-1", order)
+
+    saved = repository.replace_order_aggregate(
+        "scope-1", order.model_copy(update={"external_order_id": missing_id, "state": BrokerOrderStatus.CANCELLED})
+    )
+
+    assert saved.external_order_id == "broker-1"
+    assert saved.state is BrokerOrderStatus.CANCELLED
+
+
+def test_order_update_rejects_replacing_known_external_id(database):
+    _, session = database
+    repository = OrderFactsRepository(session)
+    order = fact_value(BrokerOrderDraft).model_copy(update={"external_order_id": "broker-1"})
+    repository.append_decision("scope-1", fact_value(TradeDecisionDraft))
+    repository.append_order("scope-1", order)
+
+    with pytest.raises(TradingFactPersistenceError) as caught:
+        repository.replace_order_aggregate("scope-1", order.model_copy(update={"external_order_id": "broker-2"}))
+
+    assert caught.value.code is TradingFactErrorCode.INVALID_STATE
+    assert repository.get_order("scope-1", order.id).external_order_id == "broker-1"
+
+
+@pytest.mark.parametrize("missing_id", ["", "   "])
+def test_order_append_normalizes_absent_external_id_and_accepts_retry(database, missing_id):
+    _, session = database
+    repository = OrderFactsRepository(session)
+    order = fact_value(BrokerOrderDraft).model_copy(update={"external_order_id": missing_id})
+    repository.append_decision("scope-1", fact_value(TradeDecisionDraft))
+
+    first = repository.append_order("scope-1", order)
+    second = repository.append_order("scope-1", order)
+
+    assert first == second
+    assert first.external_order_id is None
+
+
+def test_order_update_translates_duplicate_real_external_id(database):
+    _, session = database
+    repository = OrderFactsRepository(session)
+    decision = fact_value(TradeDecisionDraft)
+    order = fact_value(BrokerOrderDraft)
+    for suffix, external_id in (("1", "broker-1"), ("2", None)):
+        repository.append_decision(
+            "scope-1", decision.model_copy(update={"id": f"decision-{suffix}", "fact_id": f"fact-decision-{suffix}"})
+        )
+        repository.append_order(
+            "scope-1",
+            order.model_copy(
+                update={
+                    "id": f"order-{suffix}",
+                    "fact_id": f"fact-order-{suffix}",
+                    "decision_id": f"decision-{suffix}",
+                    "idempotency_key": f"idempotency-{suffix}",
+                    "external_order_id": external_id,
+                }
+            ),
+        )
+    candidate = repository.get_order("scope-1", "order-2").model_copy(update={"external_order_id": "broker-1"})
+
+    with pytest.raises(TradingFactPersistenceError) as caught:
+        repository.replace_order_aggregate("scope-1", candidate)
+
+    assert caught.value.code is TradingFactErrorCode.INVALID_STATE

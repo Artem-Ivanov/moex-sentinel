@@ -2,6 +2,9 @@
 .idea
 .venv
 .env
+deploy/remote/.env
+deploy/remote/.env.*
+deploy/remote/backups
 data
 develop
 docs

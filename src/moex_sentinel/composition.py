@@ -201,6 +201,7 @@ def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUse
         automation_service,
         automaton_broker_service,
         lambda connection: TInvestOrderExecutionAdapter(connection.token, connection.target),
+        instrument_repository,
     )
     automation_commands = AutomationCommandRepository(factory)
     trading_fact_ingress = TradingFactIngressService(

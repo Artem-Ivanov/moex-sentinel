@@ -229,7 +229,7 @@ def bootstrap_market(**changes):
     return MarketBatchSnapshot.immutable("bootstrap", NOW, {"instrument": state})
 
 
-def test_bootstrap_preparation_skips_normal_recovery_and_allows_regular_commands() -> None:
+def test_bootstrap_preparation_keeps_order_recovery_and_allows_regular_commands() -> None:
     async def scenario():
         bootstrap = PositionBootstrap()
         hydration = Hydration()
@@ -252,7 +252,7 @@ def test_bootstrap_preparation_skips_normal_recovery_and_allows_regular_commands
     bootstrap, hydration, reconciliation, regular = asyncio.run(scenario())
     assert bootstrap.calls == [bootstrap_command(), bootstrap_command()]
     assert hydration.calls == [(regular,), (regular,)]
-    assert reconciliation.calls == [(regular,), (regular,)]
+    assert reconciliation.calls == [(regular,), (bootstrap_command(),), (regular,), (bootstrap_command(),)]
 
 
 @pytest.mark.parametrize(
@@ -325,7 +325,7 @@ def test_bootstrap_requires_matching_portfolio_but_not_market_or_commission_read
     bootstrap, hydration, reconciliation = asyncio.run(scenario())
     assert bootstrap.calls == ([] if failure in {"portfolio", "recovery"} else [bootstrap_command()])
     assert hydration.calls == []
-    assert reconciliation.calls == []
+    assert reconciliation.calls == [(bootstrap_command(),)]
 
 
 @pytest.mark.parametrize("state", [AutomationState.HOLD, AutomationState.IN_QUEUE])
@@ -377,3 +377,18 @@ def test_ready_bootstrap_is_atomic_idempotent_and_hydrates_only_after_ack(tmp_pa
         assert session.scalar(select(func.count()).select_from(LocalIntentModel)) == 0
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
     engine.dispose()
+
+
+def test_held_adopted_position_still_reconciles_pending_broker_execution() -> None:
+    async def scenario():
+        reconciliation = Reconciliation()
+        service = BrokerTickPreparationService(
+            Broker(), Portfolio(), Bootstrap(), Commissions(), Hydration(),
+            reconciliation=reconciliation, position_bootstrap=PositionBootstrap(), now=lambda: NOW,
+        )
+        held = bootstrap_command()
+        await service.prepare((held,), MarketBatchSnapshot.immutable("held", NOW, {}))
+        return reconciliation, held
+
+    reconciliation, held = asyncio.run(scenario())
+    assert reconciliation.calls == [(held,)]

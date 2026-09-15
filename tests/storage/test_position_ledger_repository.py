@@ -1,6 +1,7 @@
 """Baseline position ledger repository tests."""
 
 from collections.abc import Iterator
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import Engine, func, select
@@ -163,3 +164,16 @@ def test_stale_lot_balance_rejects_allocation_without_mutation(database: tuple[E
     assert caught.value.code is TradingFactErrorCode.INVALID_STATE
     assert repository.list_open_lots("scope-1", "cycle-1") == (lot,)
     assert repository.list_allocations("scope-1", "cycle-1") == ()
+
+
+def test_older_cycle_valuation_cannot_overwrite_newer_aggregate(database):
+    _, session = database
+    repository = PositionLedgerRepository(session)
+    current = repository.get_cycle("scope-1", "cycle-1")
+    newer = current.model_copy(
+        update={"net_pnl": current.net_pnl + 10, "updated_at": current.updated_at + timedelta(seconds=1)}
+    )
+    repository.replace_cycle_aggregate("scope-1", newer)
+    result = repository.replace_cycle_aggregate("scope-1", current)
+    assert result.net_pnl == newer.net_pnl
+    assert result.updated_at == newer.updated_at

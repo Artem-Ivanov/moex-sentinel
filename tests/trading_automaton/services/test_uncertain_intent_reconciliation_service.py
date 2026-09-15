@@ -513,3 +513,26 @@ def test_failed_recovery_never_reports_completion(durable_audit, failure):
     stages = [item["stage"] for item in audit_payloads(outbox)]
     assert BusinessAuditStage.WORKER_RECOVERY_STARTED.value in stages
     assert BusinessAuditStage.WORKER_RECOVERY_COMPLETED.value not in stages
+
+
+def test_delayed_fill_is_reconciled_after_cooldown_without_restart() -> None:
+    async def scenario():
+        repository = Repository(ledger_lots=6)
+        broker = Broker((), position_lots="6")
+        clock = [NOW]
+        service = UncertainIntentReconciliationService(repository, broker, now=lambda: clock[0])
+        first = await service.reconcile((command(),))
+        broker.exact_state = filled_order_state()
+        broker.position_lots = "5"
+        immediate = await service.reconcile((command(),))
+        clock[0] += timedelta(seconds=60)
+        later = await service.reconcile((command(),))
+        return repository, first, immediate, later
+
+    repository, first, immediate, later = asyncio.run(scenario())
+    assert first.unresolved == 1
+    assert immediate.resolved == 0
+    assert later.resolved == 1
+    assert len(repository.finalizations) == 1
+    assert repository.finalizations[0][0].executed_lots == 1
+    assert repository.finalizations[0][1] is False

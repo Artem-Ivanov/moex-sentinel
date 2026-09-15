@@ -203,9 +203,15 @@ class StreamingRuntimeCoordinatorService:
         core_states = await self._synchronize_all(monitored)
         active = await asyncio.to_thread(self._repository.list_active)
         monitored = await asyncio.to_thread(self._repository.list_monitored)
-        active.extend(
-            command for command in monitored if command.state is AutomationState.HOLD and command.bootstrap is not None
-        )
+        for command in monitored:
+            if command.state is not AutomationState.HOLD:
+                continue
+            active_intent = await asyncio.to_thread(
+                self._repository.get_active_intent, str(command.automation_id)
+            )
+            if command.bootstrap is not None or active_intent is not None:
+                # Preserve HOLD: supervise uncertain execution without enabling decisions.
+                active.append(command)
         grouped: dict[str, list[AutomationCommand]] = {}
         for command in active:
             if command.bootstrap is not None:

@@ -1,6 +1,6 @@
 """Trading summary values and deterministic calculations."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from pydantic import ConfigDict, field_validator
@@ -159,7 +159,11 @@ def period_from_snapshots(
     *,
     requested_from: datetime,
 ) -> TradingPnlPeriod:
-    """Calculate one rolling period from persisted cumulative P&L values."""
+    """Calculate a period; completeness requires its boundary within one minute.
+
+    Snapshots have minute buckets. Older baselines still provide a useful delta,
+    but their longer actual interval must remain visible as incomplete history.
+    """
     requested = floor_utc_millisecond(requested_from)
     if baseline is None:
         return TradingPnlPeriod(None, None, latest.captured_at, False)
@@ -167,5 +171,5 @@ def period_from_snapshots(
         latest.cumulative_pnl - baseline.cumulative_pnl,
         baseline.captured_at,
         latest.captured_at,
-        baseline.captured_at <= requested,
+        timedelta() <= requested - baseline.captured_at <= timedelta(minutes=1),
     )

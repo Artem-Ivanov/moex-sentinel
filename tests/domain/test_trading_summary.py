@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from moex_sentinel.domain.portfolio import BrokerReadError, ExternalOperation, Money
 from moex_sentinel.domain.trading_summary import (
     CashFlowTotals,
@@ -90,6 +92,28 @@ def test_period_marks_earliest_snapshot_as_incomplete() -> None:
     assert period.from_at == NOW - timedelta(days=2)
     assert period.to_at == NOW
     assert period.complete is False
+
+
+@pytest.mark.parametrize(
+    ("baseline_offset", "complete"),
+    [
+        (timedelta(), True),
+        (-timedelta(seconds=60), True),
+        (-timedelta(seconds=60, milliseconds=1), False),
+        (-timedelta(days=1), False),
+        (timedelta(milliseconds=1), False),
+    ],
+)
+def test_period_requires_baseline_near_requested_boundary(baseline_offset: timedelta, complete: bool) -> None:
+    requested = NOW - timedelta(days=1)
+    baseline = snapshot("baseline", "5", requested + baseline_offset)
+
+    period = period_from_snapshots(snapshot("latest", "12", NOW), baseline, requested_from=requested)
+
+    assert period.value == Decimal("7")
+    assert period.from_at == requested + baseline_offset
+    assert period.to_at == NOW
+    assert period.complete is complete
 
 
 def test_snapshot_times_are_normalized_to_utc_milliseconds() -> None:

@@ -139,6 +139,7 @@ class DecisionBatchItem(PositionalModel):
     cycle_state: dict[str, Any] | None = None
     indicators: dict[str, object] = Field(default_factory=dict)
     currency: str = "RUB"
+    position_snapshot_at: datetime | None = None
 
 
 class BatchPersistResult(PositionalModel):

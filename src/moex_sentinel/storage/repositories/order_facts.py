@@ -27,9 +27,14 @@ from moex_sentinel.storage.repositories.trading_facts_support import (
     append_idempotent,
     flush_or_translate,
     require_scoped_reference,
+    translate_database_errors,
 )
 from sentinel_contracts.broker_execution import OrderSide
 from sentinel_contracts.trading import DecisionKind
+
+
+def _external_order_id(value: str | None) -> str | None:
+    return value if value and value.strip() else None
 
 
 def _decision_value(model: TradeDecisionModel) -> TradeDecisionDraft:
@@ -70,7 +75,7 @@ def _order_value(model: BrokerOrderModel) -> BrokerOrderDraft:
         position_cycle_id=model.position_cycle_id,
         instrument_id=model.instrument_id,
         idempotency_key=model.idempotency_key,
-        external_order_id=model.external_order_id,
+        external_order_id=_external_order_id(model.external_order_id),
         intent_kind=OrderIntentKind(model.intent_kind),
         side=OrderSide(model.side),
         order_type=BrokerOrderType(model.order_type),
@@ -178,7 +183,9 @@ class OrderFactsRepository:
             entity_type="broker_order",
         )
         self._require_decision_lineage(user_broker_id, value)
-        model = BrokerOrderModel(**value.model_dump(mode="python"))
+        model = BrokerOrderModel(
+            **{**value.model_dump(mode="python"), "external_order_id": _external_order_id(value.external_order_id)}
+        )
         return append_idempotent(
             self._session,
             candidate=model,
@@ -273,33 +280,39 @@ class OrderFactsRepository:
         current = self.get_order(user_broker_id, value.id)
         if not self._same_order_intent(current, value):
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order")
-        result = self._session.execute(
-            update(BrokerOrderModel)
-            .where(
-                BrokerOrderModel.user_broker_id == user_broker_id,
-                BrokerOrderModel.id == value.id,
-                BrokerOrderModel.fact_id == value.fact_id,
-                BrokerOrderModel.automation_id == value.automation_id,
-                BrokerOrderModel.decision_id == value.decision_id,
-                BrokerOrderModel.position_cycle_id == value.position_cycle_id,
-                BrokerOrderModel.instrument_id == value.instrument_id,
-                BrokerOrderModel.idempotency_key == value.idempotency_key,
+        external_order_id = _external_order_id(value.external_order_id)
+        if current.external_order_id is not None:
+            if external_order_id is not None and external_order_id != current.external_order_id:
+                raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order")
+            external_order_id = current.external_order_id
+        with translate_database_errors(entity_type="broker_order"):
+            result = self._session.execute(
+                update(BrokerOrderModel)
+                .where(
+                    BrokerOrderModel.user_broker_id == user_broker_id,
+                    BrokerOrderModel.id == value.id,
+                    BrokerOrderModel.fact_id == value.fact_id,
+                    BrokerOrderModel.automation_id == value.automation_id,
+                    BrokerOrderModel.decision_id == value.decision_id,
+                    BrokerOrderModel.position_cycle_id == value.position_cycle_id,
+                    BrokerOrderModel.instrument_id == value.instrument_id,
+                    BrokerOrderModel.idempotency_key == value.idempotency_key,
+                )
+                .values(
+                    external_order_id=external_order_id,
+                    state=value.state.value,
+                    requested_amount=value.requested_amount,
+                    executed_amount=value.executed_amount,
+                    estimated_commission=value.estimated_commission,
+                    executed_commission=value.executed_commission,
+                    dispatch_started_at=value.dispatch_started_at,
+                    broker_responded_at=value.broker_responded_at,
+                    executed_at=value.executed_at,
+                    terminal_at=value.terminal_at,
+                    updated_at=value.updated_at,
+                )
+                .returning(BrokerOrderModel.id)
             )
-            .values(
-                external_order_id=value.external_order_id,
-                state=value.state.value,
-                requested_amount=value.requested_amount,
-                executed_amount=value.executed_amount,
-                estimated_commission=value.estimated_commission,
-                executed_commission=value.executed_commission,
-                dispatch_started_at=value.dispatch_started_at,
-                broker_responded_at=value.broker_responded_at,
-                executed_at=value.executed_at,
-                terminal_at=value.terminal_at,
-                updated_at=value.updated_at,
-            )
-            .returning(BrokerOrderModel.id)
-        )
         if result.scalar_one_or_none() is None:
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order")
         flush_or_translate(self._session, entity_type="broker_order")

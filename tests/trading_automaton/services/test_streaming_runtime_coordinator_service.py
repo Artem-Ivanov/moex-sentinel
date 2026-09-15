@@ -440,3 +440,41 @@ def test_rebuilds_broker_runtime_after_its_task_finishes_with_error() -> None:
     assert any("ValueError" in message for message in messages)
     assert any("SQLITE_CONSTRAINT_UNIQUE" in message for message in messages)
     assert any("uq_fact_outbox_sequence" in message for message in messages)
+
+
+def test_held_nonbootstrap_automation_keeps_uncertain_intent_supervision(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'held.db'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+    automation_id = str(value.automation_id)
+    intent_id = repository.save_decision_batch((decision_item(value),), occurred_at=NOW).intents[0].idempotency_key
+    repository.update_intent(intent_id, state="UNCERTAIN", occurred_at=NOW)
+    repository.hold_active("Uncertain order", automation_id)
+
+    class HeldCore(Core):
+        def automation_statuses(self, automation_ids):
+            result = super().automation_statuses(automation_ids)
+            for status in result.automations.values():
+                status["state"] = "HOLD"
+            return result
+
+    async def scenario():
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        bundle = Bundle()
+        async def builder(connection):
+            return bundle
+        service = StreamingRuntimeCoordinatorService(
+            repository, synchronization, HeldCore(), builder, worker_id="worker", now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return bundle
+
+    bundle = asyncio.run(scenario())
+    assert len(bundle.commands) == 1
+    assert bundle.commands[0][0].state is AutomationState.HOLD
+    assert repository.get_active_intent(automation_id).state == "UNCERTAIN"
+    engine.dispose()

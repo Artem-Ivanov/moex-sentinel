@@ -76,6 +76,7 @@ class UncertainIntentReconciliationService:
         self._active_intents = active_intents
         self._cash = cash
         self._attempted: set[str] = set()
+        self._retry_after: dict[str, datetime] = {}
 
     async def reconcile(self, commands: tuple[AutomationCommand, ...]) -> ReconciliationResult:
         results = await asyncio.gather(*(self._reconcile_one(command) for command in commands))
@@ -88,6 +89,9 @@ class UncertainIntentReconciliationService:
         automation_id = str(command.automation_id)
         intent = await asyncio.to_thread(self._repository.get_active_intent, automation_id)
         if intent is None or intent.state != "UNCERTAIN" or intent.idempotency_key in self._attempted:
+            return "SKIPPED"
+        retry_after = self._retry_after.get(intent.idempotency_key)
+        if retry_after is not None and self._now() < retry_after:
             return "SKIPPED"
         # Keep correlation stable across retries and restarts without storing a new column.
         process_id = str(uuid5(_RECOVERY_NAMESPACE, f"{command.broker_id}:{automation_id}:{intent.idempotency_key}"))
@@ -133,6 +137,8 @@ class UncertainIntentReconciliationService:
                 broker_order_state="UNCERTAIN",
                 reason_code="UNCERTAIN_RECONCILIATION_AMBIGUOUS",
             )
+            self._retry_after[intent.idempotency_key] = self._now() + timedelta(seconds=30)
+            self._attempted.discard(intent.idempotency_key)
             return "UNRESOLVED"
         await self._audit_stage(
             command,

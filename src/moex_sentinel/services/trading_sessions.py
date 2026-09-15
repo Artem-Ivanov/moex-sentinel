@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable, Sequence
 from typing import Protocol
 
+from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
 from moex_sentinel.domain.trading_sessions import TradingSessionsStatus
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerTradingStatus
 
@@ -25,16 +26,22 @@ class TradingStatusPort(Protocol):
     async def get_trading_status(self, instrument_id: str) -> BrokerTradingStatus: ...
 
 
+class InstrumentCatalogPort(Protocol):
+    def get(self, user_broker_id: str, instrument_id: str) -> UserBrokerCatalogInstrument: ...
+
+
 class TradingSessionService:
     def __init__(
         self,
         automations: AutomationPort,
         connections: ConnectionPort,
         adapter_builder: Callable[[BrokerConnection], TradingStatusPort],
+        catalog: InstrumentCatalogPort,
     ) -> None:
         self._automations = automations
         self._connections = connections
         self._adapter_builder = adapter_builder
+        self._catalog = catalog
 
     async def status(self) -> TradingSessionsStatus:
         targets = sorted({(item.broker_id, item.instrument_id) for item in self._automations.list_active()})
@@ -55,8 +62,9 @@ class TradingSessionService:
 
     async def _read(self, broker_id: str, instrument_id: str) -> str:
         try:
+            instrument = self._catalog.get(broker_id, instrument_id)
             connection = self._connections.connection(broker_id)
-            status = await self._adapter_builder(connection).get_trading_status(instrument_id)
+            status = await self._adapter_builder(connection).get_trading_status(instrument.external_instrument_id)
         except Exception:
             return "UNAVAILABLE"
         return "OPEN" if status.api_trade_available and status.limit_order_available else "CLOSED"

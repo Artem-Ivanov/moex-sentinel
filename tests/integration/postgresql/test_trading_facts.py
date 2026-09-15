@@ -18,9 +18,11 @@ from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUni
 from tests.domain.test_trading_facts import all_fact_drafts
 from tests.services.test_trading_fact_ingress import (
     AUTOMATION_A,
+    AUTOMATION_B,
     INSTRUMENT_A,
     INSTRUMENT_B,
     SCOPE_ID,
+    assert_cancelled_orders_without_broker_ids_replay,
     assert_cycle_instrument_lineage_rejects_group_atomically,
 )
 from tests.storage.test_trading_facts_models import automation_model
@@ -125,3 +127,25 @@ def test_postgresql_unit_of_work_rolls_back_and_active_index_is_partial(
 
     assert caught.value.code is TradingFactErrorCode.INVALID_STATE
     engine.dispose()
+
+
+@pytest.mark.postgresql
+def test_postgresql_cancelled_orders_without_broker_ids_replay(isolated_postgresql_database_url: URL) -> None:
+    engine = create_database_engine(isolated_postgresql_database_url)
+    factory = create_session_factory(engine)
+    try:
+        with factory.begin() as session:
+            session.add(user_broker_model(str(SCOPE_ID), "synthetic-account"))
+            session.flush()
+            for instrument_id, ticker in ((INSTRUMENT_A, "SYNTH_A"), (INSTRUMENT_B, "SYNTH_B")):
+                instrument = instrument_model(str(instrument_id), str(SCOPE_ID))
+                instrument.ticker = ticker
+                session.add(instrument)
+            session.flush()
+            for automation_id, instrument_id in ((AUTOMATION_A, INSTRUMENT_A), (AUTOMATION_B, INSTRUMENT_B)):
+                session.add(
+                    automation_model(str(automation_id), user_broker_id=str(SCOPE_ID), instrument_id=str(instrument_id))
+                )
+        assert_cancelled_orders_without_broker_ids_replay(factory)
+    finally:
+        engine.dispose()

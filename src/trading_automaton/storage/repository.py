@@ -18,7 +18,7 @@ from sentinel_contracts.automation_lifecycle import (
 from sentinel_contracts.broker_execution import OrderSide
 from sentinel_contracts.business_audit import BusinessAuditEvent
 from sentinel_contracts.strategy import STRATEGY_CODE, STRATEGY_VERSION
-from sentinel_contracts.time import utc_now_ms
+from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
 from sentinel_contracts.trading import AutomationState, DecisionKind
 from sentinel_contracts.trading_facts import (
     AutomationCommand as TypedAutomationCommand,
@@ -354,7 +354,12 @@ class LocalAutomationRepository:
                 elif intent.side == "SELL":
                     self._allocate_sell_lifo_in_session(session, intent, finalization)
                 self._finalize_trading_cycle(session, intent, finalization)
-                snapshot = self._authoritative_position_snapshot(session, intent.automation_id, finalization)
+                snapshot = self._authoritative_position_snapshot(
+                    session,
+                    intent.automation_id,
+                    lot_size=finalization.lot_size,
+                    mark_price=finalization.executed_price,
+                )
                 self._append_execution_graph(session, intent, cached, finalization, snapshot)
             else:
                 snapshot = None
@@ -423,7 +428,7 @@ class LocalAutomationRepository:
         first_buy = intent.side == "BUY" and lot is not None and lot.original_lots == int(snapshot["quantity_lots"])
 
         if first_buy:
-            self._append_cycle_fact(session, cached, finalization, snapshot, occurred_at)
+            self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
         self._fact_writer.append(
             session,
             cached,
@@ -470,7 +475,7 @@ class LocalAutomationRepository:
                 occurred_at=occurred_at,
             )
             if not first_buy:
-                self._append_cycle_fact(session, cached, finalization, snapshot, occurred_at)
+                self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
         else:
             allocations = session.scalars(
                 select(LotAllocationModel)
@@ -503,7 +508,7 @@ class LocalAutomationRepository:
                     safe_message="Execution allocated to position lot",
                     occurred_at=allocation.closed_at,
                 )
-            self._append_cycle_fact(session, cached, finalization, snapshot, occurred_at)
+            self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
             if int(snapshot["quantity_lots"]) == 0:
                 cached.position_cycle_id = None
         intent.execution_facts_emitted_at = occurred_at
@@ -512,9 +517,10 @@ class LocalAutomationRepository:
         self,
         session: Session,
         cached: CachedAutomationModel,
-        finalization: ExecutionFinalization,
         snapshot: dict[str, int | str],
         occurred_at: datetime,
+        *,
+        updated_at: datetime | None = None,
     ) -> None:
         if cached.position_cycle_id is None or cached.fact_instrument_id is None:
             raise ValueError("Position cycle identity is incomplete.")
@@ -529,7 +535,10 @@ class LocalAutomationRepository:
                 LocalIntentModel.position_cycle_id == cached.position_cycle_id,
             )
         )
-        opened_at = first_lot_at or occurred_at
+        bootstrap_at = (
+            cached.bootstrap_observed_at if cached.bootstrap_position_cycle_id == cached.position_cycle_id else None
+        )
+        opened_at = min(at for at in (first_lot_at, bootstrap_at, occurred_at) if at is not None)
         quantity_lots = int(snapshot["quantity_lots"])
         self._fact_writer.append(
             session,
@@ -548,7 +557,9 @@ class LocalAutomationRepository:
                 opened_at=opened_at,
                 closed_at=occurred_at if quantity_lots == 0 else None,
                 created_at=opened_at,
-                updated_at=occurred_at,
+                # A delayed fill changes the ledger when observed, even if a
+                # later quote has already valued the previously known position.
+                updated_at=updated_at or occurred_at,
             ),
             safe_message="Position cycle updated",
             occurred_at=occurred_at,
@@ -607,7 +618,9 @@ class LocalAutomationRepository:
     def _authoritative_position_snapshot(
         session: Session,
         automation_id: str,
-        finalization: ExecutionFinalization,
+        *,
+        lot_size: int,
+        mark_price: Decimal,
     ) -> dict[str, int | str]:
         lots = session.scalars(select(TradeLotModel).where(TradeLotModel.automation_id == automation_id)).all()
         allocations = session.scalars(
@@ -620,8 +633,8 @@ class LocalAutomationRepository:
         )
         return lot_position_snapshot(
             lots,
-            lot_size=finalization.lot_size,
-            mark_price=finalization.executed_price,
+            lot_size=lot_size,
+            mark_price=mark_price,
             realized_pnl=realized_pnl,
             actual_commissions=actual_commissions,
         ).to_metadata()
@@ -1538,6 +1551,19 @@ class LocalAutomationRepository:
                             "intent": None,
                         }
                     )
+                if item.position_snapshot is not None and cached.position_cycle_id is not None:
+                    # Hydration may predate a fill. Read the authoritative LIFO ledger
+                    # in this transaction instead of publishing its stale quantities.
+                    snapshot = self._authoritative_position_snapshot(
+                        session, item.automation_id, lot_size=item.lot_size, mark_price=item.best_bid
+                    )
+                    if int(snapshot["quantity_lots"]) > 0:
+                        self._append_cycle_fact(
+                            session,
+                            cached,
+                            snapshot,
+                            floor_utc_millisecond(item.position_snapshot_at or occurred_at),
+                        )
                 intent_id = None
                 order_fact_at = None
                 if item.intent is not None:

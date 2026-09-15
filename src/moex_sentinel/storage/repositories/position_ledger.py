@@ -144,6 +144,7 @@ class PositionLedgerRepository:
                 PositionCycleModel.id == value.id,
                 PositionCycleModel.automation_id == value.automation_id,
                 PositionCycleModel.instrument_id == value.instrument_id,
+                PositionCycleModel.updated_at <= value.updated_at,
             )
             .values(
                 state=value.state.value,
@@ -161,7 +162,10 @@ class PositionLedgerRepository:
             .returning(PositionCycleModel.id)
         )
         if result.scalar_one_or_none() is None:
-            raise TradingFactPersistenceError(TradingFactErrorCode.NOT_FOUND, entity_type="position_cycle")
+            current = self.get_cycle(user_broker_id, value.id)
+            if current.automation_id != value.automation_id or current.instrument_id != value.instrument_id:
+                raise TradingFactPersistenceError(TradingFactErrorCode.NOT_FOUND, entity_type="position_cycle")
+            return current
         flush_or_translate(self._session, entity_type="position_cycle")
         return self.get_cycle(user_broker_id, value.id)
 

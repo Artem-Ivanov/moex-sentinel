@@ -93,6 +93,9 @@ class BrokerTickPreparationService:
         regular = tuple(item for item in commands if item not in pending)
         if regular:
             await self._prepare_regular(regular, snapshot)
+        # HOLD still supervises orders that may finish after the polling window.
+        if pending and self._reconciliation is not None:
+            await self._reconciliation.reconcile(pending)
         for command in pending:
             try:
                 await self._prepare_adopted(command)

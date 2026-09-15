@@ -199,4 +199,4 @@ def test_summary_uses_one_common_run_when_account_missed_requested_boundary(
 
     assert period.value == Decimal("11")
     assert period.from_at == NOW - timedelta(days=2)
-    assert period.complete is True
+    assert period.complete is False

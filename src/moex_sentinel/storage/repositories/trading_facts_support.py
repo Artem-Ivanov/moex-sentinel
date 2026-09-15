@@ -1,6 +1,7 @@
 """Shared idempotency and safe database-error translation for typed facts."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import TypeVar, cast
 
 from sqlalchemy import ColumnElement, select
@@ -85,8 +86,15 @@ def require_scoped_reference(
 
 def flush_or_translate(session: Session, *, entity_type: str) -> None:
     """Flush or raise a stable typed error for a known named constraint."""
-    try:
+    with translate_database_errors(entity_type=entity_type):
         session.flush()
+
+
+@contextmanager
+def translate_database_errors(*, entity_type: str) -> Iterator[None]:
+    """Translate constraints raised by either flush or an immediate SQL update."""
+    try:
+        yield
     except IntegrityError as error:
         constraint_name = _constraint_name(error)
         code = CONSTRAINT_ERRORS.get(constraint_name or "")
