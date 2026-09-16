@@ -3,7 +3,9 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 from itertools import groupby
+from sqlite3 import Connection as SQLiteConnection
 from threading import Lock
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
@@ -645,6 +647,41 @@ class LocalAutomationRepository:
         ).to_metadata()
 
     @staticmethod
+    def _stored_position_snapshot(
+        session: Session,
+        automation_id: str,
+        *,
+        lot_size: int,
+        mark_price: Decimal,
+    ) -> dict[str, int | str]:
+        """Value stored ledger rows for a fresh decision batch; finalization keeps ORM precision."""
+        lots = session.execute(
+            select(
+                TradeLotModel.remaining_lots,
+                TradeLotModel.entry_price,
+                TradeLotModel.entry_commission,
+                TradeLotModel.original_lots,
+            ).where(TradeLotModel.automation_id == automation_id)
+        ).all()
+        allocations = session.execute(
+            select(LotAllocationModel.realized_pnl, LotAllocationModel.exit_commission).where(
+                LotAllocationModel.automation_id == automation_id
+            )
+        ).all()
+        realized_pnl = sum((allocation.realized_pnl for allocation in allocations), start=Decimal())
+        actual_commissions = sum((lot.entry_commission for lot in lots), start=Decimal()) + sum(
+            (allocation.exit_commission for allocation in allocations),
+            start=Decimal(),
+        )
+        return lot_position_snapshot(
+            lots,
+            lot_size=lot_size,
+            mark_price=mark_price,
+            realized_pnl=realized_pnl,
+            actual_commissions=actual_commissions,
+        ).to_metadata()
+
+    @staticmethod
     def _create_trade_lot_in_session(
         session: Session,
         intent: LocalIntentModel,
@@ -1138,9 +1175,27 @@ class LocalAutomationRepository:
         now: datetime,
         deadline_ms: int,
     ) -> list[FactOutboxRecord]:
+        """Select an eligible batch from one read snapshot, preserving bootstrap groups."""
         if limit <= 0:
             return []
         with self._factory() as session:
+            connection = session.connection()
+            driver = cast(SQLiteConnection, connection.connection.driver_connection)
+            if not driver.in_transaction:
+                connection.exec_driver_sql("BEGIN")
+            pending_bootstrap_state = session.scalar(
+                select(FactOutboxModel.event_id)
+                .join(CachedAutomationModel, CachedAutomationModel.automation_id == FactOutboxModel.automation_id)
+                .where(
+                    FactOutboxModel.delivery_state == "PENDING",
+                    FactOutboxModel.fact_kind == FactKind.AUTOMATION_STATE_CHANGED.value,
+                    CachedAutomationModel.bootstrap_position_cycle_id.is_not(None),
+                )
+                .limit(1)
+            )
+            if pending_bootstrap_state is None:
+                return self._ready_single_facts(session, limit, now=now, deadline_ms=deadline_ms)
+            # Any potential bootstrap keeps the established atomic-group selection.
             pending = session.scalars(
                 select(FactOutboxModel)
                 .where(FactOutboxModel.delivery_state == "PENDING")
@@ -1176,6 +1231,36 @@ class LocalAutomationRepository:
                     break
             rows.sort(key=lambda row: (row.occurred_at, row.event_id))
             return [self._fact_outbox_record(row) for row in rows]
+
+    def _ready_single_facts(
+        self, session: Session, limit: int, *, now: datetime, deadline_ms: int
+    ) -> list[FactOutboxRecord]:
+        """Load at most limit payloads; a future retry blocks its automation's suffix."""
+        blocked = (
+            select(
+                FactOutboxModel.automation_id,
+                func.min(FactOutboxModel.sequence_number).label("sequence_number"),
+            )
+            .where(FactOutboxModel.delivery_state == "PENDING", FactOutboxModel.next_retry_at > now)
+            .group_by(FactOutboxModel.automation_id)
+            .subquery()
+        )
+        eligible = (
+            select(FactOutboxModel)
+            .outerjoin(blocked, blocked.c.automation_id == FactOutboxModel.automation_id)
+            .where(
+                FactOutboxModel.delivery_state == "PENDING",
+                or_(blocked.c.sequence_number.is_(None), FactOutboxModel.sequence_number < blocked.c.sequence_number),
+            )
+        )
+        rows = session.scalars(
+            eligible.order_by(FactOutboxModel.occurred_at, FactOutboxModel.event_id).limit(limit)
+        ).all()
+        if len(rows) < limit:
+            oldest = min((row.created_at for row in rows), default=None)
+            if oldest is None or now < oldest + timedelta(milliseconds=deadline_ms):
+                return []
+        return [self._fact_outbox_record(row) for row in rows]
 
     @staticmethod
     def _fact_publication_units(session: Session, pending: list[FactOutboxModel]) -> list[list[FactOutboxModel]]:
@@ -1559,7 +1644,7 @@ class LocalAutomationRepository:
                 if item.position_snapshot is not None and cached.position_cycle_id is not None:
                     # Hydration may predate a fill. Read the authoritative LIFO ledger
                     # in this transaction instead of publishing its stale quantities.
-                    snapshot = self._authoritative_position_snapshot(
+                    snapshot = self._stored_position_snapshot(
                         session, item.automation_id, lot_size=item.lot_size, mark_price=item.best_bid
                     )
                     if int(snapshot["quantity_lots"]) > 0:

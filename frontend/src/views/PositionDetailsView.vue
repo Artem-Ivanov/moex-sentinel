@@ -75,8 +75,8 @@ onBeforeUnmount(() => {
       <article class="candle-panel">
         <div class="candle-panel__header"><strong>Брокерские операции по позиции</strong></div>
         <p v-if="details?.errors.some(item => item.source === 'operations')" class="error">{{ details.errors.find(item => item.source === 'operations')?.message }}</p>
-        <p v-if="details?.operations.length === 0" class="empty">Исполненных операций пока нет</p>
-        <div v-else class="table-scroll">
+        <p v-if="details?.operations.length === 0 && !details.errors.some(item => item.source === 'operations')" class="empty">Исполненных операций пока нет</p>
+        <div v-if="details?.operations.length" class="table-scroll">
           <table class="data-table">
             <thead><tr><th>Время</th><th>Операция</th><th>Состояние</th><th>Количество</th><th>Цена</th><th>Сумма</th><th>Комиссия</th></tr></thead>
             <tbody><tr v-for="item in details?.operations" :key="item.operation_id">

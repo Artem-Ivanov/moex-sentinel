@@ -25,12 +25,12 @@ from trading_automaton.services.broker_tick_preparation import BrokerTickPrepara
 @pytest.mark.parametrize(
     ("retry_limit", "retryable", "expected_calls", "expected_delays"),
     [
-        (0, True, 1, []),
-        (2, True, 3, [1, 3]),
+        (0, True, 1, [60]),
+        (2, True, 3, [1, 3, 60]),
         (2, False, 1, []),
     ],
 )
-def test_preparation_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_permanent_error(
+def test_preparation_uses_runtime_retry_budget_then_cooldown_or_permanent_pause(
     monkeypatch, failure_phase, retry_limit, retryable, expected_calls, expected_delays
 ):
     """Adoption skips commission lookup; later trading preparation must still bound SDK retries."""
@@ -56,8 +56,10 @@ def test_preparation_uses_runtime_retry_budget_and_pauses_on_exhaustion_or_perma
                 return await super().refresh_if_due(request, provider, now=now)
 
         async def skip_delay(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
-            awaitable.close()
             delays.append(timeout)
+            if timeout == 60:
+                return await awaitable
+            awaitable.close()
             await asyncio.sleep(0)
             raise TimeoutError
 

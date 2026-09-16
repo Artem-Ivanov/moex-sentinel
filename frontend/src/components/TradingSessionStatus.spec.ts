@@ -32,3 +32,29 @@ it("does not start polling after unmount while the initial request is pending", 
   expect(fetchMock).toHaveBeenCalledTimes(1)
   expect(vi.getTimerCount()).toBe(0)
 })
+
+it("skips overlapping status requests and retries after a failed refresh", async () => {
+  vi.useFakeTimers()
+  const open = { status: "OPEN", total: 1, open: 1, closed: 0, unavailable: 0 }
+  let rejectRefresh!: (reason: Error) => void
+  const pending = new Promise<Response>((_resolve, reject) => { rejectRefresh = reject })
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(open))
+    .mockReturnValueOnce(pending)
+    .mockImplementation(() => Promise.resolve(Response.json(open)))
+  vi.stubGlobal("fetch", fetchMock)
+  render(TradingSessionStatus)
+  await flushPromises()
+
+  await vi.advanceTimersByTimeAsync(60_000)
+  await vi.advanceTimersByTimeAsync(120_000)
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+
+  rejectRefresh(new Error("temporary failure"))
+  await flushPromises()
+  expect(screen.getByText("Статус торгов недоступен")).toBeTruthy()
+  await vi.advanceTimersByTimeAsync(60_000)
+  await flushPromises()
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+  expect(screen.getByText("Торги доступны: 1/1")).toBeTruthy()
+})

@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -365,10 +366,76 @@ def test_position_operations_are_scoped_and_only_include_executed_trades() -> No
                 None,
             )
 
-    adapter = PositionOperationsAdapter()
-    service = PortfolioAggregationService(BrokerRepository([broker("b1", "First")]), lambda _broker: adapter)
+    class Catalog:
+        def get(self, user_broker_id, instrument_id):
+            assert (user_broker_id, instrument_id) == ("b1", "internal-instrument")
+            return SimpleNamespace(external_instrument_id="instrument-1")
 
-    result = asyncio.run(service.view_position_operations("b1", "account-1", "instrument-1", 50))
+    adapter = PositionOperationsAdapter()
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: adapter, instruments=Catalog()
+    )
+
+    result = asyncio.run(service.view_position_operations("b1", "account-1", "internal-instrument", 50))
 
     assert adapter.calls == [("account-1", None, 50, "instrument-1")]
     assert [item.operation.operation_id for item in result.items] == ["buy", "sell"]
+
+
+@pytest.mark.parametrize(
+    "initially_present", [pytest.param(True, id="known-instrument"), pytest.param(False, id="missing-instrument")]
+)
+def test_operation_ticker_lookup_is_scoped_to_broker_and_one_request(initially_present):
+    class RepeatedOperations(PortfolioAdapter):
+        async def list_accounts(self):
+            return tuple(
+                BrokerAccount(account_id=f"account-{index}", name="Main", status="OPEN", account_type="BROKER")
+                for index in range(2)
+            )
+
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None):
+            page = await super().get_operations(account_id, cursor, limit, instrument_id)
+            item = page.items[0]
+            return OperationsPage(
+                tuple(
+                    item.model_copy(
+                        update={"operation_id": f"{account_id}-{index}", "instrument_id": "shared-external"}
+                    )
+                    for index in range(2)
+                ),
+                None,
+            )
+
+    class Catalog:
+        def __init__(self):
+            self.calls = []
+            self.generation = 1
+
+        def find_by_external_instrument_id(self, broker_id, external_instrument_id):
+            self.calls.append((broker_id, external_instrument_id))
+            if self.generation == 1 and not initially_present:
+                return None
+            return SimpleNamespace(ticker=f"{broker_id}-generation-{self.generation}")
+
+    catalog = Catalog()
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First"), broker("b2", "Second")]),
+        lambda _broker: RepeatedOperations("unused"),
+        instruments=catalog,
+    )
+    first = asyncio.run(service.view_operations(50))
+
+    assert len(first.items) == 8
+    assert first.errors == ()
+    for item in first.items:
+        assert item.operation.ticker == (f"{item.broker_id}-generation-1" if initially_present else None)
+    assert sorted(catalog.calls) == [("b1", "shared-external"), ("b2", "shared-external")]
+
+    catalog.generation = 2
+    second = asyncio.run(service.view_operations(50))
+
+    assert len(second.items) == 8
+    assert second.errors == ()
+    assert sorted(catalog.calls) == [("b1", "shared-external")] * 2 + [("b2", "shared-external")] * 2
+    for item in second.items:
+        assert item.operation.ticker == f"{item.broker_id}-generation-2"

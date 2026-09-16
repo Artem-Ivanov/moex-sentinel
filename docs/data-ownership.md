@@ -12,7 +12,7 @@
 | `trading_automations`, `position_cycles`, `position_lots` | Core, PostgreSQL | Подтверждённое состояние автоматов и позиций |
 | `trade_decisions`, `broker_orders`, `broker_order_events`, `trade_executions`, `execution_lot_allocations` | Core, PostgreSQL | Подтверждённые решения, заявки, исполнения и атрибуция лотов |
 | `automation_events`, `trade_audit_events` | Core, PostgreSQL | Принятые envelopes, последовательность и бизнес-аудит |
-| `broker_account_fee_profiles`, `position_valuation_snapshots` | Core, PostgreSQL | Профили комиссии и оценки позиции |
+| `broker_account_fee_profiles`, `position_valuation_snapshots` | Core, PostgreSQL | Сохранённая capability; текущие runtime-пути эти таблицы не наполняют и не читают |
 | `portfolio_snapshots`, `portfolio_snapshot_runs` | Процесс снимков внутри Core, PostgreSQL | Сохранённая сводка портфеля и её сбор |
 | `cached_automations`, `worker_runs`, `account_commission_profiles` | Worker, SQLite | Кэш команд, восстановление процесса и комиссии |
 | `broker_intents`, `trade_decisions`, `trade_lots`, `lot_allocations`, `trading_cycle_states` | Worker, SQLite | Восстановимое состояние выполнения и принятия решений |
@@ -24,6 +24,19 @@
 источника торговых фактов. Worker атомарно сохраняет результат выполнения и
 outbox; Core принимает этот результат по единственному typed-протоколу.
 Worker не подключается к PostgreSQL и не изменяет Core ORM напрямую.
+
+Текущие профили комиссий рассчитываются в Worker `account_commission_profiles`,
+оценка открытой позиции публикуется в Core `position_cycles`, а сводка портфеля
+использует `portfolio_snapshots`. Наличие двух неактивных аналитических таблиц
+Core не означает, что их можно удалить вместе с возможной историей: решение
+об их поддержке или архивировании принимается отдельно. Проверенные consumers,
+назначение повторяющихся полей и ограничения — в
+[схемном аудите](audits/2026-09-16-database-architecture.md).
+
+Worker при инициализации создаёт недостающий неуникальный индекс
+`ix_trade_decisions_intent_id`, в том числе в существующей SQLite. Обновление
+не пересоздаёт таблицы и не меняет строки; создание индекса выполняется до
+запуска торговых задач и может занять время на большой истории решений.
 
 `execution_price_repair_journal` в каждой БД — отдельный постоянный журнал
 выполненной коррекции цен, вне Alembic. Он сохраняется; восстановление проекций

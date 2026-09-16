@@ -6,11 +6,15 @@ import { fetchTradingSessionsStatus, type TradingSessionsStatus } from "../api/a
 const state = ref<TradingSessionsStatus>()
 let timer: ReturnType<typeof setInterval> | undefined
 let disposed = false
+let refreshing = false
 
 /** Refresh session availability, reporting a failed request as unavailable. */
 async function refresh(): Promise<void> {
+  if (disposed || refreshing) return
+  refreshing = true
   try { state.value = await fetchTradingSessionsStatus() }
   catch { state.value = { status: "UNAVAILABLE", total: 0, open: 0, closed: 0, unavailable: 0 } }
+  finally { refreshing = false }
 }
 
 onMounted(async () => {

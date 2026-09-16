@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/vue"
+import { cleanup, fireEvent, render, screen } from "@testing-library/vue"
 import { createMemoryHistory, createRouter } from "vue-router"
 import { flushPromises } from "@vue/test-utils"
 import { afterEach, expect, it, vi } from "vitest"
@@ -111,4 +111,32 @@ it("does not start polling after unmount while the initial request is pending", 
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
   expect(vi.getTimerCount()).toBe(0)
+})
+
+
+it("reports operation failures and restores exact trade rows on manual refresh", async () => {
+  const operationError = { source: "operations", code: "BROKER_UNAVAILABLE", message: "Не удалось получить операции." }
+  const operations = [
+    { operation_id: "buy-1", operation_type: "BUY", state: "EXECUTED", occurred_at: "2026-08-06T13:59:00Z", quantity: "1", price: { amount: "553.850000000", currency: "RUB" }, payment: { amount: "-553.850000000", currency: "RUB" }, commission: { amount: "0.276925000", currency: "RUB" } },
+    { operation_id: "sell-1", operation_type: "SELL", state: "EXECUTED", occurred_at: "2026-08-06T14:00:00Z", quantity: "2", price: { amount: "554.150000000", currency: "RUB" }, payment: { amount: "1108.300000000", currency: "RUB" }, commission: { amount: "0.554150000", currency: "RUB" } },
+  ]
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ ...details, errors: [operationError] }))
+    .mockResolvedValueOnce(Response.json({ ...details, operations, errors: [operationError] }))
+    .mockResolvedValueOnce(Response.json({ ...details, operations }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+
+  expect(await screen.findByText(operationError.message)).toBeTruthy()
+  expect(screen.queryByText("Исполненных операций пока нет")).toBeNull()
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  expect(await screen.findByRole("row", { name: /BUY EXECUTED 1 553\.850000000 RUB -553\.850000000 RUB 0\.276925000 RUB/ })).toBeTruthy()
+  expect(screen.getByRole("row", { name: /SELL EXECUTED 2 554\.150000000 RUB 1108\.300000000 RUB 0\.554150000 RUB/ })).toBeTruthy()
+  expect(screen.getByText(operationError.message)).toBeTruthy()
+  await flushPromises()
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await flushPromises()
+  expect(screen.queryByText(operationError.message)).toBeNull()
+  expect(screen.getAllByRole("row")).toHaveLength(3)
+  expect(fetchMock.mock.calls).toEqual(Array.from({ length: 3 }, () => ["/api/trading-automations/auto-1/details", undefined]))
 })

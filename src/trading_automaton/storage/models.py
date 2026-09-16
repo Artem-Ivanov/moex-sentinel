@@ -200,6 +200,9 @@ class TradeDecisionModel(Base):
     intent_id: Mapped[str | None] = mapped_column(String(36))
 
 
+TRADE_DECISION_INTENT_INDEX = Index("ix_trade_decisions_intent_id", TradeDecisionModel.intent_id)
+
+
 class TradeLotModel(Base):
     __tablename__ = "trade_lots"
     __table_args__ = (UniqueConstraint("source_intent_id", name="uq_trade_lot_source_intent"),)

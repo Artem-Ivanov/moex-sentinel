@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from sqlalchemy import func, inspect, select
+from sqlalchemy import event, func, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from sentinel_contracts.trading import AutomationState
@@ -346,3 +346,60 @@ def test_retrying_head_blocks_only_same_automation_suffix(factory: sessionmaker[
     rows = repository.ready_fact_outbox(10, now=NOW, deadline_ms=0)
 
     assert [row.event_id for row in rows] == [str(peer_id)]
+
+
+@pytest.mark.parametrize("blocked_sequence", [pytest.param(1, id="head"), pytest.param(2, id="middle")])
+@pytest.mark.parametrize(
+    "retry_offset_ms",
+    [pytest.param(-1, id="before-due"), pytest.param(0, id="exactly-due"), pytest.param(1, id="after-due")],
+)
+def test_small_batch_preserves_retry_prefix_and_peer_progress(factory, blocked_sequence, retry_offset_ms):
+    ids = [UUID(int=400 + index) for index in range(4)]
+    for index in range(3):
+        append_fact(
+            factory, automation_id=AUTOMATION_A, event_id=ids[index], occurred_at=NOW + timedelta(milliseconds=index)
+        )
+    append_fact(factory, automation_id=AUTOMATION_B, event_id=ids[3], occurred_at=NOW + timedelta(milliseconds=3))
+    repository = LocalAutomationRepository(factory)
+    retry_at = NOW + timedelta(seconds=1)
+    repository.schedule_fact_retry((str(ids[blocked_sequence - 1]),), retry_count=1, next_retry_at=retry_at)
+
+    rows = repository.ready_fact_outbox(2, now=retry_at + timedelta(milliseconds=retry_offset_ms), deadline_ms=0)
+
+    expected = ids[:2] if retry_offset_ms >= 0 else (ids[:1] + ids[3:] if blocked_sequence == 2 else ids[3:])
+    assert [row.event_id for row in rows] == [str(value) for value in expected]
+
+
+@pytest.mark.parametrize(
+    "blocked_sequence", [pytest.param(1, id="new-head-retry"), pytest.param(2, id="new-middle-retry")]
+)
+def test_ready_batch_observes_one_snapshot_during_concurrent_retry_commit(factory, blocked_sequence):
+    ids = [UUID(int=500 + index) for index in range(3)]
+    append_fact(factory, automation_id=AUTOMATION_A, event_id=ids[0], occurred_at=NOW)
+    append_fact(factory, automation_id=AUTOMATION_A, event_id=ids[1], occurred_at=NOW + timedelta(milliseconds=1))
+    append_fact(factory, automation_id=AUTOMATION_B, event_id=ids[2], occurred_at=NOW + timedelta(milliseconds=2))
+    repository = LocalAutomationRepository(factory)
+    engine = factory.kw["bind"]
+    committed = False
+
+    def concurrent_retry(_connection, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal committed
+        if committed or not statement.lstrip().upper().startswith("SELECT"):
+            return
+        committed = True
+        # Independent connection commits after the reader's first SELECT, before later reads.
+        repository.schedule_fact_retry(
+            (str(ids[blocked_sequence - 1]),), retry_count=1, next_retry_at=NOW + timedelta(seconds=1)
+        )
+
+    event.listen(engine, "after_cursor_execute", concurrent_retry)
+    try:
+        first = repository.ready_fact_outbox(2, now=NOW, deadline_ms=0)
+    finally:
+        event.remove(engine, "after_cursor_execute", concurrent_retry)
+
+    assert committed is True
+    assert [row.event_id for row in first] == [str(ids[0]), str(ids[1])]
+    next_batch = repository.ready_fact_outbox(2, now=NOW, deadline_ms=0)
+    expected = [ids[2]] if blocked_sequence == 1 else [ids[0], ids[2]]
+    assert [row.event_id for row in next_batch] == [str(value) for value in expected]

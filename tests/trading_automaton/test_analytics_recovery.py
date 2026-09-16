@@ -70,37 +70,84 @@ def test_broker_preparation_retries_follow_odd_seconds_and_reset_after_success(m
 
 
 @pytest.mark.parametrize("retry_limit", [0, 2, 5])
-def test_exhausted_broker_retries_remain_paused_until_restart(monkeypatch, retry_limit):
+def test_exhausted_broker_retries_probe_until_preparation_recovers(monkeypatch, retry_limit):
     async def scenario():
-        service, preparation, _ = runtime(Source(frame()))
+        service, preparation, tick = runtime(Source(frame()))
         service._retry_limit = retry_limit
         calls = 0
         waits = []
+
+        async def temporarily_unavailable(commands, snapshot):
+            nonlocal calls
+            calls += 1
+            if calls <= retry_limit + 2:
+                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+
+        async def skip_delay(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
+            awaitable.close()
+            waits.append(timeout)
+            if tick.calls:
+                service._closed.set()
+            await asyncio.sleep(0)
+            raise TimeoutError
+
+        preparation.prepare = temporarily_unavailable
+        monkeypatch.setattr(asyncio, "wait_for", skip_delay)
+        await service.replace_commands((command(),))
+        task = asyncio.create_task(service.run())
+        try:
+            for _ in range(40):
+                await asyncio.sleep(0)
+            assert calls == retry_limit + 3
+            assert waits == [2 * retry + 1 for retry in range(retry_limit)] + [60, 60, 1]
+            assert len(tick.calls) == 1
+            assert task.done()
+        finally:
+            await service.close()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("retry_limit", [0, 2])
+def test_close_interrupts_exhausted_broker_cooldown(monkeypatch, retry_limit):
+    async def scenario():
+        service, preparation, tick = runtime(Source(frame()))
+        service._retry_limit = retry_limit
+        calls = 0
+        cooldown_entered = asyncio.Event()
 
         async def unavailable(commands, snapshot):
             nonlocal calls
             calls += 1
             raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
 
-        async def skip_delay(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
+        async def wait_without_wall_time(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
+            if timeout == 60:
+                cooldown_entered.set()
+                return await awaitable
             awaitable.close()
-            waits.append(timeout)
             await asyncio.sleep(0)
             raise TimeoutError
 
         preparation.prepare = unavailable
-        monkeypatch.setattr(asyncio, "wait_for", skip_delay)
+        monkeypatch.setattr(asyncio, "wait_for", wait_without_wall_time)
         await service.replace_commands((command(),))
         task = asyncio.create_task(service.run())
         try:
             for _ in range(20):
                 await asyncio.sleep(0)
-            assert calls == retry_limit + 1
-            assert waits == [2 * retry + 1 for retry in range(retry_limit)]
+            assert cooldown_entered.is_set()
             assert not task.done()
             await service.close()
-            await task
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert task.done()
+            assert calls == retry_limit + 1
+            assert not tick.calls
         finally:
+            await service.close()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 

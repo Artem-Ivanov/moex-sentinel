@@ -29,6 +29,8 @@ class AutomationServicePort(Protocol):
 
 
 class PositionOperationsServicePort(Protocol):
+    """Position operations addressed by broker-scoped internal catalog IDs."""
+
     async def view_position_operations(
         self,
         broker_id: str,

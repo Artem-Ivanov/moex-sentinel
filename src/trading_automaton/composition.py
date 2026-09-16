@@ -57,8 +57,7 @@ from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
 )
-from trading_automaton.storage.database import create_worker_engine
-from trading_automaton.storage.models import Base
+from trading_automaton.storage.database import create_worker_engine, initialize_worker_schema
 from trading_automaton.storage.repository import LocalAutomationRepository
 from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
 from trading_automaton.usecases.recover_worker_run import RecoverWorkerRunUsecase
@@ -274,7 +273,7 @@ def build_streaming_runtime(
 
     The caller closes the coordinator, finishes its run marker and closes HTTP."""
     engine = create_worker_engine(settings.database_url)
-    Base.metadata.create_all(engine)
+    initialize_worker_schema(engine)
     repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
     http = httpx.Client(base_url=settings.core_url, timeout=10.0)
     core = CoreClient(http)

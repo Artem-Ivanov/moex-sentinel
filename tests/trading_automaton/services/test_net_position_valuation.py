@@ -20,6 +20,7 @@ from trading_automaton.domain.dtos import (
     TradeDecision,
 )
 from trading_automaton.services.decision_materialization import DecisionMaterializerService
+from trading_automaton.storage.models import LotAllocationModel, TradeLotModel
 from trading_automaton.storage.repository import IntentBatchItem
 
 BUY = "00000000-0000-4000-8000-000000000405"
@@ -133,3 +134,45 @@ def test_terminal_and_next_tick_net_agree_after_buy_partial_sell_and_close(
     assert Decimal(closed["net_pnl"]) == Decimal(closed_net)
     assert Decimal(closed["net_pnl"]) == Decimal(closed["realized_pnl"])
     assert Decimal(asyncio.run(next_tick(closed, "110"))["net_pnl"]) == Decimal(closed_net)
+
+
+def test_finalization_valuation_retains_held_allocation_decimal_precision(worker_repository_factory):
+    repo, factory = worker_repository_factory()
+    realized = Decimal("10") - Decimal("1") / Decimal("3")
+    with factory() as session:
+        lot = TradeLotModel(
+            id="held-lot",
+            automation_id="held-automation",
+            source_intent_id="held-buy",
+            source="EXECUTED",
+            original_lots=3,
+            remaining_lots=2,
+            entry_price=Decimal("100"),
+            entry_commission=Decimal("1"),
+            opened_at=NOW,
+        )
+        allocation = LotAllocationModel(
+            id="held-allocation",
+            automation_id="held-automation",
+            sell_intent_id="held-sell",
+            lot_id=lot.id,
+            quantity_lots=1,
+            exit_price=Decimal("101"),
+            exit_commission=Decimal("0"),
+            realized_pnl=realized,
+            closed_at=NOW,
+        )
+        session.add_all([lot, allocation])
+        session.flush()
+
+        snapshot = repo._authoritative_position_snapshot(
+            session,
+            "held-automation",
+            lot_size=10,
+            mark_price=Decimal("101"),
+        )
+
+        assert allocation.realized_pnl == realized
+        assert Decimal(snapshot["realized_pnl"]) == realized
+        assert Decimal(snapshot["actual_commissions"]) == Decimal("1")
+        assert Decimal(snapshot["net_pnl"]) == realized + Decimal("20") - Decimal("1") * 2 / 3

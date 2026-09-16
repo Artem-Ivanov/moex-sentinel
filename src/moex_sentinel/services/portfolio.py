@@ -28,6 +28,8 @@ AdapterFactory = Callable[[Broker], PortfolioPort]
 
 
 class InstrumentCatalogLookupPort(Protocol):
+    def get(self, user_broker_id: str, instrument_id: str) -> UserBrokerCatalogInstrument: ...
+
     def find_by_external_instrument_id(
         self,
         user_broker_id: str,
@@ -115,13 +117,19 @@ class PortfolioAggregationService:
         instrument_id: str,
         limit: int,
     ) -> BrokerOperationsView:
+        """Resolve a broker-scoped internal catalog ID before reading executed position trades."""
         broker = self._brokers.get(broker_id)
         if not broker.enabled:
             raise ValueError("Подключение брокера отключено.")
         if broker.is_test is not self._active_test():
             raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        if self._instruments is None:
+            raise ValueError("Position operations require an instrument catalog.")
+        instrument = self._instruments.get(broker_id, instrument_id)
         try:
-            page = await self._adapter_factory(broker).get_operations(account_id, None, limit, instrument_id)
+            page = await self._adapter_factory(broker).get_operations(
+                account_id, None, limit, instrument.external_instrument_id
+            )
         except (TInvestAdapterError, ValueError) as error:
             return BrokerOperationsView((), (self._error(broker, account_id, error),))
         items = tuple(
@@ -196,6 +204,7 @@ class PortfolioAggregationService:
 
         items: list[BrokerOperation] = []
         errors: list[BrokerReadError] = []
+        instruments: dict[str, UserBrokerCatalogInstrument | None] = {}
         for account in accounts:
             try:
                 page = await adapter.get_operations(account.account_id, None, limit)
@@ -203,7 +212,7 @@ class PortfolioAggregationService:
                     BrokerOperation(
                         broker.id,
                         broker.display_name,
-                        self._with_ticker(broker.id, item),
+                        self._with_ticker(broker.id, item, instruments),
                     )
                     for item in page.items
                     if item.operation_type not in NON_TRADING_OPERATION_TYPES
@@ -212,10 +221,20 @@ class PortfolioAggregationService:
                 errors.append(self._error(broker, account.account_id, error))
         return tuple(items), tuple(errors)
 
-    def _with_ticker(self, broker_id: str, operation: ExternalOperation) -> ExternalOperation:
+    def _with_ticker(
+        self,
+        broker_id: str,
+        operation: ExternalOperation,
+        instruments: dict[str, UserBrokerCatalogInstrument | None],
+    ) -> ExternalOperation:
+        """Reuse successful and missing lookups only within this broker's operations read."""
         if self._instruments is None or not operation.instrument_id:
             return operation
-        instrument = self._instruments.find_by_external_instrument_id(broker_id, operation.instrument_id)
+        if operation.instrument_id not in instruments:
+            instruments[operation.instrument_id] = self._instruments.find_by_external_instrument_id(
+                broker_id, operation.instrument_id
+            )
+        instrument = instruments[operation.instrument_id]
         if instrument is None:
             return operation
         return operation.model_copy(update={"ticker": instrument.ticker})
