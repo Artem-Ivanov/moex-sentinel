@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -516,3 +517,95 @@ def test_inspects_position_and_recent_operations_after_dispatch_failure() -> Non
     assert operations[0]["operation_id"] == "operation-1"
     assert operations[0]["currency"] == "RUB"
     assert client.operations.request.limit == 20
+
+
+@pytest.mark.parametrize(
+    ("operation", "status", "details", "retryable"),
+    [
+        ("positions", StatusCode.UNKNOWN, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", True),
+        ("cash", StatusCode.UNKNOWN, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", True),
+        ("positions", StatusCode.UNKNOWN, "  Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))\n", True),
+        ("cash", StatusCode.UNKNOWN, "Stream removed", False),
+        ("positions", StatusCode.UNKNOWN, "Stream removed (Unwrap failed (TSI_INTERNAL_ERROR))", False),
+        ("cash", StatusCode.UNKNOWN, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED)): private-token", False),
+        ("cash", StatusCode.UNKNOWN, "prefix Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", False),
+        ("positions", StatusCode.UNKNOWN, "different private-token", False),
+        ("positions", StatusCode.UNAUTHENTICATED, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", False),
+        ("cash", StatusCode.PERMISSION_DENIED, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", False),
+        ("submit", StatusCode.UNKNOWN, "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))", False),
+    ],
+)
+def test_only_snapshot_exact_tls_unwrap_failure_is_retryable(
+    operation, status, details, retryable, caplog, monkeypatch
+):
+    logger = logging.getLogger("trading_automaton.adapters.tinvest_broker_session")
+    monkeypatch.setattr(logger, "disabled", False)
+
+    async def scenario():
+        client = FakeClient()
+        original = AioRequestError(status, details, None)
+        calls = []
+
+        async def fail(**kwargs):
+            calls.append(kwargs)
+            raise original
+
+        client.sandbox.get_sandbox_portfolio = fail
+        client.sandbox.get_sandbox_positions = fail
+        client.orders.post_order = fail
+        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_a, **_k: client)
+        await session.start()
+        try:
+            if operation == "positions":
+                request = session.get_positions("account")
+            elif operation == "cash":
+                request = session.get_free_cash("account", "RUB")
+            else:
+                request = session.dispatch_limit_order(
+                    DispatchRequest("intent", "account", "instrument", OrderSide.BUY, 1, Decimal("100"))
+                )
+            with pytest.raises(TInvestAdapterError) as caught:
+                await request
+            assert caught.value.retryable is retryable
+            assert caught.value.__cause__ is original
+            assert "private-token" not in str(caught.value)
+            assert len(calls) == 1  # Runtime owns retries; adapter must not resubmit here.
+        finally:
+            await session.close()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+    records = [r for r in caplog.records if getattr(r, "reason_code", None) == "BROKER_SDK_REQUEST_FAILED"]
+    assert len(records) == 1
+    assert records[0].data["grpc_status"] == status.name
+    assert records[0].data["retryable"] is retryable
+    assert "private-token" not in str(records[0].__dict__)
+    assert records[0].exc_info is None
+
+
+@pytest.mark.parametrize("operation", ["positions", "cash"])
+def test_snapshot_cancellation_is_not_converted_to_broker_error(operation):
+    async def scenario():
+        client = FakeClient()
+        cancellation = asyncio.CancelledError()
+
+        async def cancelled(**kwargs):
+            raise cancellation
+
+        client.sandbox.get_sandbox_portfolio = cancelled
+        client.sandbox.get_sandbox_positions = cancelled
+        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_a, **_k: client)
+        await session.start()
+        try:
+            request = (
+                session.get_positions("account")
+                if operation == "positions"
+                else session.get_free_cash("account", "RUB")
+            )
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await request
+            assert caught.value is cancellation
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())

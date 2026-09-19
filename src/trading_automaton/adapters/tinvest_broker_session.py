@@ -1,12 +1,14 @@
 """Long-lived T-Invest async client session owned by one broker runtime."""
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from time import monotonic as system_monotonic
-from typing import Any
+from typing import Any, Literal
 
+from grpc import StatusCode
 from t_tech.invest import AioRequestError, AsyncClient
 from t_tech.invest.schemas import (
     CandleInterval,
@@ -24,6 +26,9 @@ from moex_sentinel.domain.market_data import HistoricCandle
 from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
 from sentinel_contracts.time import floor_utc_millisecond
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
+
+LOGGER = logging.getLogger(__name__)
+_TLS_UNWRAP_FAILURE = "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))"
 
 
 def _default_client_factory(token: str, *, target: str) -> AsyncClient:
@@ -104,7 +109,10 @@ class BrokerSdkSession:
             now = self._monotonic()
             if cached is not None and cached[0] > now:
                 return cached[1]
-            response = await self._broker_request(self.services.sandbox.get_sandbox_portfolio(account_id=account_id))
+            response = await self._broker_request(
+                self.services.sandbox.get_sandbox_portfolio(account_id=account_id),
+                snapshot_operation="GetSandboxPortfolio",
+            )
             positions = tuple(
                 BrokerPosition(
                     instrument_id=item.instrument_uid,
@@ -124,7 +132,8 @@ class BrokerSdkSession:
             now = self._monotonic()
             if cached is None or cached[0] <= now:
                 response = await self._broker_request(
-                    self.services.sandbox.get_sandbox_positions(account_id=account_id)
+                    self.services.sandbox.get_sandbox_positions(account_id=account_id),
+                    snapshot_operation="GetSandboxPositions",
                 )
                 values: dict[str, Decimal] = {}
                 for item in response.money:
@@ -224,7 +233,8 @@ class BrokerSdkSession:
             await self.invalidate_account_snapshot(account_id)
 
     @staticmethod
-    def _snapshot_error(error: AioRequestError) -> TInvestAdapterError:
+    def _snapshot_error(error: AioRequestError, *, snapshot_read: bool = False) -> TInvestAdapterError:
+        """Retry the observed TLS unwrap failure only for side-effect-free account reads."""
         status = enum_name(error.code)
         mapping = {
             "UNAUTHENTICATED": ("BROKER_AUTH_FAILED", "Проверка токена не пройдена.", False),
@@ -237,13 +247,35 @@ class BrokerSdkSession:
             status,
             ("BROKER_UNAVAILABLE", "Не удалось получить данные площадки.", False),  # noqa: RUF001
         )
+        if snapshot_read and error.code is StatusCode.UNKNOWN and error.details.strip() == _TLS_UNWRAP_FAILURE:
+            retryable = True
         return TInvestAdapterError(code, message, retryable=retryable)
 
-    async def _broker_request(self, request: Awaitable[Any]) -> Any:
+    async def _broker_request(
+        self,
+        request: Awaitable[Any],
+        *,
+        snapshot_operation: Literal["GetSandboxPortfolio", "GetSandboxPositions"] | None = None,
+    ) -> Any:
+        """Translate SDK failures once; the runtime owns retry delays and recovery probes."""
         try:
             return await request
         except AioRequestError as error:
-            raise self._snapshot_error(error) from error
+            mapped = self._snapshot_error(error, snapshot_read=snapshot_operation is not None)
+            LOGGER.warning(
+                "Broker SDK request failed",
+                extra={
+                    "reason_code": "BROKER_SDK_REQUEST_FAILED",
+                    "data": {
+                        "operation": snapshot_operation or "broker_request",
+                        "grpc_status": error.code.name if isinstance(error.code, StatusCode) else "UNRECOGNIZED",
+                        "code": mapped.code,
+                        "retryable": mapped.retryable,
+                        "tls_unwrap_failure": error.details.strip() == _TLS_UNWRAP_FAILURE,
+                    },
+                },
+            )
+            raise mapped from error
 
     async def inspect_position(self, account_id: str, instrument_id: str) -> dict[str, object] | None:
         positions = await self.get_positions(account_id)

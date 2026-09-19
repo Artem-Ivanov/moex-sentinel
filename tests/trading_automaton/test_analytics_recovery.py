@@ -38,6 +38,8 @@ def test_repeated_analytics_transport_failures_log_transitions_only(caplog, monk
 
 
 def test_broker_preparation_retries_follow_odd_seconds_and_reset_after_success(monkeypatch):
+    monkeypatch.setattr("trading_automaton.runtime.analytics_broker.monotonic", lambda: 0.0, raising=False)
+
     async def scenario():
         service, preparation, _ = runtime(Source(frame()), now=lambda: NOW)
         attempts = 0
@@ -71,6 +73,8 @@ def test_broker_preparation_retries_follow_odd_seconds_and_reset_after_success(m
 
 @pytest.mark.parametrize("retry_limit", [0, 2, 5])
 def test_exhausted_broker_retries_probe_until_preparation_recovers(monkeypatch, retry_limit):
+    monkeypatch.setattr("trading_automaton.runtime.analytics_broker.monotonic", lambda: 0.0, raising=False)
+
     async def scenario():
         service, preparation, tick = runtime(Source(frame()))
         service._retry_limit = retry_limit
@@ -183,3 +187,53 @@ def test_permanent_broker_error_waits_for_restart_without_repeating_calls(caplog
     with caplog.at_level(logging.ERROR):
         asyncio.run(scenario())
     assert any(getattr(r, "reason_code", None) == "BROKER_PREPARATION_BLOCKED" for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "retry_limit", "fails", "expected_delays", "expected_starts"),
+    [
+        (0.4, 5, False, [0.6, 0.6], [0.0, 1.0]),
+        (1.0, 5, False, [0.0, 0.0], [0.0, 1.0]),
+        (1.4, 5, False, [0.0, 0.0], [0.0, 1.4]),
+        (1.4, 2, True, [1.0, 3.0], [0.0, 2.4]),
+        (1.4, 0, True, [60.0, 60.0], [0.0, 61.4]),
+    ],
+)
+def test_success_cadence_accounts_for_work_but_preserves_error_backoff(
+    monkeypatch, elapsed, retry_limit, fails, expected_delays, expected_starts
+):
+    async def scenario():
+        clock = [0.0]
+        starts = []
+        delays = []
+        service, preparation, tick = runtime(Source(frame()))
+        service._retry_limit = retry_limit
+        monkeypatch.setattr("trading_automaton.runtime.analytics_broker.monotonic", lambda: clock[0], raising=False)
+
+        async def prepare(commands, snapshot):
+            starts.append(clock[0])
+            clock[0] += elapsed
+            if fails:
+                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+
+        async def advance_delay(awaitable, *, timeout):  # noqa: ASYNC109 - virtual elapsed time
+            awaitable.close()
+            delays.append(timeout)
+            clock[0] += timeout
+            if len(delays) == 2:
+                service._closed.set()
+            await asyncio.sleep(0)
+            raise TimeoutError
+
+        preparation.prepare = prepare
+        monkeypatch.setattr(asyncio, "wait_for", advance_delay)
+        await service.replace_commands((command(),))
+        try:
+            await service.run()
+            assert starts == pytest.approx(expected_starts)
+            assert delays == pytest.approx(expected_delays)
+            assert len(tick.calls) == (0 if fails else 1)  # Repeated frame remains deduplicated.
+        finally:
+            await service.close()
+
+    asyncio.run(scenario())
