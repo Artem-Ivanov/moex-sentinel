@@ -16,9 +16,10 @@ from trading_automaton.adapters.core_client import CoreClient
 
 
 class TimedIngress:
-    def __init__(self, ingress, profile):
+    def __init__(self, ingress, profile, *, require_all=True):
         self.ingress = ingress
         self.profile = profile
+        self.require_all = require_all
 
     def publish(self, facts):
         self.profile.active_ingress = True
@@ -27,12 +28,13 @@ class TimedIngress:
         try:
             with self.profile.timing("core_ingress_ms"):
                 result = self.ingress.publish(facts)
-            require(not result.failures, "Production Core ingress rejected synthetic facts")
-            require(
-                {item for group in result.results for item in group.accepted_event_ids}
-                == {fact.event_id for fact in facts},
-                "Core did not acknowledge every requested event",
-            )
+            if self.require_all:
+                require(not result.failures, "Production Core ingress rejected synthetic facts")
+                require(
+                    {item for group in result.results for item in group.accepted_event_ids}
+                    == {fact.event_id for fact in facts},
+                    "Core did not acknowledge every requested event",
+                )
             return result
         finally:
             self.profile.add(
@@ -69,10 +71,11 @@ class LoseAcknowledgement:
 
 
 class CoreServer:
-    def __init__(self, ingress, profile):
+    def __init__(self, ingress, profile, *, require_all=True, statuses=None):
         app = FastAPI()
         app.state.usecases = SimpleNamespace(
-            publish_trading_facts=PublishTradingFactsUsecase(TimedIngress(ingress, profile))
+            publish_trading_facts=PublishTradingFactsUsecase(TimedIngress(ingress, profile, require_all=require_all)),
+            view_automation_statuses=statuses,
         )
         app.include_router(router)
         self.app = LoseAcknowledgement(app)

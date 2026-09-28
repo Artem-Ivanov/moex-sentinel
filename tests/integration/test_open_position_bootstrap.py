@@ -57,13 +57,22 @@ CYCLE_ID = UUID("00000000-0000-4000-8000-000000000604")
 LOT_ID = UUID("00000000-0000-4000-8000-000000000605")
 
 
-def bootstrap_context(*, core_state=AutomationState.HOLD, core_revision=1, prepare_worker=True, worker_db_path=None):
-    core_engine = create_engine("sqlite:///:memory:")
-    CoreBase.metadata.create_all(core_engine)
+def bootstrap_context(
+    *, core_state=AutomationState.HOLD, core_revision=1, prepare_worker=True, worker_db_path=None, core_engine=None
+):
+    if core_engine is None:
+        core_engine = create_engine("sqlite:///:memory:")
+        CoreBase.metadata.create_all(core_engine)
     core_factory = sessionmaker(core_engine, expire_on_commit=False)
     with core_factory.begin() as session:
         session.add(user_broker_model(str(SCOPE_ID), "account-1"))
-        session.add(instrument_model(str(INSTRUMENT_ID), str(SCOPE_ID)))
+        session.flush()
+        instrument = instrument_model(str(INSTRUMENT_ID), str(SCOPE_ID))
+        instrument.external_instrument_id = "external-instrument"
+        instrument.ticker = "SYNTH"
+        instrument.name = "Synthetic"
+        session.add(instrument)
+        session.flush()
         session.add(
             TradingAutomationModel(
                 id=str(AUTOMATION_ID),

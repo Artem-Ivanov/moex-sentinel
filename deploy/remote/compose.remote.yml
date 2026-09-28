@@ -1,0 +1,41 @@
+# Use only with compose.yml through compose.sh. Docker Compose >= 2.24.4.
+x-runtime: &runtime
+  stop_grace_period: 90s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  database:
+    <<: *runtime
+    ports: !reset []
+
+  migrations:
+    image: moex-sentinel-migrations:${RELEASE_TAG:?Set a unique release tag}
+
+  backend:
+    <<: *runtime
+    image: moex-sentinel-backend:${RELEASE_TAG:?Set a unique release tag}
+
+  portfolio-snapshot-worker:
+    <<: *runtime
+    image: moex-sentinel-portfolio-snapshot-worker:${RELEASE_TAG:?Set a unique release tag}
+
+  analytics:
+    <<: *runtime
+    image: moex-sentinel-analytics:${RELEASE_TAG:?Set a unique release tag}
+
+  trading-automaton:
+    <<: *runtime
+    image: moex-sentinel-trading-automaton:${RELEASE_TAG:?Set a unique release tag}
+    profiles: [trading]
+    # The SQLite intent/outbox owner must remain a singleton.
+    scale: 1
+
+  frontend:
+    <<: *runtime
+    image: moex-sentinel-frontend:${RELEASE_TAG:?Set a unique release tag}
+    ports: !override
+      - "127.0.0.1:${APP_PORT:-8080}:8080"

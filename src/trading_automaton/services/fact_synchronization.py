@@ -121,14 +121,14 @@ class FactSynchronizationService:
                         )
                     return True
                 if attempt >= self._retry_limit:
-                    self._schedule_rows(rows, now)
+                    self._schedule_rows(rows)
                     return False
             except httpx.TransportError:
                 if attempt >= self._retry_limit:
-                    self._schedule_rows(rows, now)
+                    self._schedule_rows(rows)
                     return False
             else:
-                self._apply_result(result, rows, now)
+                self._apply_result(result, rows)
                 return True
             self._sleep(2**attempt + self._jitter(attempt))
             attempt += 1
@@ -137,7 +137,6 @@ class FactSynchronizationService:
         self,
         result: FactBatchResult,
         rows: list[FactOutboxRecord],
-        now: datetime,
     ) -> None:
         by_event_id = {row.event_id: row for row in rows}
         for acknowledgement in result.results:
@@ -150,7 +149,7 @@ class FactSynchronizationService:
         for failure in result.failures:
             if failure.retryable:
                 failed_rows = [by_event_id[str(event_id)] for event_id in failure.event_ids]
-                self._schedule_rows(failed_rows, now)
+                self._schedule_rows(failed_rows)
             else:
                 non_retryable.append(failure)
         self._reconcile(tuple(dict.fromkeys(failure.automation_id for failure in non_retryable)))
@@ -184,14 +183,14 @@ class FactSynchronizationService:
                 last_sequence_number=status.last_sequence_number,
             )
 
-    def _schedule_rows(self, rows: list[FactOutboxRecord], now: datetime) -> None:
+    def _schedule_rows(self, rows: list[FactOutboxRecord]) -> None:
         if not rows:
             return
         retry_count = max(row.retry_count for row in rows) + 1
         self._repository.schedule_fact_retry(
             tuple(row.event_id for row in rows),
             retry_count=retry_count,
-            next_retry_at=now + timedelta(seconds=min(60, 2 ** min(retry_count - 1, 6))),
+            next_retry_at=self._now() + timedelta(seconds=min(60, 2 ** min(retry_count - 1, 6))),
         )
 
     @staticmethod

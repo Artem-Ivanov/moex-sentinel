@@ -1,14 +1,21 @@
 """Durable Worker schema and queue for unified typed fact delivery."""
 
+import gzip
+import importlib
+import json
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from shutil import copyfileobj
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 from sqlalchemy import event, func, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from develop.benchmarks.fact_outbox_baseline_oracle import select_old_batch
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationStateChangedPayload, FactKind, TradeAuditRecordedPayload
 from tests.contracts.trading_facts_helpers import all_envelopes
@@ -218,6 +225,32 @@ def append_fact(
         )
 
 
+def insert_outbox_rows(factory, rows: list[FactOutboxModel]) -> None:
+    with factory.begin() as session:
+        session.add_all(rows)
+
+
+def outbox_row(event_number: int, automation_id: str, sequence: int, **overrides) -> FactOutboxModel:
+    values = {
+        "event_id": str(UUID(int=event_number)),
+        "user_broker_id": SCOPE_ID,
+        "automation_id": automation_id,
+        "sequence_number": sequence,
+        "expected_revision": 1,
+        "fact_kind": FactKind.TRADE_AUDIT_RECORDED.value,
+        "payload": {"stage": "SYNTHETIC"},
+        "safe_message": "Synthetic audit",
+        "occurred_at": NOW,
+        "created_at": NOW,
+        "updated_at": NOW,
+        "delivery_state": "PENDING",
+        "retry_count": 0,
+        "next_retry_at": None,
+    }
+    values.update(overrides)
+    return FactOutboxModel(**values)
+
+
 def test_ready_queue_uses_global_count_or_deadline(factory: sessionmaker[Session]) -> None:
     append_fact(
         factory,
@@ -403,3 +436,504 @@ def test_ready_batch_observes_one_snapshot_during_concurrent_retry_commit(factor
     next_batch = repository.ready_fact_outbox(2, now=NOW, deadline_ms=0)
     expected = [ids[2]] if blocked_sequence == 1 else [ids[0], ids[2]]
     assert [row.event_id for row in next_batch] == [str(value) for value in expected]
+
+
+@pytest.mark.parametrize(("limit", "expected_count"), [(0, 0), (1, 1), (2, 2), (100, 3)])
+def test_selector_characterizes_limits_on_persisted_sqlite(factory, limit, expected_count):
+    ids = [UUID(int=600 + index) for index in range(3)]
+    insert_outbox_rows(
+        factory,
+        [outbox_row(value.int, AUTOMATION_A, index + 1) for index, value in enumerate(ids)],
+    )
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(limit, now=NOW, deadline_ms=0)
+
+    assert len(rows) == expected_count
+    assert [row.event_id for row in rows] == [str(value) for value in ids[:expected_count]]
+    assert [row.event_id for row in rows] == select_old_batch(factory, limit, now=NOW, deadline_ms=0)
+
+
+def test_selector_characterizes_bootstrap_quartet_and_separate_hold(factory):
+    cycle_id = "00000000-0000-4000-8000-000000000701"
+    lot_id = "00000000-0000-4000-8000-000000000702"
+    quartet_kinds = [
+        FactKind.POSITION_CYCLE_UPDATED.value,
+        FactKind.POSITION_LOT_OPENED.value,
+        FactKind.TRADE_AUDIT_RECORDED.value,
+        FactKind.AUTOMATION_STATE_CHANGED.value,
+    ]
+    payloads = [
+        {"position_cycle_id": cycle_id},
+        {
+            "position_cycle_id": cycle_id,
+            "position_lot_id": lot_id,
+            "source": "BROKER_POSITION_BOOTSTRAP",
+        },
+        {"stage": "BOOTSTRAP_POSITION_ADOPTED"},
+        {"state": "IN_WORK"},
+    ]
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        session.add_all(
+            [
+                outbox_row(710 + index, AUTOMATION_A, index + 1, fact_kind=kind, payload=payload)
+                for index, (kind, payload) in enumerate(zip(quartet_kinds, payloads, strict=True))
+            ]
+            + [
+                outbox_row(
+                    714,
+                    AUTOMATION_A,
+                    5,
+                    fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                    payload={"state": "HOLD"},
+                )
+            ]
+        )
+
+    repository = LocalAutomationRepository(factory)
+    rows = repository.ready_fact_outbox(2, now=NOW, deadline_ms=0)
+
+    assert [row.sequence_number for row in rows] == [1, 2, 3, 4]
+    assert [row.event_id for row in rows] == [str(UUID(int=710 + index)) for index in range(4)]
+    assert [row.event_id for row in rows] == select_old_batch(factory, 2, now=NOW, deadline_ms=0)
+
+    repository.acknowledge_fact_outbox(AUTOMATION_A, accepted_through_sequence=4, current_revision=4)
+    hold = repository.ready_fact_outbox(100, now=NOW, deadline_ms=0)
+    assert [(row.sequence_number, row.payload["state"]) for row in hold] == [(5, "HOLD")]
+
+
+@pytest.mark.parametrize("invalid_part", ["sequence", "payload"])
+def test_selector_does_not_group_invalid_bootstrap_quartet(factory, invalid_part):
+    cycle_id = "00000000-0000-4000-8000-000000000711"
+    lot_id = "00000000-0000-4000-8000-000000000712"
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        for index, kind in enumerate(
+            [
+                FactKind.POSITION_CYCLE_UPDATED.value,
+                FactKind.POSITION_LOT_OPENED.value,
+                FactKind.TRADE_AUDIT_RECORDED.value,
+                FactKind.AUTOMATION_STATE_CHANGED.value,
+            ]
+        ):
+            payload = [
+                {"position_cycle_id": cycle_id},
+                {
+                    "position_cycle_id": cycle_id,
+                    "position_lot_id": lot_id,
+                    "source": "BROKER_POSITION_BOOTSTRAP",
+                },
+                {"stage": "BOOTSTRAP_POSITION_ADOPTED"},
+                {"state": "IN_WORK"},
+            ][index]
+            sequence = index + 1
+            if invalid_part == "sequence" and index >= 2:
+                sequence += 1
+            if invalid_part == "payload" and index == 0:
+                payload = {"position_cycle_id": "wrong-cycle"}
+            session.add(outbox_row(730 + index, AUTOMATION_A, sequence, fact_kind=kind, payload=payload))
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(2, now=NOW, deadline_ms=0)
+
+    assert [row.event_id for row in rows] == [str(UUID(int=730)), str(UUID(int=731))]
+    assert [row.event_id for row in rows] == select_old_batch(factory, 2, now=NOW, deadline_ms=0)
+
+
+def test_selector_allows_quartet_to_extend_limit_by_three(factory):
+    cycle_id = "00000000-0000-4000-8000-000000000721"
+    lot_id = "00000000-0000-4000-8000-000000000722"
+    kinds = [
+        FactKind.POSITION_CYCLE_UPDATED.value,
+        FactKind.POSITION_LOT_OPENED.value,
+        FactKind.TRADE_AUDIT_RECORDED.value,
+        FactKind.AUTOMATION_STATE_CHANGED.value,
+    ]
+    payloads = [
+        {"position_cycle_id": cycle_id},
+        {
+            "position_cycle_id": cycle_id,
+            "position_lot_id": lot_id,
+            "source": "BROKER_POSITION_BOOTSTRAP",
+        },
+        {"stage": "BOOTSTRAP_POSITION_ADOPTED"},
+        {"state": "IN_WORK"},
+    ]
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        session.add_all(
+            [
+                outbox_row(
+                    800 + index,
+                    AUTOMATION_B,
+                    index + 1,
+                    occurred_at=NOW + timedelta(milliseconds=index),
+                )
+                for index in range(99)
+            ]
+            + [
+                outbox_row(
+                    900 + index,
+                    AUTOMATION_A,
+                    index + 1,
+                    fact_kind=kinds[index],
+                    payload=payloads[index],
+                    occurred_at=NOW + timedelta(milliseconds=200),
+                )
+                for index in range(4)
+            ]
+        )
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+
+    assert [row.event_id for row in rows] == [
+        *(str(UUID(int=800 + index)) for index in range(99)),
+        *(str(UUID(int=900 + index)) for index in range(4)),
+    ]
+    assert [row.event_id for row in rows] == select_old_batch(factory, 100, now=NOW, deadline_ms=0)
+
+
+def test_selector_characterizes_delayed_failed_and_blocked_heads(factory):
+    delayed_head = outbox_row(720, AUTOMATION_A, 1, next_retry_at=NOW + timedelta(seconds=1))
+    delayed_suffix = outbox_row(721, AUTOMATION_A, 2)
+    failed_peer = outbox_row(722, AUTOMATION_B, 1, delivery_state="FAILED")
+    ready_peer = outbox_row(723, INSTRUMENT_ID, 1)
+    insert_outbox_rows(factory, [delayed_head, delayed_suffix, failed_peer, ready_peer])
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+
+    assert [row.event_id for row in rows] == [str(UUID(int=723))]
+
+
+def test_failed_fact_is_excluded_without_creating_sequence_gap(factory):
+    failed = outbox_row(724, AUTOMATION_B, 1, delivery_state="FAILED")
+    independent_pending = outbox_row(725, AUTOMATION_A, 1)
+    insert_outbox_rows(factory, [failed, independent_pending])
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+
+    assert [row.event_id for row in rows] == [str(UUID(int=725))]
+
+
+def test_failed_head_blocks_same_automation_suffix(factory):
+    insert_outbox_rows(
+        factory,
+        [
+            outbox_row(726, AUTOMATION_B, 1, delivery_state="FAILED"),
+            outbox_row(727, AUTOMATION_B, 2),
+        ],
+    )
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+
+    assert rows == []
+
+
+@pytest.mark.parametrize("backlog", [100, 10_000, 50_000])
+def test_bootstrap_selector_retains_only_bounded_rows(factory, backlog, record_property):
+    cycle_id = str(UUID(int=9001))
+    lot_id = str(UUID(int=9002))
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        session.add_all(
+            [outbox_row(100_000 + index, AUTOMATION_B, index + 1) for index in range(backlog)]
+            + [
+                outbox_row(
+                    20_000,
+                    AUTOMATION_A,
+                    1,
+                    fact_kind=FactKind.POSITION_CYCLE_UPDATED.value,
+                    payload={"position_cycle_id": cycle_id},
+                ),
+                outbox_row(
+                    20_001,
+                    AUTOMATION_A,
+                    2,
+                    fact_kind=FactKind.POSITION_LOT_OPENED.value,
+                    payload={
+                        "position_cycle_id": cycle_id,
+                        "position_lot_id": lot_id,
+                        "source": "BROKER_POSITION_BOOTSTRAP",
+                    },
+                ),
+                outbox_row(20_002, AUTOMATION_A, 3, payload={"stage": "BOOTSTRAP_POSITION_ADOPTED"}),
+                outbox_row(
+                    20_003,
+                    AUTOMATION_A,
+                    4,
+                    fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                    payload={"state": "IN_WORK"},
+                ),
+            ]
+        )
+
+    retained_peak = 0
+    metadata_peak = 0
+    identity_peak = 0
+    payload_peak = 0
+
+    def trace(frame, event, _arg):
+        nonlocal retained_peak, metadata_peak, identity_peak, payload_peak
+        if event != "line" or not frame.f_code.co_filename.endswith("repository.py"):
+            return trace
+        local = frame.f_locals
+        retained_peak = max((retained_peak, *(len(value) for value in local.values() if isinstance(value, list))))
+        if frame.f_code.co_name == "ready_fact_outbox":
+            metadata_peak = max(
+                metadata_peak,
+                local.get("candidate_rows", 0)
+                + local.get("local_rows", 0)
+                + len(local.get("unit", ()))
+                + len(local.get("selected", ())),
+            )
+        payloads = local.get("payloads")
+        if isinstance(payloads, dict):
+            payload_peak = max(payload_peak, len(payloads))
+        session = local.get("session")
+        if isinstance(session, Session):
+            identity_peak = max(identity_peak, len(session.identity_map))
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        rows = LocalAutomationRepository(factory).ready_fact_outbox(10, now=NOW, deadline_ms=0)
+    finally:
+        sys.settrace(previous)
+
+    assert [row.event_id for row in rows] == [
+        *(str(UUID(int=20_000 + index)) for index in range(4)),
+        *(str(UUID(int=100_000 + index)) for index in range(6)),
+    ]
+    assert retained_peak <= 138  # batch + one 128-row scan window
+    assert metadata_peak <= 30  # two bounded top-k sets and one quartet
+    assert identity_peak <= 13  # batch + a whole quartet
+    assert payload_peak <= 4
+    record_property("retained_list_peak", retained_peak)
+    record_property("metadata_peak_excluding_128_row_driver_window", metadata_peak)
+    record_property("identity_map_peak", identity_peak)
+    record_property("quartet_payload_peak", payload_peak)
+
+
+def test_many_bootstrap_quartets_use_one_metadata_scan(factory):
+    cycle_id = str(UUID(int=30_001))
+    lot_id = str(UUID(int=30_002))
+    kinds = (
+        FactKind.POSITION_CYCLE_UPDATED.value,
+        FactKind.POSITION_LOT_OPENED.value,
+        FactKind.TRADE_AUDIT_RECORDED.value,
+        FactKind.AUTOMATION_STATE_CHANGED.value,
+    )
+    payloads = (
+        {"position_cycle_id": cycle_id},
+        {
+            "position_cycle_id": cycle_id,
+            "position_lot_id": lot_id,
+            "source": "BROKER_POSITION_BOOTSTRAP",
+        },
+        {"stage": "BOOTSTRAP_POSITION_ADOPTED"},
+        {"state": "IN_WORK"},
+    )
+    with factory.begin() as session:
+        for automation_index in range(30):
+            automation_id = str(UUID(int=40_000 + automation_index))
+            cached = cached_automation(automation_id)
+            cached.bootstrap_position_cycle_id = cycle_id
+            cached.bootstrap_position_lot_id = lot_id
+            session.add(cached)
+            base = 50_000 + automation_index * 100
+            session.add_all(
+                [
+                    outbox_row(base + index, automation_id, index + 1, fact_kind=kinds[index], payload=payloads[index])
+                    for index in range(4)
+                ]
+                + [outbox_row(base + 10 + index, automation_id, index + 5) for index in range(12)]
+            )
+
+    scans = 0
+
+    def count_scan(_connection, _cursor, statement, _parameters, _context, _many):
+        nonlocal scans
+        if "ORDER BY fact_outbox.automation_id, fact_outbox.sequence_number" in statement:
+            scans += 1
+
+    engine = factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_scan)
+    try:
+        rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+    finally:
+        event.remove(engine, "before_cursor_execute", count_scan)
+
+    assert scans == 1
+    assert len(rows) == 100
+    assert [row.event_id for row in rows] == select_old_batch(factory, 100, now=NOW, deadline_ms=0)
+    assert all(row.sequence_number <= 4 for row in rows)
+
+
+def test_late_quartet_does_not_evict_earlier_peer_from_candidate_batch(factory):
+    cycle_id = str(UUID(int=71_001))
+    lot_id = str(UUID(int=71_002))
+    peer_automation = str(UUID(int=300))
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        session.add(outbox_row(72_300, peer_automation, 1))
+        session.add_all([outbox_row(72_200 + index, AUTOMATION_A, index + 1) for index in range(8)])
+        session.add_all(
+            [
+                outbox_row(
+                    72_100,
+                    AUTOMATION_A,
+                    9,
+                    fact_kind=FactKind.POSITION_CYCLE_UPDATED.value,
+                    payload={"position_cycle_id": cycle_id},
+                ),
+                outbox_row(
+                    72_101,
+                    AUTOMATION_A,
+                    10,
+                    fact_kind=FactKind.POSITION_LOT_OPENED.value,
+                    payload={
+                        "position_cycle_id": cycle_id,
+                        "position_lot_id": lot_id,
+                        "source": "BROKER_POSITION_BOOTSTRAP",
+                    },
+                ),
+                outbox_row(72_102, AUTOMATION_A, 11, payload={"stage": "BOOTSTRAP_POSITION_ADOPTED"}),
+                outbox_row(
+                    72_103,
+                    AUTOMATION_A,
+                    12,
+                    fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                    payload={"state": "IN_WORK"},
+                ),
+            ]
+        )
+
+    rows = LocalAutomationRepository(factory).ready_fact_outbox(5, now=NOW, deadline_ms=0)
+
+    assert [row.event_id for row in rows] == [
+        *(str(UUID(int=72_100 + index)) for index in range(4)),
+        str(UUID(int=72_300)),
+    ]
+    assert [row.event_id for row in rows] == select_old_batch(factory, 5, now=NOW, deadline_ms=0)
+
+
+def test_large_fully_blocked_bootstrap_queue_uses_one_metadata_scan(factory):
+    cycle_id = str(UUID(int=81_001))
+    lot_id = str(UUID(int=81_002))
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, AUTOMATION_A)
+        cached.bootstrap_position_cycle_id = cycle_id
+        cached.bootstrap_position_lot_id = lot_id
+        session.add_all(
+            [
+                outbox_row(
+                    82_000,
+                    AUTOMATION_A,
+                    1,
+                    fact_kind=FactKind.POSITION_CYCLE_UPDATED.value,
+                    payload={"position_cycle_id": cycle_id},
+                    next_retry_at=NOW + timedelta(days=1),
+                ),
+                outbox_row(
+                    82_001,
+                    AUTOMATION_A,
+                    2,
+                    fact_kind=FactKind.POSITION_LOT_OPENED.value,
+                    payload={
+                        "position_cycle_id": cycle_id,
+                        "position_lot_id": lot_id,
+                        "source": "BROKER_POSITION_BOOTSTRAP",
+                    },
+                ),
+                outbox_row(82_002, AUTOMATION_A, 3, payload={"stage": "BOOTSTRAP_POSITION_ADOPTED"}),
+                outbox_row(
+                    82_003,
+                    AUTOMATION_A,
+                    4,
+                    fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                    payload={"state": "IN_WORK"},
+                ),
+                outbox_row(83_000, AUTOMATION_B, 1, delivery_state="FAILED"),
+                *(outbox_row(100_000 + index, AUTOMATION_B, index + 2) for index in range(50_000)),
+            ]
+        )
+
+    scans = 0
+
+    def count_scan(_connection, _cursor, statement, _parameters, _context, _many):
+        nonlocal scans
+        if "ORDER BY fact_outbox.automation_id, fact_outbox.sequence_number" in statement:
+            scans += 1
+
+    engine = factory.kw["bind"]
+    event.listen(engine, "before_cursor_execute", count_scan)
+    try:
+        rows = LocalAutomationRepository(factory).ready_fact_outbox(100, now=NOW, deadline_ms=0)
+    finally:
+        event.remove(engine, "before_cursor_execute", count_scan)
+
+    assert rows == []
+    assert scans == 1
+
+
+def test_compare_mode_exits_nonzero_when_current_selector_mismatches(factory, tmp_path, monkeypatch):
+    output = tmp_path
+    datasets = output / "datasets"
+    datasets.mkdir()
+    insert_outbox_rows(factory, [outbox_row(728, AUTOMATION_A, 1)])
+    expected = select_old_batch(factory, 1, now=NOW, deadline_ms=0)
+    factory.kw["bind"].dispose()
+    database_path = Path(factory.kw["bind"].url.database)
+    with database_path.open("rb") as source, gzip.open(datasets / "small.sqlite.gz", "wb") as target:
+        copyfileobj(source, target)
+    (output / "selector-baseline-v2.json").write_text(
+        json.dumps(
+            {
+                "scenarios": {
+                    "normal": {
+                        "1": {
+                            "dataset_path": "datasets/small.sqlite.gz",
+                            "oracle_old_selector": {"selected_event_ids_in_order": expected},
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "develop" / "benchmarks"))
+    benchmark = importlib.import_module("benchmark_fact_outbox_selector")
+
+    with pytest.raises(SystemExit, match="current selector differs from old oracle"):
+        benchmark.compare_baseline(
+            SimpleNamespace(output=output, sizes=[1], repeats=1),
+            selector=lambda *_args, **_kwargs: [],
+        )
+
+    comparison = json.loads((output / "selector-comparison-v2.json").read_text(encoding="utf-8"))
+    assert comparison["scenarios"]["normal"]["1"]["current_ids_match_old_oracle"] is False
+
+
+def test_selector_characterizes_equal_timestamp_id_order_and_deadline_boundary(factory):
+    ids = [UUID(int=732), UUID(int=731)]
+    insert_outbox_rows(
+        factory,
+        [outbox_row(value.int, AUTOMATION_A, index + 1) for index, value in enumerate(ids)],
+    )
+    repository = LocalAutomationRepository(factory)
+
+    before = repository.ready_fact_outbox(3, now=NOW + timedelta(milliseconds=99), deadline_ms=100)
+    at_boundary = repository.ready_fact_outbox(3, now=NOW + timedelta(milliseconds=100), deadline_ms=100)
+
+    assert before == []
+    assert [row.event_id for row in at_boundary] == [str(UUID(int=731)), str(UUID(int=732))]

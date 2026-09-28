@@ -1,14 +1,16 @@
 """Short worker-local transactions for cache, outbox and recovery markers."""
 
+from bisect import insort
+from collections import deque
 from datetime import datetime, timedelta
 from decimal import Decimal
-from itertools import groupby
 from sqlite3 import Connection as SQLiteConnection
 from threading import Lock
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
+from sqlalchemy.engine import Row
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -1195,42 +1197,67 @@ class LocalAutomationRepository:
             )
             if pending_bootstrap_state is None:
                 return self._ready_single_facts(session, limit, now=now, deadline_ms=deadline_ms)
-            # Any potential bootstrap keeps the established atomic-group selection.
-            pending = session.scalars(
-                select(FactOutboxModel)
-                .where(FactOutboxModel.delivery_state == "PENDING")
-                .order_by(FactOutboxModel.automation_id, FactOutboxModel.sequence_number)
-            ).all()
-            eligible: list[list[FactOutboxModel]] = []
-            blocked_automations: set[str] = set()
-            for unit in self._fact_publication_units(session, pending):
-                automation_id = unit[0].automation_id
-                if automation_id in blocked_automations:
+            count = 0
+            oldest = None
+            candidates = []
+            candidate_rows = 0
+            local_candidates = []
+            local_rows = 0
+            automation_id = None
+            bootstrap_key = None
+
+            def merge_automation():
+                nonlocal candidate_rows, local_rows
+                for item in local_candidates:
+                    insort(candidates, item)
+                    candidate_rows += len(item[1])
+                    if candidate_rows > limit + 3:
+                        candidate_rows -= len(candidates.pop()[1])
+                local_candidates.clear()
+                local_rows = 0
+
+            for unit in self._fact_publication_units(session, now=now):
+                count += len(unit)
+                for row in unit:
+                    if oldest is None or row.created_at < oldest:
+                        oldest = row.created_at
+                key = (unit[0].occurred_at, unit[0].event_id)
+                if unit[0].automation_id != automation_id:
+                    merge_automation()
+                    automation_id = unit[0].automation_id
+                    bootstrap_key = None
+                if len(unit) == 4 and (bootstrap_key is None or key < bootstrap_key):
+                    bootstrap_key = key
+                    # A later-key unit cannot be selected if this quartet is
+                    # selected; if it is not, the batch fills before that unit.
+                    for index in range(len(local_candidates) - 1, -1, -1):
+                        candidate_key, candidate_unit = local_candidates[index]
+                        if candidate_key > key:
+                            local_rows -= len(candidate_unit)
+                            local_candidates.pop(index)
+                if bootstrap_key is not None and key > bootstrap_key:
                     continue
-                if any(row.next_retry_at is not None and row.next_retry_at > now for row in unit):
-                    blocked_automations.add(automation_id)
-                    continue
-                eligible.append(unit)
-            count = sum(len(unit) for unit in eligible)
-            oldest = min((row.created_at for unit in eligible for row in unit), default=None)
+                insort(local_candidates, (key, unit))
+                local_rows += len(unit)
+                if local_rows > limit + 3:
+                    local_rows -= len(local_candidates.pop()[1])
+            merge_automation()
             due_by_deadline = oldest is not None and now >= oldest + timedelta(milliseconds=deadline_ms)
             if count < limit and not due_by_deadline:
                 return []
-            rows: list[FactOutboxModel] = []
-            selected_bootstraps: set[str] = set()
-            for unit in sorted(eligible, key=lambda unit: (unit[0].occurred_at, unit[0].event_id)):
-                automation_id = unit[0].automation_id
-                if automation_id in selected_bootstraps:
-                    continue
-                rows.extend(unit)
-                if len(unit) == 4:
-                    # Bootstrap activation must remain the final fact in its
-                    # first Core transaction. Deliver any later HOLD separately.
-                    selected_bootstraps.add(automation_id)
-                if len(rows) >= limit:
+            selected = []
+            for _, unit in candidates:
+                selected.extend(unit)
+                if len(selected) >= limit:
                     break
-            rows.sort(key=lambda row: (row.occurred_at, row.event_id))
-            return [self._fact_outbox_record(row) for row in rows]
+            selected.sort(key=lambda row: (row.occurred_at, row.event_id))
+            models = {
+                model.event_id: model
+                for model in session.scalars(
+                    select(FactOutboxModel).where(FactOutboxModel.event_id.in_([row.event_id for row in selected]))
+                )
+            }
+            return [self._fact_outbox_record(models[row.event_id]) for row in selected]
 
     def _ready_single_facts(
         self, session: Session, limit: int, *, now: datetime, deadline_ms: int
@@ -1241,7 +1268,12 @@ class LocalAutomationRepository:
                 FactOutboxModel.automation_id,
                 func.min(FactOutboxModel.sequence_number).label("sequence_number"),
             )
-            .where(FactOutboxModel.delivery_state == "PENDING", FactOutboxModel.next_retry_at > now)
+            .where(
+                or_(
+                    FactOutboxModel.delivery_state == "FAILED",
+                    and_(FactOutboxModel.delivery_state == "PENDING", FactOutboxModel.next_retry_at > now),
+                )
+            )
             .group_by(FactOutboxModel.automation_id)
             .subquery()
         )
@@ -1263,47 +1295,100 @@ class LocalAutomationRepository:
         return [self._fact_outbox_record(row) for row in rows]
 
     @staticmethod
-    def _fact_publication_units(session: Session, pending: list[FactOutboxModel]) -> list[list[FactOutboxModel]]:
-        """Keep the initial bootstrap quartet together without expanding runtime backlog."""
-        units: list[list[FactOutboxModel]] = []
-        bootstraps = {
-            cached.automation_id: cached
-            for cached in session.scalars(
-                select(CachedAutomationModel).where(CachedAutomationModel.bootstrap_position_cycle_id.is_not(None))
+    def _fact_publication_units(session: Session, *, now: datetime):
+        """Stream eligible units with four-row lookahead and no ORM backlog."""
+        fact = FactOutboxModel
+        cached = CachedAutomationModel
+        statement = (
+            select(
+                fact.event_id,
+                fact.automation_id,
+                fact.sequence_number,
+                fact.fact_kind,
+                fact.occurred_at,
+                fact.created_at,
+                fact.next_retry_at,
+                fact.delivery_state,
+                cached.bootstrap_position_cycle_id,
+                cached.bootstrap_position_lot_id,
             )
-        }
-        for automation_id, group in groupby(pending, key=lambda row: row.automation_id):
-            rows = list(group)
-            cached = bootstraps.get(automation_id)
-            index = 0
-            while index < len(rows):
-                quartet = rows[index : index + 4]
-                if (
-                    cached is not None
-                    and cached.bootstrap_position_cycle_id is not None
-                    and len(quartet) == 4
-                    and [row.fact_kind for row in quartet]
-                    == [
-                        FactKind.POSITION_CYCLE_UPDATED.value,
-                        FactKind.POSITION_LOT_OPENED.value,
-                        FactKind.TRADE_AUDIT_RECORDED.value,
-                        FactKind.AUTOMATION_STATE_CHANGED.value,
-                    ]
-                    and [row.sequence_number for row in quartet]
-                    == list(range(quartet[0].sequence_number, quartet[0].sequence_number + 4))
-                    and quartet[0].payload["position_cycle_id"] == cached.bootstrap_position_cycle_id
-                    and quartet[1].payload["position_cycle_id"] == cached.bootstrap_position_cycle_id
-                    and quartet[1].payload["position_lot_id"] == cached.bootstrap_position_lot_id
-                    and quartet[1].payload["source"] == PositionLotSource.BROKER_POSITION_BOOTSTRAP.value
-                    and quartet[2].payload["stage"] == "BOOTSTRAP_POSITION_ADOPTED"
-                    and quartet[3].payload["state"] == AutomationState.IN_WORK.value
-                ):
-                    units.append(quartet)
-                    index += 4
+            .outerjoin(cached, cached.automation_id == fact.automation_id)
+            .where(fact.delivery_state.in_(("PENDING", "FAILED")))
+            .order_by(fact.automation_id, fact.sequence_number)
+        )
+        pending = deque()
+        automation_id = None
+        blocked = False
+
+        def drain(complete: bool):
+            nonlocal blocked
+            while pending and (complete or len(pending) >= 4):
+                quartet = tuple(pending) if len(pending) >= 4 else ()
+                if quartet and LocalAutomationRepository._is_bootstrap_quartet(session, quartet):
+                    unit = quartet
+                    pending.clear()
                 else:
-                    units.append([rows[index]])
-                    index += 1
-        return units
+                    unit = (pending.popleft(),)
+                if any(row.next_retry_at is not None and row.next_retry_at > now for row in unit):
+                    blocked = True
+                    pending.clear()
+                    return
+                yield unit
+
+        result = session.execute(statement).yield_per(128)
+        try:
+            for row in result:
+                if row.automation_id != automation_id:
+                    yield from drain(True)
+                    pending.clear()
+                    automation_id = row.automation_id
+                    blocked = False
+                if blocked:
+                    continue
+                if row.delivery_state == "FAILED":
+                    yield from drain(True)
+                    pending.clear()
+                    blocked = True
+                    continue
+                pending.append(row)
+                yield from drain(False)
+            yield from drain(True)
+        finally:
+            result.close()
+
+    @staticmethod
+    def _is_bootstrap_quartet(session: Session, quartet: tuple[Row, ...]) -> bool:
+        first = quartet[0]
+        if (
+            first.bootstrap_position_cycle_id is None
+            or tuple(row.fact_kind for row in quartet)
+            != (
+                FactKind.POSITION_CYCLE_UPDATED.value,
+                FactKind.POSITION_LOT_OPENED.value,
+                FactKind.TRADE_AUDIT_RECORDED.value,
+                FactKind.AUTOMATION_STATE_CHANGED.value,
+            )
+            or tuple(row.sequence_number for row in quartet)
+            != tuple(range(first.sequence_number, first.sequence_number + 4))
+        ):
+            return False
+        payloads = dict(
+            iter(
+                session.execute(
+                    select(FactOutboxModel.event_id, FactOutboxModel.payload).where(
+                        FactOutboxModel.event_id.in_(row.event_id for row in quartet)
+                    )
+                )
+            )
+        )
+        return (
+            payloads[quartet[0].event_id]["position_cycle_id"] == first.bootstrap_position_cycle_id
+            and payloads[quartet[1].event_id]["position_cycle_id"] == first.bootstrap_position_cycle_id
+            and payloads[quartet[1].event_id]["position_lot_id"] == first.bootstrap_position_lot_id
+            and payloads[quartet[1].event_id]["source"] == PositionLotSource.BROKER_POSITION_BOOTSTRAP.value
+            and payloads[quartet[2].event_id]["stage"] == "BOOTSTRAP_POSITION_ADOPTED"
+            and payloads[quartet[3].event_id]["state"] == AutomationState.IN_WORK.value
+        )
 
     def has_pending_fact_outbox(self, automation_id: str) -> bool:
         with self._factory() as session:

@@ -73,7 +73,7 @@ class RepositoryStub:
         return True
 
     def ready_fact_outbox(self, limit: int, *, now: datetime, deadline_ms: int) -> list[FactOutboxRecord]:
-        return self.rows[:limit]
+        return [row for row in self.rows if row.next_retry_at is None or row.next_retry_at <= now][:limit]
 
     def acknowledge_fact_outbox(
         self,
@@ -83,6 +83,11 @@ class RepositoryStub:
         current_revision: int,
     ) -> None:
         self.acknowledged.append((automation_id, accepted_through_sequence, current_revision))
+        self.rows = [
+            row
+            for row in self.rows
+            if row.automation_id != automation_id or row.sequence_number > accepted_through_sequence
+        ]
 
     def schedule_fact_retry(
         self,
@@ -92,6 +97,14 @@ class RepositoryStub:
         next_retry_at: datetime,
     ) -> None:
         self.retries.append((event_ids, retry_count, next_retry_at))
+        self.rows = [
+            (
+                row.model_copy(update={"retry_count": retry_count, "next_retry_at": next_retry_at})
+                if row.event_id in event_ids
+                else row
+            )
+            for row in self.rows
+        ]
 
     def reject_fact_outbox(self, automation_id: str, event_ids: tuple[str, ...], *, reason: str) -> None:
         self.rejected.append((automation_id, event_ids, reason))
@@ -247,3 +260,89 @@ def test_retries_byte_equivalent_batch_on_transport_failure() -> None:
     assert client.published[0] == client.published[1]
     assert client.published[0][0] is client.published[1][0]
     assert delays == [1.0]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("offline"),
+        httpx.HTTPStatusError(
+            "service unavailable",
+            request=httpx.Request("POST", "https://core.test/facts"),
+            response=httpx.Response(503),
+        ),
+    ],
+    ids=["transport", "http-503"],
+)
+def test_durable_retry_starts_after_internal_attempts_and_blocks_until_due(failure: Exception) -> None:
+    pending = row().model_copy(update={"retry_count": 2})
+    clock = [NOW]
+    repository = RepositoryStub([pending])
+    client = ClientStub(failure, failure, FactBatchResult(results=()))
+
+    def slow_sleep(delay: float) -> None:
+        assert delay == 1.0
+        clock[0] += timedelta(seconds=30)
+
+    service = FactSynchronizationService(
+        repository, client, now=lambda: clock[0], sleep=slow_sleep, retry_limit=1, deadline_ms=0
+    )
+
+    assert service.flush_outbox() is False
+    due = NOW + timedelta(seconds=34)
+    assert repository.retries == [((pending.event_id,), 3, due)]
+    assert [batch[0].model_dump_json() for batch in client.published] == [client.published[0][0].model_dump_json()] * 2
+    clock[0] = due - timedelta(microseconds=1)
+    assert service.flush_outbox() is True
+    assert len(client.published) == 2
+    clock[0] = due
+    assert service.flush_outbox() is True
+    assert len(client.published) == 3
+    assert client.published[2][0].model_dump_json() == client.published[0][0].model_dump_json()
+
+
+def test_retryable_group_response_starts_retry_from_response_time_with_selective_ack() -> None:
+    accepted = row(0)
+    failed = row(1).model_copy(update={"automation_id": str(UUID(int=702))})
+    result = FactBatchResult(
+        results=(
+            FactGroupAcknowledgement(
+                automation_id=UUID(accepted.automation_id),
+                accepted_through_sequence=accepted.sequence_number,
+                current_revision=2,
+                accepted_event_ids=(UUID(accepted.event_id),),
+            ),
+        ),
+        failures=(
+            FactGroupFailure(
+                automation_id=UUID(failed.automation_id),
+                code=FactIngressErrorCode.TEMPORARY_CORE_FAILURE,
+                event_ids=(UUID(failed.event_id),),
+                sequence_numbers=(failed.sequence_number,),
+                retryable=True,
+            ),
+        ),
+    )
+    clock = [NOW]
+
+    class SlowClient(ClientStub):
+        def publish_facts(self, facts: list[FactEnvelope]) -> FactBatchResult:
+            clock[0] += timedelta(seconds=30)
+            return super().publish_facts(facts)
+
+    repository = RepositoryStub([accepted, failed])
+    client = SlowClient(result, FactBatchResult(results=()))
+    service = FactSynchronizationService(repository, client, now=lambda: clock[0], sleep=lambda _: None, deadline_ms=0)
+
+    assert service.flush_outbox() is True
+    due = NOW + timedelta(seconds=31)
+    assert repository.acknowledged == [(accepted.automation_id, accepted.sequence_number, 2)]
+    assert repository.retries == [((failed.event_id,), 1, due)]
+    assert [row.event_id for row in repository.rows] == [failed.event_id]
+    clock[0] = due - timedelta(microseconds=1)
+    assert service.flush_outbox() is True
+    assert len(client.published) == 1
+    clock[0] = due
+    assert service.flush_outbox() is True
+    assert len(client.published) == 2
+    assert client.published[1][0].model_dump_json() == client.published[0][1].model_dump_json()

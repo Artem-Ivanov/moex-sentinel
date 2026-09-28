@@ -30,6 +30,9 @@ class MarketRecoveryPolicy:
         self.sleep = sleep
 
     def delay(self, failures: int) -> float:
+        # Transient outages outlive the short retry budget; keep probing slowly.
+        if failures > self.retry_limit:
+            return 60.0
         return self.retry_seconds * (2 * failures - 1)
 
 

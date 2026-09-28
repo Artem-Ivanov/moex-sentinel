@@ -169,10 +169,9 @@ class _SourceRuntime:
             self.failures += 1
             if self.failures > self.recovery.retry_limit:
                 LOGGER.warning(
-                    "Market source retries exhausted",
-                    extra={"data": {"code": "RETRY_EXHAUSTED", "retries": self.recovery.retry_limit}},
+                    "Market source short retries exhausted; cooldown scheduled",
+                    extra={"data": {"code": "RETRY_COOLDOWN", "retries": self.recovery.retry_limit}},
                 )
-                return
             delay = self.recovery.delay(self.failures)
             LOGGER.info(
                 "Market source retry",
@@ -293,7 +292,7 @@ class _SourceRuntime:
                     # fresh quotes must remain usable for position protection.
                     data = _failure_data(error)
                     count = self.history_failures[instrument_id] = self.history_failures.get(instrument_id, 0) + 1
-                    if PERMANENT_STATUSES.intersection(data["grpc_statuses"]) or count > self.recovery.retry_limit:
+                    if PERMANENT_STATUSES.intersection(data["grpc_statuses"]):
                         self.history_blocked.add(instrument_id)
                         due.pop(instrument_id, None)
                         self.history_retry_due.pop(instrument_id, None)

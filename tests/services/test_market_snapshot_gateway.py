@@ -469,36 +469,98 @@ def test_repeated_failures_use_requested_intervals_without_parallel_connections(
 
 
 @pytest.mark.parametrize("limit", [0, 2, 5])
-def test_retry_limit_counts_retries_after_initial_attempt_and_polling_cannot_restart_it(limit):
+def test_transient_outage_recovers_after_budget_and_polling_cannot_bypass_cooldown(limit):
+    class FailedSource(Source):
+        broken = True
+
+        async def start(self):
+            assert self.starts == self.closes
+            await super().start()
+            if self.broken:
+                raise ConnectionError("synthetic")
+
+    async def run():
+        delays = []
+        cooldown = asyncio.Event()
+        release = asyncio.Event()
+
+        async def sleep(delay):
+            delays.append(delay)
+            if delay == 60:
+                cooldown.set()
+                await release.wait()
+                release.clear()
+            await asyncio.sleep(0)
+
+        source = FailedSource()
+        gateway = MarketSnapshotGateway(
+            lambda _: source, now=lambda: NOW, recovery=MarketRecoveryPolicy(retry_limit=limit, sleep=sleep)
+        )
+        request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
+        try:
+            await gateway.snapshot(request)
+            await asyncio.wait_for(cooldown.wait(), 0.2)
+            for _ in range(3):
+                assert not (await gateway.snapshot(request)).instruments[0].available
+                await settle()
+            assert source.starts == source.closes == limit + 1
+            assert delays == [*[1, 3, 5, 7, 9][:limit], 60]
+            cooldown.clear()
+            release.set()
+            await asyncio.wait_for(cooldown.wait(), 0.2)
+            assert source.starts == source.closes == limit + 2
+            assert delays[-2:] == [60, 60]
+            source.broken = False
+            release.set()
+            await ready(source)
+            assert (await gateway.snapshot(request)).instruments[0].available
+            assert source.starts == limit + 3
+        finally:
+            await gateway.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("action", ["shutdown", "rotation"])
+def test_cooldown_can_be_cancelled_without_restarting_old_source(action):
     class FailedSource(Source):
         async def start(self):
             await super().start()
             raise ConnectionError("synthetic")
 
     async def run():
-        delays = []
+        cooldown = asyncio.Event()
+        cancelled = asyncio.Event()
 
         async def sleep(delay):
-            delays.append(delay)
-            await asyncio.sleep(0)
+            assert delay == 60
+            cooldown.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
 
-        source = FailedSource()
+        source, replacement = FailedSource(), Source()
+        configuration = ["original"]
         gateway = MarketSnapshotGateway(
-            lambda _: source,
+            lambda item: source if item == "original" else replacement,
+            configuration_resolver=lambda _: configuration[0],
             now=lambda: NOW,
-            recovery=MarketRecoveryPolicy(retry_limit=limit, sleep=sleep),
+            recovery=MarketRecoveryPolicy(retry_limit=0, sleep=sleep),
         )
         request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
         try:
             await gateway.snapshot(request)
-            async with asyncio.timeout(0.2):
-                while source.closes < limit + 1:  # noqa: ASYNC110 - bounded observation of the source
-                    await asyncio.sleep(0.001)
-            for _ in range(3):
-                assert not (await gateway.snapshot(request)).instruments[0].available
-                await settle()
-            assert source.starts == limit + 1
-            assert delays == [1, 3, 5, 7, 9][:limit]
+            await asyncio.wait_for(cooldown.wait(), 0.2)
+            if action == "rotation":
+                configuration[0] = "replacement"
+                await gateway.snapshot(request)
+                await ready(replacement)
+                assert (await gateway.snapshot(request)).instruments[0].available
+            else:
+                await asyncio.wait_for(gateway.close(), 0.2)
+            assert cancelled.is_set()
+            assert source.starts == source.closes == 1
         finally:
             await gateway.close()
 
@@ -551,7 +613,12 @@ def test_incomplete_or_untradeable_market_cannot_reset_retry_budget(defect):
     async def run():
         source = Source()
 
-        async def sleep(_):
+        delays = []
+
+        async def sleep(delay):
+            delays.append(delay)
+            if delay == 60:
+                await asyncio.Event().wait()
             await asyncio.sleep(0)
 
         gateway = MarketSnapshotGateway(
@@ -586,17 +653,22 @@ def test_incomplete_or_untradeable_market_cannot_reset_retry_budget(defect):
                 await source.queue.put(ConnectionError("synthetic"))
                 await settle()
             assert source.starts == 3
+            assert delays == [1, 3, 60]
         finally:
             await gateway.close()
 
     asyncio.run(run())
 
 
-def test_history_transient_failure_stops_after_configured_retries():
+def test_history_transient_failure_recovers_after_cooldown():
     class FailedHistorySource(Source):
+        broken = True
+
         async def get_candles(self, instrument_id, start, end):
-            self.history_calls.append(instrument_id)
-            raise ConnectionError("synthetic")
+            if self.broken:
+                self.history_calls.append(instrument_id)
+                raise ConnectionError("synthetic")
+            return await super().get_candles(instrument_id, start, end)
 
     async def run():
         source = FailedHistorySource()
@@ -614,6 +686,20 @@ def test_history_transient_failure_stops_after_configured_retries():
             assert source.history_calls == ["AAA"] * 3
             assert source.starts == 1
             assert not (await gateway.snapshot(request)).instruments[0].available
+            source.broken = False
+            clock[0] += timedelta(seconds=60)
+            await source.queue.put(
+                StreamOrderBook(
+                    "AAA", (OrderBookLevel(Decimal("10"), 1),), (OrderBookLevel(Decimal("11"), 1),), clock[0], True
+                )
+            )
+            await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, True, clock[0]))
+            # Advance virtual time; adding an instrument wakes the existing history owner.
+            await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB")))
+            await settle()
+            assert (await gateway.snapshot(request)).instruments[0].available
+            assert source.history_calls.count("AAA") == 4
+            assert source.starts == 1
         finally:
             await gateway.close()
 
@@ -622,8 +708,10 @@ def test_history_transient_failure_stops_after_configured_retries():
 
 def test_history_retry_budget_survives_stream_reconnects_with_a_healthy_peer():
     class FailedHistorySource(Source):
+        broken = True
+
         async def get_candles(self, instrument_id, start, end):
-            if instrument_id == "AAA":
+            if instrument_id == "AAA" and self.broken:
                 self.history_calls.append(instrument_id)
                 raise ConnectionError("synthetic")
             return await super().get_candles(instrument_id, start, end)
@@ -652,6 +740,25 @@ def test_history_retry_budget_survives_stream_reconnects_with_a_healthy_peer():
                 await source.queue.put(ConnectionError("synthetic"))
                 await settle()
             assert source.history_calls.count("AAA") == 3
+            assert source.starts == 5
+            source.broken = False
+            clock[0] += timedelta(seconds=60)
+            for instrument_id in ("AAA", "BBB"):
+                await source.queue.put(
+                    StreamOrderBook(
+                        instrument_id,
+                        (OrderBookLevel(Decimal("10"), 1),),
+                        (OrderBookLevel(Decimal("11"), 1),),
+                        clock[0],
+                        True,
+                    )
+                )
+                await source.queue.put(StreamTradingStatus(instrument_id, "NORMAL_TRADING", True, True, clock[0]))
+            await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB", "CCC")))
+            await settle()
+            snapshot = await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB")))
+            assert all(item.available for item in snapshot.instruments)
+            assert source.history_calls.count("AAA") == 4
             assert source.starts == 5
         finally:
             await gateway.close()
