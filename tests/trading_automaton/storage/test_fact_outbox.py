@@ -777,6 +777,76 @@ def test_many_bootstrap_quartets_use_one_metadata_scan(factory):
     assert all(row.sequence_number <= 4 for row in rows)
 
 
+def test_many_early_quartets_keep_global_candidate_metadata_bounded(factory):
+    cycle_id = str(UUID(int=73_001))
+    lot_id = str(UUID(int=73_002))
+    single_automation = str(UUID(int=74_999))
+    kinds = (
+        FactKind.POSITION_CYCLE_UPDATED.value,
+        FactKind.POSITION_LOT_OPENED.value,
+        FactKind.TRADE_AUDIT_RECORDED.value,
+        FactKind.AUTOMATION_STATE_CHANGED.value,
+    )
+    payloads = (
+        {"position_cycle_id": cycle_id},
+        {"position_cycle_id": cycle_id, "position_lot_id": lot_id, "source": "BROKER_POSITION_BOOTSTRAP"},
+        {"stage": "BOOTSTRAP_POSITION_ADOPTED"},
+        {"state": "IN_WORK"},
+    )
+    with factory.begin() as session:
+        session.add(cached_automation(single_automation))
+        session.add_all(
+            [
+                outbox_row(74_000 + index, single_automation, index + 1, occurred_at=NOW + timedelta(days=1))
+                for index in range(13)
+            ]
+        )
+        for automation_index in range(6):
+            automation_id = str(UUID(int=75_000 + automation_index))
+            cached = cached_automation(automation_id)
+            cached.bootstrap_position_cycle_id = cycle_id
+            cached.bootstrap_position_lot_id = lot_id
+            session.add(cached)
+            session.add_all(
+                [
+                    outbox_row(
+                        76_000 + automation_index * 4 + index,
+                        automation_id,
+                        index + 1,
+                        fact_kind=kinds[index],
+                        payload=payloads[index],
+                    )
+                    for index in range(4)
+                ]
+            )
+
+    metadata_peak = 0
+
+    def trace(frame, event, _arg):
+        nonlocal metadata_peak
+        if event == "line" and frame.f_code.co_name == "ready_fact_outbox":
+            local = frame.f_locals
+            metadata_peak = max(
+                metadata_peak,
+                local.get("candidate_rows", 0)
+                + local.get("local_rows", 0)
+                + len(local.get("unit", ()))
+                + len(local.get("selected", ())),
+            )
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        rows = LocalAutomationRepository(factory).ready_fact_outbox(10, now=NOW + timedelta(days=2), deadline_ms=0)
+    finally:
+        sys.settrace(previous)
+
+    assert [row.event_id for row in rows] == select_old_batch(factory, 10, now=NOW + timedelta(days=2), deadline_ms=0)
+    assert len(rows) == 12
+    assert metadata_peak <= 30
+
+
 def test_late_quartet_does_not_evict_earlier_peer_from_candidate_batch(factory):
     cycle_id = str(UUID(int=71_001))
     lot_id = str(UUID(int=71_002))

@@ -1,40 +1,40 @@
 # Текущая точка продолжения
 
-Обновлено 2026-09-28 (МСК). Перед действиями сверить checkout и состояние
-нужных сервисов: сохранённые проверки не подтверждают текущий runtime.
+Обновлено 2026-09-28 (МСК). Перед действиями сверить checkout и текущий
+runtime: исторические отчёты не подтверждают состояние сервисов сегодня.
 
-## Открытая веха 0.9.8
+## Веха 0.9.8 принята
 
-W1, W2a и W2b выполнены и прошли независимое ревью. V0 и итоговая приёмка
-0.9.8 остаются открытыми. Для V0 поднята отдельная временная PostgreSQL 16
-`moex-sentinel-v0-test-pg` на `127.0.0.1:55433`, без persistent volume;
-перед новым прогоном проверить, что она ещё работает. Рабочий Compose, БД и
-volumes не трогать.
+W1, W2a, W2b и V0 завершены. Сквозные Worker SQLite → HTTP → отдельный Core
+PostgreSQL тесты покрыли bootstrap, selective ACK, retry-before-due, обычную
+доставку и потерю ACK с restart/replay. Backlog 100/10k/50k завершился без
+потерь: 1/10/50 запросов, нулевой outbox, равные конечные sequence/revision.
+На двух seeds old/current selector drain совпал по count, остатку и порядку;
+второй seed — 9/9 persisted пар. Adversarial cap глобальных кандидатов
+исправлен после RED (peak 47 при пределе 30). Суммарный bootstrap metadata
+stream на many-bootstrap 50k — 1 274 970 строк; внутренние чтения SQLite
+не измерялись.
 
-Сквозные Worker SQLite → HTTP → Core PostgreSQL bootstrap, mixed selective ACK
-и retry-before-due прошли профильные тесты; `/root/review_v0` дал PASS после
-исправления существенного замечания. Старые и текущие селекторы на 18 парах
-normal/bootstrap/many-bootstrap 100/10k/50k совпали по count, остатку и
-порядку; `/root/review_drain` дал PASS после исправления методики. Чистый
-полный backend прогон до последних benchmark-тестов: 1326 passed, 17 warnings
-в `develop/reports/0.9.8-v0/pytest-final-postgresql.txt`. Малый сквозной
-backlog 100 фактов прошёл: `http-backlog-100.json`.
+Финальный backend pytest на отдельной PostgreSQL: **1334 passed, 0 skipped,
+17 warnings, exit 0**. Ruff, Black и `git diff --check` прошли.
+Независимые `/root/review_v0`, `/root/review_drain`, `/root/review_pg_backlog`
+и итоговый `/root/review_v0_integration` — PASS после исправления замечаний;
+финальные документы также прошли независимую проверку. Тестовый контейнер
+`moex-sentinel-v0-test-pg` остановлен, он не имел mounts. Рабочие Compose,
+БД и persistent volumes не затрагивались.
 
-**Следующий шаг:** выполнить сквозные backlog 10k/50k на тестовой PostgreSQL,
-проверить метрики и ограничения, получить независимое ревью нового benchmark,
-затем повторить полный backend pytest без PostgreSQL skips, lint и итоговое
-кросс-ревью. После этого решить статус V0 по критериям постановки.
-Подробная методика и сырые результаты — `develop/reports/0.9.8-v0/README.md`.
+Подробности и ограничения — [приёмка 0.9.8](../docs/milestone-0.9.8-outbox-delivery.md)
+и локальный `develop/reports/0.9.8-v0/README.md`; полный лог —
+`develop/reports/0.9.8-v0/pytest-final-v2-postgresql.txt`.
 
-R0 — отдельная открытая проверка свежего runtime после recovery. Снимок 19.09
-не подтверждает текущую торговлю.
+## Следующий шаг
 
-## Где искать подробности
+R0 — отдельная открытая оперативная проверка свежего runtime после recovery.
+Снимок 19.09 не подтверждает текущую торговлю. Перед R0 прочитать относящиеся
+к ней пункты [актуального плана](../docs/phase-1-implementation-plan.md) и
+[границы сервисов](../AGENT_BRIEF.md), затем проверить текущие сервисы
+read-only. Никаких действий по восстановлению торговли без отдельного анализа
+и соответствующего скилла.
 
-- [Очередь и статусы](../docs/phase-1-implementation-plan.md) и
-  [постановка 0.9.8](../docs/milestone-0.9.8-outbox-delivery.md).
-- [Постоянные границы сервисов](../AGENT_BRIEF.md). История сессий — в
-  `develop/WORK_LOG.md`; локальные доказательства — в `develop/reports/`.
-
-Существующие пользовательские изменения в checkout не стадировать и не
-коммитить без отдельной задачи.
+Существующие пользовательские изменения в dirty checkout не стадировать и не
+коммитить без отдельной задачи. История сессий — в `develop/WORK_LOG.md`.

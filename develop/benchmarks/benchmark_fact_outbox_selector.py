@@ -42,7 +42,7 @@ def _event_id(index: int) -> str:
     return str(UUID(int=index + 1))
 
 
-def dataset(path: Path, count: int, *, scenario: str) -> sessionmaker[Session]:
+def dataset(path: Path, count: int, *, scenario: str, seed: int = SEED) -> sessionmaker[Session]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
     engine = create_worker_engine(f"sqlite:///{path}")
@@ -103,10 +103,16 @@ def dataset(path: Path, count: int, *, scenario: str) -> sessionmaker[Session]:
                     sequence_number=sequence,
                     expected_revision=1,
                     fact_kind=kind,
-                    payload=payload or {"stage": "SYNTHETIC", "sample": (event_number * 104_729 + SEED) % 1_000_000},
+                    payload=payload or {"stage": "SYNTHETIC", "sample": (event_number * 104_729 + seed) % 1_000_000},
                     safe_message="Synthetic selector-only row",
                     occurred_at=BASE_TIME
-                    + timedelta(milliseconds=occurred_ms if occurred_ms is not None else sequence),
+                    + timedelta(
+                        milliseconds=(
+                            occurred_ms
+                            if occurred_ms is not None
+                            else sequence if seed == SEED else 1 + (event_number * 982_451_653 + seed) % 100_003
+                        )
+                    ),
                     created_at=BASE_TIME,
                     updated_at=BASE_TIME,
                     delivery_state=state,
@@ -132,8 +138,9 @@ def dataset(path: Path, count: int, *, scenario: str) -> sessionmaker[Session]:
         add_row(2, event_number=used, state="FAILED", occurred_ms=3)
         used += 1
         normal_start = used if scenario == "many-bootstrap" else (4 if scenario == "bootstrap" else 3)
+        seed_offset = 0 if seed == SEED else seed % (automation_count - 3)
         while used < count:
-            automation_index = 3 + ((used - normal_start) % (automation_count - 3))
+            automation_index = 3 + ((used - normal_start + seed_offset) % (automation_count - 3))
             add_row(automation_index, event_number=used)
             used += 1
         session.add_all(rows)

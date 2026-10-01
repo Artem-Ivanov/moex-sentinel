@@ -129,7 +129,7 @@ credentials и persistence рассчитывает market-only batch. Worker и
 | 0.9.5 | [x] Ограниченные повторы и обработка недоступности песочницы; [приёмка](milestone-0.9.5-acceptance-2026-09-09.md). |
 | 0.9.6 | [x] UPDATE RETURNING после CAS в Core; 102/103/106 SQL на WAIT-решение, [приёмка](milestone-0.9.6-acceptance-2026-09-09.md). |
 | 0.9.7 | [x] Один lookup вместо двух; 93/94/97 SQL на WAIT-решение, [приёмка и ограничения latency](milestone-0.9.7-acceptance-2026-09-10.md). |
-| 0.9.8 | [ ] В работе: W1, W2a и W2b выполнены 26.09; V0, сквозная PostgreSQL-проверка, полная backend-регрессия и итоговая приёмка открыты. [Контракт и результаты W2](milestone-0.9.8-outbox-delivery.md); очередь ведётся в актуальном плане. |
+| 0.9.8 | [x] Принята 28.09: W1, W2a, W2b, V0, сквозная PostgreSQL-проверка, полный backend прогон (1334 passed, 0 skipped) и независимое итоговое ревью завершены. [Контракт, результаты и ограничения](milestone-0.9.8-outbox-delivery.md); очередь ведётся в актуальном плане. |
 
 [Доказательства 0.9.3 и ограничения метрик](milestone-0.9.3-acceptance-2026-09-09.md).
 Production SLA, BUY/SELL burst и длительная устойчивость этим benchmark не подтверждены.

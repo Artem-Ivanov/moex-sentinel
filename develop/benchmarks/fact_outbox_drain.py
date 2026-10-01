@@ -22,7 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from develop.benchmarks.benchmark_fact_outbox_selector import BASE_TIME, SEED, current_selector, dataset
 from develop.benchmarks.fact_outbox_baseline_oracle import select_old_batch
 from trading_automaton.storage.database import create_worker_engine
-from trading_automaton.storage.models import FactOutboxModel
+from trading_automaton.storage.models import CachedAutomationModel, FactOutboxModel
 
 
 def _distribution(samples):
@@ -37,7 +37,28 @@ def _distribution(samples):
     }
 
 
-def measure_drain(factory, *, selector, batch_size):
+def _bootstrap_read_rows(factory, selector):
+    """Count rows the bootstrap query returns; the selector exhausts that query."""
+    with factory() as session:
+        bootstrap = session.scalar(
+            select(FactOutboxModel.event_id)
+            .join(CachedAutomationModel, CachedAutomationModel.automation_id == FactOutboxModel.automation_id)
+            .where(
+                FactOutboxModel.delivery_state == "PENDING",
+                FactOutboxModel.fact_kind == "AUTOMATION_STATE_CHANGED",
+                CachedAutomationModel.bootstrap_position_cycle_id.is_not(None),
+            )
+            .limit(1)
+        )
+        if bootstrap is None:
+            return 0
+        states = ("PENDING",) if selector == "old" else ("PENDING", "FAILED")
+        return session.scalar(
+            select(func.count()).select_from(FactOutboxModel).where(FactOutboxModel.delivery_state.in_(states))
+        )
+
+
+def measure_drain(factory, *, selector, batch_size, count_read_rows=False):
     """Select and bulk-remove eligible IDs; no HTTP or Core work is included."""
     if batch_size < 1 or selector not in {"old", "current"}:
         raise ValueError("selector must be old/current and batch_size positive")
@@ -57,11 +78,14 @@ def measure_drain(factory, *, selector, batch_size):
     batches = 0
     digest = hashlib.sha256()
     delivered = 0
+    bootstrap_read_rows = 0
     started_wall = time.perf_counter()
     started_cpu = time.process_time()
     tracemalloc.start()
     try:
         while True:
+            if count_read_rows:
+                bootstrap_read_rows += _bootstrap_read_rows(factory, selector)
             selecting = True
             started = time.perf_counter()
             try:
@@ -104,8 +128,15 @@ def measure_drain(factory, *, selector, batch_size):
         "process_maxrss_unit": "bytes" if platform.system() == "Darwin" else "KiB",
         "selection_sql_statements": selection_sql,
         "all_sql_statements": all_sql,
+        "bootstrap_read_rows": bootstrap_read_rows if count_read_rows else None,
+        "bootstrap_read_kind": (
+            ("old PENDING ORM rows" if selector == "old" else "current PENDING/FAILED metadata stream rows")
+            if count_read_rows
+            else None
+        ),
+        "row_count_probes_in_wall_ms": count_read_rows,
         "scope": "Worker SQLite selector plus bulk deletion of selected IDs; excludes HTTP/Core",
-        "database_rows_scanned": "not measured by SQLite cursor instrumentation",
+        "database_rows_scanned": "SQLite internal scan/page reads not measured",
     }
 
 
@@ -113,12 +144,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--dataset", type=Path, help="Frozen .sqlite.gz baseline")
-    input_group.add_argument(
-        "--many-bootstrap-count", type=int, help="Generate many valid quartets with the fixed seed"
-    )
+    input_group.add_argument("--many-bootstrap-count", type=int, help="Generate many valid quartets")
     parser.add_argument("--selector", choices=("old", "current"), required=True)
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--block-all", action="store_true", help="make every PENDING head retry in the future")
+    parser.add_argument(
+        "--count-read-rows", action="store_true", help="count application bootstrap rows with extra SQL probes"
+    )
     parser.add_argument("--implementation-label", default="unspecified")
     args = parser.parse_args()
     with TemporaryDirectory(prefix="sentinel-outbox-drain-") as folder:
@@ -143,7 +175,9 @@ def main():
                         .where(FactOutboxModel.delivery_state == "PENDING")
                         .values(next_retry_at=BASE_TIME + timedelta(days=4))
                     )
-            result = measure_drain(factory, selector=args.selector, batch_size=args.batch_size)
+            result = measure_drain(
+                factory, selector=args.selector, batch_size=args.batch_size, count_read_rows=args.count_read_rows
+            )
         finally:
             engine.dispose()
     sys.stdout.write(

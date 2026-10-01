@@ -1211,7 +1211,7 @@ class LocalAutomationRepository:
                 for item in local_candidates:
                     insort(candidates, item)
                     candidate_rows += len(item[1])
-                    if candidate_rows > limit + 3:
+                    while candidate_rows > limit + 3:
                         candidate_rows -= len(candidates.pop()[1])
                 local_candidates.clear()
                 local_rows = 0
