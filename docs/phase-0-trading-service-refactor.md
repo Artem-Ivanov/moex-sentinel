@@ -6,8 +6,8 @@
 этапы не требуется. Статусы ниже опираются на датированные приёмки, а не на новый
 запуск тестов или новую проверку работающего Compose.
 
-[Пунктовая сверка прежних требований](milestone-audit-2026-09-09.md) объясняет
-каждое сохранение, уточнение и исключение. [Прежний план](phase-0-trading-service-refactor-archive-2026-09-09.md)
+[Пунктовая сверка прежних требований](milestone-audit.md) объясняет
+каждое сохранение, уточнение и исключение. Прежний план — `phase-0-trading-service-refactor-archive-2026-09-09.md` (необязательный локальный архив)
 сохранён как архив; его команды, shadow-схемы и промежуточные gates не действуют.
 
 ## 0.1. Pydantic-владение и ликвидация `@dataclass` (CRIT)
@@ -19,7 +19,7 @@
 
 Доказательства: [bootstrap DTO](../src/trading_automaton/services/position_bootstrap.py),
 [тесты bootstrap](../tests/trading_automaton/services/test_position_bootstrap_service.py),
-[закрытие остатка 0.1](milestone-0.9.3-acceptance-2026-09-09.md).
+[закрытие остатка 0.1](milestone-0.9.3-acceptance.md).
 
 ## 0.2. Реструктурирование структуры БД и единых фактов (CRIT)
 
@@ -35,7 +35,7 @@ SQLite. UUID, sequence и revision обеспечивают идентичнос
 аудируемыми решениями; подавление всего такого аудита не требуется.
 
 Доказательства: [владельцы таблиц и тесты](data-ownership.md),
-[приёмка 0.2](milestone-0.2-acceptance-2026-09-09.md),
+[приёмка 0.2](milestone-0.2-acceptance.md),
 [ограничения PostgreSQL](../tests/integration/postgresql/test_schema_constraints.py).
 
 ## 0.3. Единый жизненный цикл и границы сервисов (CORE ↔ Worker) (CRIT)
@@ -47,7 +47,7 @@ HOLD/BOOTSTRAPPING в IN_WORK последним фактом атомарной
 
 Доказательства: [политика](../src/sentinel_contracts/automation_lifecycle.py),
 [интеграция двух сервисов](../tests/integration/test_core_worker_lifecycle.py),
-[приёмка 0.3](milestone-0.3-acceptance-2026-09-09.md).
+[приёмка 0.3](milestone-0.3-acceptance.md).
 
 ## 0.4. Отдельный БД-сервис и контейнеризация хранилища (MAJOR)
 
@@ -61,7 +61,7 @@ SQLite URL. Оба persistent volume сохраняются при обновл�
 разрешения. Тесты БД выполняются на отдельном экземпляре.
 
 Доказательства: [Compose](../compose.yml), [проверки Worker SQLite](../tests/trading_automaton/storage/test_worker_database.py),
-[эксплуатация](development.md), [приёмка baseline](milestone-acceptance-2026-09-08.md).
+[эксплуатация](development.md), [приёмка baseline](milestone-acceptance.md).
 
 ## 0.5. Отдельный аналитический сервис (MAJOR)
 
@@ -74,7 +74,7 @@ credentials и persistence рассчитывает market-only batch. Worker и
 Доказательства: [Core gateway](../src/moex_sentinel/services/market_snapshot_gateway.py),
 [Analytics](../src/market_analytics/service.py),
 [сквозной контракт](../tests/integration/test_analytics_worker_contract.py),
-[приёмка 0.5](milestone-0.5-acceptance-2026-09-09.md).
+[приёмка 0.5](milestone-0.5-acceptance.md).
 Непрерывная свежесть всех инструментов не заявлена; обработка отказа выделена в 0.9.5.
 
 ## 0.6. Страница брокеров и управления интеграциями (MAJOR)
@@ -87,7 +87,7 @@ credentials и persistence рассчитывает market-only batch. Worker и
 Доказательства: [UI](../frontend/src/views/BrokersView.vue),
 [API contract клиента](../frontend/src/api/brokers.ts),
 [браузерный smoke](../develop/scripts/check_brokers_ui.mjs),
-[приёмка UI](milestone-0.9.3-acceptance-2026-09-09.md#ui-и-регрессия).
+[приёмка UI](milestone-0.9.3-acceptance.md#ui-и-регрессия).
 Изменяющие сценарии выполнены с mock API; рабочий UI проверен GET/HEAD.
 
 ## 0.7. Единая динамическая стратегия (MAJOR)
@@ -104,7 +104,7 @@ credentials и persistence рассчитывает market-only batch. Worker и
 Доказательства: [идентичность](../src/sentinel_contracts/strategy.py),
 [адаптация](../src/market_analytics/volatility_strategy.py),
 [сквозные тесты](../tests/integration/test_dynamic_strategy_contract.py),
-[приёмка 0.7](milestone-0.7-acceptance-2026-09-09.md).
+[приёмка 0.7](milestone-0.7-acceptance.md).
 
 ## 0.8. Реструктурирование механики принятия решений (CRIT)
 
@@ -116,7 +116,7 @@ credentials и persistence рассчитывает market-only batch. Worker и
 Доказательства: [спецификация стратегии](trading-strategy.md),
 [матрица решений](../tests/trading_automaton/services/test_strategy_selection_matrix.py),
 [execution graph](../tests/integration/test_execution_cycle_core_contract.py),
-[приёмка 0.8](milestone-0.8-acceptance-2026-09-09.md).
+[приёмка 0.8](milestone-0.8-acceptance.md).
 
 ## 0.9. Дополнительные вехи
 
@@ -125,13 +125,13 @@ credentials и persistence рассчитывает market-only batch. Worker и
 | 0.9.1 | Поглощён 0.5: push уже реализован, стакан глубины 20; произвольная глубина не обещана. |
 | 0.9.2 | Условный backlog: только возможная замена Worker SQLite при доказанной необходимости. Core уже PostgreSQL. |
 | 0.9.3 | [x] Изолированный benchmark 6/20/50 с SQLite, WAIT после начальных BUY/FILLED и восстановлением после потери ACK. |
-| 0.9.4 | [x] Профиль доставки на Core PostgreSQL; [измерения и приёмка](milestone-0.9.4-acceptance-2026-09-09.md). |
-| 0.9.5 | [x] Ограниченные повторы и обработка недоступности песочницы; [приёмка](milestone-0.9.5-acceptance-2026-09-09.md). |
-| 0.9.6 | [x] UPDATE RETURNING после CAS в Core; 102/103/106 SQL на WAIT-решение, [приёмка](milestone-0.9.6-acceptance-2026-09-09.md). |
-| 0.9.7 | [x] Один lookup вместо двух; 93/94/97 SQL на WAIT-решение, [приёмка и ограничения latency](milestone-0.9.7-acceptance-2026-09-10.md). |
+| 0.9.4 | [x] Профиль доставки на Core PostgreSQL; [измерения и приёмка](milestone-0.9.4-acceptance.md). |
+| 0.9.5 | [x] Ограниченные повторы и обработка недоступности песочницы; [приёмка](milestone-0.9.5-acceptance.md). |
+| 0.9.6 | [x] UPDATE RETURNING после CAS в Core; 102/103/106 SQL на WAIT-решение, [приёмка](milestone-0.9.6-acceptance.md). |
+| 0.9.7 | [x] Один lookup вместо двух; 93/94/97 SQL на WAIT-решение, [приёмка и ограничения latency](milestone-0.9.7-acceptance.md). |
 | 0.9.8 | [x] Принята 28.09: W1, W2a, W2b, V0, сквозная PostgreSQL-проверка, полный backend прогон (1334 passed, 0 skipped) и независимое итоговое ревью завершены. [Контракт, результаты и ограничения](milestone-0.9.8-outbox-delivery.md); очередь ведётся в актуальном плане. |
 
-[Доказательства 0.9.3 и ограничения метрик](milestone-0.9.3-acceptance-2026-09-09.md).
+[Доказательства 0.9.3 и ограничения метрик](milestone-0.9.3-acceptance.md).
 Production SLA, BUY/SELL burst и длительная устойчивость этим benchmark не подтверждены.
 
 Приоритеты и критерии незавершённых пунктов ведутся только в

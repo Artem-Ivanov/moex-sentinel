@@ -50,3 +50,10 @@
 /scripts/verify_recovery_20260915.py
 /scripts/verify_recovery_deployment.py
 /scripts/verify_remote_compose_20260915.py
+
+# Local continuation, reviews and preserved daily plans/originals.
+/CURRENT.md
+/reviews/
+/market-stream-investigation-2026-09-09.md
+/plans/2026-09-09-postgresql-profile.md
+/plans/2026-09-26-iteration-task-pool.md

@@ -11,18 +11,27 @@ services:
   database:
     <<: *runtime
     ports: !reset []
+    networks:
+      default: {}
+      data:
+        aliases: [sentinel-shared-postgres]
 
   migrations:
+    networks: [default, data]
     image: moex-sentinel-migrations:${RELEASE_TAG:?Set a unique release tag}
 
   backend:
     <<: *runtime
+    networks: [default, data]
     image: moex-sentinel-backend:${RELEASE_TAG:?Set a unique release tag}
     environment:
       AUTH_INSECURE_LOOPBACK: "false"
 
   portfolio-snapshot-worker:
     <<: *runtime
+    networks: [default, data]
+    environment:
+      PORTFOLIO_SNAPSHOT_ALL_ENVIRONMENTS: "true"
     image: moex-sentinel-portfolio-snapshot-worker:${RELEASE_TAG:?Set a unique release tag}
 
   analytics:
@@ -42,3 +51,8 @@ services:
     image: moex-sentinel-frontend:${RELEASE_TAG:?Set a unique release tag}
     ports: !override
       - "127.0.0.1:${APP_PORT:-8080}:8080"
+
+networks:
+  data:
+    external: true
+    name: moex-sentinel-data

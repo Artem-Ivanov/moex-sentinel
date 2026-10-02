@@ -57,9 +57,11 @@ class UserBrokerRepositoryPort:
 
     def create(self, draft: UserBrokerDraft) -> UserBroker: ...
 
-    def replace(self, user_broker_id: str, draft: UserBrokerDraft) -> UserBroker: ...
+    def replace(
+        self, user_broker_id: str, draft: UserBrokerDraft, *, expected_environment: str | None = None
+    ) -> UserBroker: ...
 
-    def disable(self, user_broker_id: str) -> UserBroker: ...
+    def disable(self, user_broker_id: str, *, expected_environment: str | None = None) -> UserBroker: ...
 
 
 class BrokerConfigurationService:
@@ -89,7 +91,9 @@ class BrokerConfigurationService:
             user_draft = self._draft(draft, current)
             if broker_id is None:
                 return self._broker(self._repository.create(user_draft))
-            return self._broker(self._repository.replace(broker_id, user_draft))
+            return self._broker(
+                self._repository.replace(broker_id, user_draft, expected_environment=self._active_environment())
+            )
         except (BrokerRecordDuplicateError, UserBrokerDuplicateError) as error:
             raise DuplicateBrokerError("A broker with this identity already exists.") from error
         except (BrokerRecordNotFoundError, UserBrokerNotFoundError) as error:
@@ -101,7 +105,7 @@ class BrokerConfigurationService:
 
     def delete_settings(self, broker_id: str) -> None:
         try:
-            self._repository.disable(broker_id)
+            self._repository.disable(broker_id, expected_environment=self._active_environment())
         except UserBrokerNotFoundError:
             raise BrokerNotFoundError("Broker was not found.")
 

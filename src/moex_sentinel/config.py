@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     database_max_overflow: int = 10
     database_pool_timeout_seconds: float = 5.0
     sandbox_retry_limit: int = Field(default=5, ge=0)
+    portfolio_snapshot_all_environments: bool = False
     portfolio_snapshot_interval_seconds: int = Field(default=60, ge=60)
     portfolio_snapshot_retry_limit: int = Field(default=3, ge=0)
     portfolio_snapshot_retry_base_seconds: float = Field(default=1.0, gt=0)

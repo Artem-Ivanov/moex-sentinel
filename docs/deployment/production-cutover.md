@@ -13,11 +13,19 @@
 
 Владелец требует одну PostgreSQL/одну database. Первоначальный отдельный PROD
 prototype остановлен, listener8443 отключён, данные/volumes сохранены.
-Этот runbook сейчас **не готов к запуску общей БД**: Compose/env template/
-preflight ещё предполагают отдельную PROD PostgreSQL. До запуска нужно
-исправить их, завершить scope guards/summary/collector и обновить Sandbox
-backend до первой PROD записи. Worker storage отдельно проанализирован в
-[аудите](../audits/2026-10-02-orchestration-and-worker-storage.md); миграция не выбрана.
+В текущем пакете добавлены shared-DB Compose/env/preflight и contour guards;
+код и конфигурация прошли независимые reviews A/B/C и итоговую source integration.
+Полный изолированный backend прогон: **1456 passed, 0 skipped**; frontend
+**119 passed**, typecheck/build exit0. Shared-DB scope guards/collector/Compose
+и dedup проверены. Paired restore fixtures на PG16 — **2 passed, 0 skipped**:
+сохранение journals, lost ACK replay и отсутствие повторной отправки проверены
+на тестовой паре. Восстановление рабочей пары и проверка repair на её данных
+остаются открытыми.
+Это **не operational PASS и не разрешение запуска**. Перед первой PROD записью
+нужно обновить TEST backend с contour guards и единственный collector,
+принять capacity/backup/restore gates и получить явную отмашку владельца.
+Worker storage отдельно проанализирован в
+[аудите](../audits/orchestration-and-worker-storage.md); миграция не выбрана.
 
 ## Изоляция
 
@@ -37,10 +45,19 @@ Sandbox token/account/ledger в PROD не копируются.
 | PostgreSQL volume / database | Существующая общая PostgreSQL | Та же PostgreSQL/database; второй service не запускается |
 | Worker volume | moex-sentinel-remote-automaton-data | moex-sentinel-prod-automaton-data |
 
-Сети создаются отдельно по Compose project. Durable volumes external;
+Application сети создаются отдельно по Compose project. Общая внешняя
+private data network — `moex-sentinel-data`; TEST database имеет alias
+`sentinel-shared-postgres`. Оба Core используют одинаковые `POSTGRES_DB`,
+credentials и `DATABASE_HOST=sentinel-shared-postgres`. В PROD overlay удалены
+services `database`, `migrations`, `portfolio-snapshot-worker` и PG volume.
+Миграциями владеет TEST; единственный TEST collector читает оба контура через
+`PORTFOLIO_SNAPSHOT_ALL_ENVIRONMENTS=true`, установленный remote overlay.
+Локальный default остаётся false. Старт второго collector запрещён.
+Durable Worker volumes external;
 существующие Sandbox volumes не переименовывать и не удалять. Analytics не
-получает broker credentials или данные портфеля. Backend, snapshot worker
-и торговый Worker должны иметь одинаковые contour/access mode.
+получает broker credentials или данные портфеля. Backend и его торговый Worker
+должны иметь одинаковые contour/access mode. Collector остаётся внутри Core
+boundary: его явное чтение обеих сред не даёт TEST API/Worker доступа к PROD scope.
 Worker сверяет Core contour/mode до изменяющих HTTP-запросов и SDK session;
 общий TEST/PROD target allowlist отвергает подмену FQDN. PROD TRADE запрещён.
 После выбора любого account scope неизменяем, включая disabled подключение
@@ -48,15 +65,52 @@ Worker сверяет Core contour/mode до изменяющих HTTP-запр�
 
 ## Проверки до запуска
 
-Запустить офлайн preflight с отдельным `REMOTE_ENV_FILE` через
-`deploy/remote/preflight.py`: он читает `docker compose config`, не запускает
-контейнеры и не выводит resolved env. Текущая версия проверяет прежние отдельные project/volumes и требует изменения для общей БД; она проверяет
-режим, strategy=false, cookie/origin и loopback UI; внутренние ports закрыты.
+Проверить офлайн без запуска и вывода resolved env. Пути ниже — отдельные
+root-only env, не shell source. `compose.production.sh` использует
+`.env.production` по умолчанию и явно выбирает PROD overlay:
+
+```sh
+REMOTE_ENV_FILE=/secure/test.env sh deploy/remote/compose.sh config --quiet
+REMOTE_ENV_FILE=/secure/prod.env sh deploy/remote/compose.production.sh config --quiet
+REMOTE_CONTOUR=PROD REMOTE_ENV_FILE=/secure/prod.env TEST_REMOTE_ENV_FILE=/secure/test.env \
+  PYTHONPATH=src python3 deploy/remote/preflight.py
+```
+
+PROD preflight требует TEST env для проверки владельца общей БД и collector;
+проверяет shared alias/credentials, отсутствие второй PG/мигратора/collector,
+READ_ONLY, strategy=false, cookie/origin, private network и loopback UI.
+Он не доказывает существование network, работоспособность БД или live RPC.
 
 Перед запуском двух stacks отдельно измерить RAM/disk и резерв на startup,
 каталог и peaks Worker. Замер02.10 (~786MiB available, existing containers
 ~605MiB) не доказывает запас при двух runtime; сначала пересчитать peak budget
 и принять capacity gate. Миграции и restore репетировать на отдельной БД.
+
+После пользовательского commit и явной отмашки на deployment создать общую
+network, если её ещё нет, с `docker network create --internal moex-sentinel-data`.
+Существующая network должна быть проверена как private/internal, без её слепого
+пересоздания. Сначала обновить TEST stack, сохранив PG volume/имя database;
+TEST migrations выполняются один раз после согласованной резервной копии.
+При нездоровом TEST owner PROD не запускать. Затем ограниченный initial PROD:
+
+```sh
+REMOTE_ENV_FILE=/secure/prod.env sh deploy/remote/compose.production.sh up -d --wait backend frontend
+```
+
+Не запускать PROD Worker/Analytics до следующего capacity/token/bootstrap gate.
+Не выполнять PROD migration/database/collector команды. Перед обновлением и
+изменением сетей writers останавливаются согласованно; общая БД и Worker volumes
+сохраняются. Успешная конфигурация не разрешает restart Sandbox.
+
+Согласованную backup снимает tracked `develop/scripts/paired_backup.py` после
+остановки всех TEST/PROD Core writers, collector и Workers. Credentials PG
+задать через защищённый `PGPASSFILE` или env, не аргументы. Helper сам не
+останавливает процессы и не восстанавливает БД. Проверка пары включает весь
+durable Worker state, outbox/intent/cycle и price repair journals; restore
+и ACK replay выполняются только в изолированном тестовом окружении.
+`pg_dump` и `pg_restore` должны совпадать по major с PostgreSQL server16;
+client17 не является проверенным restore инструментом для этого пакета.
+SKIP из-за несовпадения версии не подтверждает успешный restore.
 
 Шаблон `deploy/remote/nginx-production-ip.conf` добавляется рядом с Sandbox
 конфигурацией:8443 использует тот же действующий TLS certificate path, upstream
@@ -79,6 +133,11 @@ roots. SDK1.49.3 включает официальный российский ro
 TLS/gRPC, но не авторизованные RPC; evidence:
 `develop/reports/prod-api-20261002/prod-sdk-network.json`.
 До ввода владельцем реального read-only токена live чтения не проверены.
+Опциональный `PYTHONPATH=src python3 develop/scripts/prod_readonly_probe.py`
+читает фиксированный root-only `/etc/moex-sentinel/prod-readonly-token`0600,
+использует pinned PROD endpoint и выводит безопасные счётчики. Создание файла
+и авторизованный запуск требуют отдельного решения владельца; отсутствующий
+token не является пройденной проверкой. Проба не отправляет заявки.
 
 Выбрать точный account ID через защищённый UI; сверить accounts, cash/blocked
 balances, portfolio, positions, active orders/stop orders с кабинетом владельца.
@@ -90,7 +149,11 @@ Adoption counts и диагнозы UI не подтверждают факти�
 кнопки и отказ manual/retry/recovery writes. Внешние исполнения сверять отдельно,
 не создавать execution facts из snapshot.
 
-При откате остановить только PROD project/Worker, сохранить его env и обе
-базы для сверки. Sandbox project/env/volumes не менять. Не удалять durable
+При откате приложения остановить только PROD project/Worker, сохранить env,
+общую PG и Worker volumes для сверки. Не откатывать общую БД отдельно для PROD:
+это затронет TEST и требует остановки всех writers, согласованной пары backup,
+проверки совместимости и отдельного разрешения. Брокерские действия после backup
+требуют reconciliation, а не автоматического restore старого состояния.
+Sandbox project/env/volumes не менять без согласованного общего перехода. Не удалять durable
 volumes и финансовые факты. Реальная торговля, lease/arming/лимиты/canary P3–P5
 требуют отдельной реализации, проверки и допуска владельца.

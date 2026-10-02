@@ -2,16 +2,25 @@
 
 Актуализировано 2026-09-28 по текущему checkout и сохранённым материалам.
 Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
-содержит завершённый baseline; [пунктовый аудит](milestone-audit-2026-09-09.md)
-объясняет судьбу каждого прежнего требования. [Предыдущая версия этого файла](phase-1-implementation-plan-archive-2026-09-09.md)
+содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
+объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
 сохранена как история приёмок, а не инструкция к повторному выполнению.
 
 ## Дополнение 02.10.2026: VPS, эксплуатация и реальный API
 
 Уточнение владельца: одна PostgreSQL/одна database для TEST и PROD, без отдельной
 PROD БД. Первоначальный prototype остановлен, volumes сохранены. Перед
-объединением Core нужны contour guards/summary/collector и обновление Sandbox.
-Сначала завершить [анализ оркестрации и Worker storage](audits/2026-10-02-orchestration-and-worker-storage.md):
+объединением Core завершена code/integration приёмка contour guards/summary/collector
+и shared-DB конфигурации. Изолированный полный прогон: **1456 passed, 0 skipped**;
+frontend **119 passed**, typecheck/build exit0. Paired restore fixtures на PG16:
+**2 passed, 0 skipped**, включая сохранение journals, lost ACK replay и отсутствие
+повторной отправки. Восстановление рабочей пары и проверка repair на её данных
+остаются открытыми.
+Независимые code reviews A/B/C и итоговая source integration — **PASS**.
+Пользователь сам коммитит после проверок; обновление Sandbox/PROD только после
+его явной отмашки. Capacity, backup рабочей пары, live restart/restore и
+авторизованные PROD чтения с реальным токеном остаются открытыми.
+Завершён [анализ оркестрации и Worker storage](audits/orchestration-and-worker-storage.md):
 Worker оркестрирует исполнение, его durable состояние не заменяется чтением
 брокерского портфеля; перенос Worker/Redis/RabbitMQ ещё не выбраны.
 Отдельный dedup audit реализован и интегрирован, независимое ревью81 PASS,
@@ -32,12 +41,12 @@ Storage baseline измерен и независимо
 |---|---|---|
 | 1 | Завершить текущую Sandbox приёмку | Свежая сверка и независимый runtime review; состояние из CURRENT не заменяет проверку |
 | 2 | O1/S1: диагностика и ёмкость | Статус/audit доступны оператору; замеры24ч и подтверждение7дней дают диапазон хранения30/180дней |
-| 3 | PROD P1/P2: базовый код/tests PASS, объединение БД открыто | Одна Core PostgreSQL, все scope guards и collector, новый capacity gate и live приёмка |
+| 3 | PROD P1/P2/shared-DB/dedup: code/integration PASS | Одна Core PG/БД, scope guards/collector/Compose проверены; backend 1456/0skip, frontend 119/type/build, isolated paired fixtures 2/0skip. Token/live API, capacity, рабочая backup/restart и deployment остаются открытыми |
 | 4 | O2/PROD P3/P4: готовность | Уведомления, лимиты/controlled takeover, восстановление и сверка реального счёта приняты |
 | 5 | PROD P5: canary | Отдельный допуск владельца, численные лимиты и один разрешённый UID; расширение отдельно |
 
-Документы перехода: [PROD design](superpowers/specs/2026-10-02-production-api-design.md),
-[план перехода](superpowers/plans/2026-10-02-production-api.md),
+Документы перехода: [PROD design](superpowers/specs/production-api-design.md),
+[план перехода](superpowers/plans/production-api.md),
 [наблюдаемость](deployment/observability-plan.md),
 [хранение30/180дней](deployment/storage-capacity.md).
 Идентификаторы P1–P5 здесь относятся к PROD плану, а не оценкам приоритета
@@ -58,22 +67,22 @@ ledger не копируются. Текущее развёртывание Sand
 **[x] Принята 28.09.** W1, W2a, W2b и V0 выполнены. Сквозные
 PostgreSQL-сценарии, backlog 100/10k/50k, финальная backend-регрессия и
 независимое итоговое ревью завершены без существенных замечаний.
-[Оценка кодовой базы](audits/2026-09-10-codebase-improvement-assessment.md),
+[Оценка кодовой базы](audits/codebase-improvement-assessment.md),
 [постановка, границы и DoD](milestone-0.9.8-outbox-delivery.md),
-[результат W1](../develop/reports/local-development-coordinator/skill-w1-forward.md).
+результат W1 — `../develop/reports/local-development-coordinator/skill-w1-forward.md` (необязательный локальный архив).
 
 Независимые ревью W2a (`/root/review_w2a`) и W2b (`/root/review_w2b`) —
 **PASS**. Frozen compare совпал на 6/6 normal/bootstrap наборах 100/10k/50k.
 Bootstrap 50k old/new: peak tracemalloc 108105444/382335 B, время
 отбора, медиана 3 повторов, 6366.750/2894.517 ms, SQL 4/5. Итоговые значения
-W2b — в [selector comparison JSON](../develop/reports/0.9.8-w2/selector-comparison-v2.json).
+W2b — в selector comparison JSON — `../develop/reports/0.9.8-w2/selector-comparison-v2.json` (необязательный локальный архив).
 Детерминированный предел при limit=10:
 metadata 24, Session identity map 10, quartet payload 4, DTO не более limit+3;
 буфер драйвера отдельно — до 128 строк. Normal selector не демонстрирует общего
 ускорения: повторные медианы old/new — 24.580/25.953 ms при 10k и
-65.517/74.404 ms при 50k, p95 шумный. [W2a baseline](../develop/reports/0.9.8-w2/BASELINE-IN-PROGRESS.md)
+65.517/74.404 ms при 50k, p95 шумный. W2a baseline — `../develop/reports/0.9.8-w2/BASELINE-IN-PROGRESS.md` (необязательный локальный архив)
 — историческая характеристика, зафиксированная до W2b; повтор normal-замеров —
-в [normal perf repeat](../develop/reports/0.9.8-w2/normal-perf-repeat.md).
+в normal perf repeat — `../develop/reports/0.9.8-w2/normal-perf-repeat.md` (необязательный локальный архив).
 
 В V0 сквозные bootstrap, mixed selective ACK и retry-before-due проверены через
 реальный HTTP и отдельный Core PostgreSQL; backlog 100/10k/50k завершился без
@@ -85,7 +94,7 @@ Adversarial cap при многих ранних quartet исправлен по
 Ruff, Black и `git diff --check` прошли. Повторное независимое интеграционное
 ревью `/root/review_v0_integration` — PASS после исправления трёх существенных
 замечаний. Подробности и ограничения —
-в [V0 отчёте](../develop/reports/0.9.8-v0/README.md). R0 также открыт.
+в V0 отчёте — `../develop/reports/0.9.8-v0/README.md` (необязательный локальный архив). R0 также открыт.
 
 Выбраны W1/W2 — два изменения одного пути доставки Worker. После долгой HTTP-попытки
 durable retry должен отсчитываться от свежих часов; подбор batch должен удерживать
@@ -101,7 +110,7 @@ runtime: сохранённый `after-deployment.json` подтверждает
 healthy на 19.09, но не новые решения и устойчивость. На 28.09 Docker daemon
 доступен для отдельной тестовой PostgreSQL; рабочие сервисы в рамках V0 не
 проверялись, поэтому текущий статус торговли неизвестен. Пакеты реализации и
-проверки сведены в [пул задач](../develop/plans/2026-09-26-iteration-task-pool.md).
+проверки сведены в [пул задач](phase-1-implementation-plan.md).
 
 ## Текущая очередь после 0.9.8
 
@@ -125,7 +134,7 @@ F1 уже реализована в HEAD и ждёт повторной пров
 
 ## Завершённая веха: 0.9.5 — обработка недоступности песочницы
 
-**[x] Завершена.** [Приёмка](milestone-0.9.5-acceptance-2026-09-09.md),
+**[x] Завершена.** [Приёмка](milestone-0.9.5-acceptance.md),
 [полная постановка и DoD](milestone-0.9.5-sandbox-resilience.md).
 Проверены безопасное ожидание, ограниченные повторы, отсутствие конкурирующих
 переподключений и восстановление без повторных заявок. По последнему уточнению
@@ -150,8 +159,8 @@ F1 уже реализована в HEAD и ждёт повторной пров
 <a id="следующая-веха-094--профиль-доставки-фактов-на-core-postgresql"></a>
 ## Завершённая веха: 0.9.4 — профиль доставки фактов на Core PostgreSQL
 
-**[x] Завершена.** [Приёмка и измерения](milestone-0.9.4-acceptance-2026-09-09.md),
-[план выполнения](../develop/plans/2026-09-09-postgresql-profile.md).
+**[x] Завершена.** [Приёмка и измерения](milestone-0.9.4-acceptance.md),
+[план выполнения](../develop/benchmarks/README.md).
 Измерен реальный путь Worker SQLite → HTTP ingress → Core PostgreSQL в отдельном
 тестовом контуре. Benchmark
 0.9.3 использует SQLite для Core и не доказывает необходимость смены хранилища
@@ -178,7 +187,7 @@ F1 уже реализована в HEAD и ждёт повторной пров
 ## Завершённая веха: 0.9.6 — сокращение повторных чтений Core
 
 **[x] Завершена.** [Постановка](milestone-0.9.6-core-sql-roundtrips.md),
-[приёмка и сравнение](milestone-0.9.6-acceptance-2026-09-09.md).
+[приёмка и сравнение](milestone-0.9.6-acceptance.md).
 UPDATE RETURNING заменил повторный SELECT после успешного CAS. Сохранены
 conflict/revision/sequence, актуальность DTO/UTC, rollback и exact replay;
 диагностика конфликтов больше не зависит от устаревшего identity map.
@@ -190,7 +199,7 @@ conflict/revision/sequence, актуальность DTO/UTC, rollback и exact 
 ## Завершённая веха: 0.9.7 — объединённое чтение идентичности факта
 
 **[x] Завершена.** [Согласованный объём](milestone-0.9.7-envelope-lookup.md),
-[результаты приёмки](milestone-0.9.7-acceptance-2026-09-10.md):
+[результаты приёмки](milestone-0.9.7-acceptance.md):
 один lookup по event/sequence вместо двух, с сохранением replay, приоритета
 конфликтов, scope и атомарности группы. Реализация и полная регрессия завершены:
 1152 passed; независимое ревью кода и итоговой интеграции пройдено. Профиль подтвердил 93/94/97 SQL
@@ -217,8 +226,8 @@ conflict/revision/sequence, актуальность DTO/UTC, rollback и exact 
 | --- | --- |
 | 0.1–0.8 | [Завершённый baseline с кодом, тестами и приёмками](phase-0-trading-service-refactor.md). |
 | 0.9.1 | Push входит в 0.5: [подписки SDK](../src/moex_sentinel/adapters/tinvest/streaming.py), глубина стакана 20. |
-| 0.9.3 | [Benchmark, UI, bootstrap DTO, исправление лимита WAIT](milestone-0.9.3-acceptance-2026-09-09.md). |
-| Clean-slate и сводка торговли | [Приёмка запуска и схемы](milestone-acceptance-2026-09-08.md); сохранённые snapshot собирает отдельный Core worker. |
+| 0.9.3 | [Benchmark, UI, bootstrap DTO, исправление лимита WAIT](milestone-0.9.3-acceptance.md). |
+| Clean-slate и сводка торговли | [Приёмка запуска и схемы](milestone-acceptance.md); сохранённые snapshot собирает отдельный Core worker. |
 
 Старые результаты тестов и наблюдений относятся к датам приёмок. Актуализация
 плана сама по себе не означает повторное прохождение этих проверок.

@@ -70,11 +70,13 @@ class UserBrokerRepository:
         except IntegrityError as error:
             self._raise_constraint_error(error)
 
-    def replace(self, user_broker_id: str, draft: UserBrokerDraft) -> UserBroker:
+    def replace(
+        self, user_broker_id: str, draft: UserBrokerDraft, *, expected_environment: str | None = None
+    ) -> UserBroker:
         try:
             with session_scope(self._factory) as session:
                 model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
-                if model is None:
+                if model is None or (expected_environment is not None and model.environment != expected_environment):
                     raise UserBrokerNotFoundError(user_broker_id)
                 scope_changed = any(
                     getattr(model, name) != getattr(draft, name)
@@ -94,9 +96,11 @@ class UserBrokerRepository:
         except IntegrityError as error:
             self._raise_constraint_error(error)
 
-    def disable(self, user_broker_id: str) -> UserBroker:
+    def disable(self, user_broker_id: str, *, expected_environment: str | None = None) -> UserBroker:
         with session_scope(self._factory) as session:
-            model = self._get_model(session, user_broker_id)
+            model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
+            if model is None or (expected_environment is not None and model.environment != expected_environment):
+                raise UserBrokerNotFoundError(user_broker_id)
             model.state = UserBrokerState.DISABLED.value
             session.flush()
             return _record(model)

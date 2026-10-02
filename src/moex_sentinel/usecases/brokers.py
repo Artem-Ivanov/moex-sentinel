@@ -41,6 +41,8 @@ class SaveBrokerSettingsUsecase(PositionalModel):
     def execute(self, broker_id: str | None, draft: BrokerDraft) -> Broker:
         try:
             return self.service.save_settings(broker_id, draft)
+        except BrokerNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Настройки площадки не найдены.") from error
         except DuplicateBrokerError as error:
             raise UseCaseError("DUPLICATE_BROKER", "Такая настройка площадки уже существует.") from error
         except UnknownBrokerAdapterError as error:

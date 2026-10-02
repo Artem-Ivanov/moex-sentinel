@@ -133,12 +133,13 @@ class ApplicationUsecases(PositionalModel):
 class _SessionTradingSummaryService:
     """Keep one consistent database session for all summary reads."""
 
-    def __init__(self, factory: sessionmaker[Session]) -> None:
+    def __init__(self, factory: sessionmaker[Session], environment: str) -> None:
         self._factory = factory
+        self._environment = environment
 
     def view(self) -> TradingSummaryView:
         with self._factory() as session:
-            return TradingSummaryService(PortfolioSnapshotRepository(session)).view()
+            return TradingSummaryService(PortfolioSnapshotRepository(session, environment=self._environment)).view()
 
 
 def build_portfolio_snapshot_collector(
@@ -157,7 +158,11 @@ def build_portfolio_snapshot_collector(
         adapter_factory.create,
         store,
         clock=clock,
-        environment=PinnedEnvironment(settings.application_environment),
+        environment=(
+            None
+            if settings.portfolio_snapshot_all_environments
+            else PinnedEnvironment(settings.application_environment)
+        ),
         retry_limit=settings.portfolio_snapshot_retry_limit,
         retry_base_seconds=settings.portfolio_snapshot_retry_base_seconds,
     )
@@ -231,10 +236,11 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         ),
         instrument_repository,
     )
-    automation_commands = AutomationCommandRepository(factory)
+    automation_commands = AutomationCommandRepository(factory, environment=settings.application_environment)
     trading_fact_ingress = TradingFactIngressService(
         lambda: TradingFactsUnitOfWork(factory),
         TradingFactMapper(),
+        environment=settings.application_environment,
     )
     return ApplicationUsecases(
         view_automaton_broker_scope=ViewAutomatonBrokerScopeUsecase(automaton_broker_service),
@@ -272,5 +278,7 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         claim_automation_commands=ClaimAutomationCommandsUsecase(automation_commands),
         view_automation_statuses=ViewAutomationStatusesUsecase(automation_commands),
         publish_trading_facts=PublishTradingFactsUsecase(trading_fact_ingress),
-        view_trading_summary=ViewTradingSummaryUsecase(_SessionTradingSummaryService(factory)),
+        view_trading_summary=ViewTradingSummaryUsecase(
+            _SessionTradingSummaryService(factory, settings.application_environment)
+        ),
     )

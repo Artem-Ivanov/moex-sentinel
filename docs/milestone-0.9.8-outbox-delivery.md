@@ -3,7 +3,7 @@
 Дата постановки: 2026-09-10. **Статус на 28.09: веха 0.9.8 принята.**
 W1, W2a, W2b и V0 выполнены; финальная регрессия и независимое итоговое
 кросс-ревью завершились без существенных замечаний.
-Основание: W1/W2 в [оценке кодовой базы](audits/2026-09-10-codebase-improvement-assessment.md).
+Основание: W1/W2 в [оценке кодовой базы](audits/codebase-improvement-assessment.md).
 Очередь и статусы ведутся в [актуальном плане](phase-1-implementation-plan.md).
 
 ## Проблема и ожидаемое поведение
@@ -24,7 +24,7 @@ W1, W2a и W2b выполнены и приняты независимыми р�
 совпадение 6/6 наборов (normal и bootstrap, 100/10 000/50 000 строк).
 Для bootstrap 50k old/new: peak tracemalloc 108105444/382335 B,
 медиана времени отбора за 3 повтора 6366.750/2894.517 ms, SQL 4/5
-(old/new; [результат frozen compare](../develop/reports/0.9.8-w2/selector-comparison-v2.json)).
+(old/new; результат frozen compare — `../develop/reports/0.9.8-w2/selector-comparison-v2.json` (необязательный локальный архив)).
 Последние чередующиеся
 normal-замеры показывают небольшой медианный проигрыш нового селектора:
 10k — 24.580/25.953 ms и 50k — 65.517/74.404 ms (old/new); p95 шумный.
@@ -37,8 +37,8 @@ quartet payload 4; итоговый DTO ограничен limit+3. Буфер �
 не означает отсутствия сканирования или затрат буфера драйвера. Полная
 сквозная проверка с PostgreSQL и полный drain выполнены в V0 ниже.
 
-Подробные локальные доказательства: [W2a baseline и методика](../develop/reports/0.9.8-w2/BASELINE-IN-PROGRESS.md),
-[повторные normal-измерения](../develop/reports/0.9.8-w2/normal-perf-repeat.md).
+Подробные локальные доказательства: W2a baseline и методика — `../develop/reports/0.9.8-w2/BASELINE-IN-PROGRESS.md` (необязательный локальный архив),
+повторные normal-измерения — `../develop/reports/0.9.8-w2/normal-perf-repeat.md` (необязательный локальный архив).
 
 ## Итог V0 и приёмка 28.09
 
@@ -58,7 +58,7 @@ seed 20260928: normal/bootstrap/many-bootstrap 100/10k/50k совпали по
 Это не доказывает общего ускорения. В selector drain входит локальное удаление,
 но не HTTP/Core; сквозной backlog измеряется отдельно. Рецензент
 `/root/review_drain` подтвердил методику после исправления трёх существенных
-замечаний. [Методика и числа](../develop/reports/0.9.8-v0/README.md).
+замечаний. Методика и числа — `../develop/reports/0.9.8-v0/README.md` (необязательный локальный архив).
 
 Итоговое ревью выявило переполнение глобального списка кандидатов при многих
 ранних quartet: adversarial тест показал peak 47 при пределе 30. Вытеснение
@@ -72,7 +72,7 @@ bootstrap и 1 274 970 для many-bootstrap; внутренние чтения 
 
 Финальный полный backend прогон с отдельной PostgreSQL после всех изменений:
 **1334 passed, 0 skipped, 17 warnings, exit 0** за 275.87 с;
-[лог](../develop/reports/0.9.8-v0/pytest-final-v2-postgresql.txt). Ruff,
+лог — `../develop/reports/0.9.8-v0/pytest-final-v2-postgresql.txt` (необязательный локальный архив). Ruff,
 Black и `git diff --check` прошли. Независимые `/root/review_v0` проверил
 сквозные тесты и HTTP test server, `/root/review_drain` — методику полного
 selector drain, `/root/review_pg_backlog` — сквозной backlog-профиль.

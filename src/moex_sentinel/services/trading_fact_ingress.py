@@ -56,10 +56,12 @@ class TradingFactIngressService:
         mapper: TradingFactMapper,
         *,
         now: Callable[[], datetime] = utc_now_ms,
+        environment: str | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._mapper = mapper
         self._now = now
+        self._environment = environment
 
     def publish(self, facts: list[FactEnvelope]) -> FactBatchResult:
         groups: dict[UUID, list[FactEnvelope]] = {}
@@ -99,6 +101,8 @@ class TradingFactIngressService:
         scope_id = str(facts[0].user_broker_id)
         accepted: list[UUID] = []
         with self._uow_factory() as uow:
+            if self._environment is not None and not uow.scope_matches_environment(scope_id, self._environment):
+                raise _FactGroupRejected(FactIngressErrorCode.CROSS_SCOPE_RELATION)
             try:
                 current = uow.automations.get(scope_id, str(automation_id))
             except TradingFactPersistenceError as error:

@@ -30,14 +30,47 @@ Overlay использует [правила merge Docker Compose](https://docs.
 инструменты. Пока активного подключения нет, UI r2 показывает переход к
 настройкам. Данные открытых позиций доходят до qty/avg UI после Worker bootstrap.
 Новый PROD план, наблюдаемость и сроки хранения описаны отдельно:
-[переход](../superpowers/plans/2026-10-02-production-api.md),
+[переход](../superpowers/plans/production-api.md),
 [диагностика](observability-plan.md), [ёмкость](storage-capacity.md).
 
-## Файлы
+## Общая БД TEST/PROD: пакет перехода
+
+В текущем пакете TEST владеет одной PostgreSQL/database и миграциями.
+`compose.production.sh` добавляет PROD overlay и использует отдельный
+`.env.production`: второй database service/PG volume, migrations и collector
+в нём удалены. Оба Core подключаются через alias `sentinel-shared-postgres`
+к общей внешней private network `moex-sentinel-data`; application сети,
+root-only env и браузерные sessions остаются отдельными. Единственный TEST
+collector remote overlay имеет `PORTFOLIO_SNAPSHOT_ALL_ENVIRONMENTS=true`.
+Worker сохраняет собственный SQLite intent/outbox; перенос журнала не выбран.
+
+Конфигурация и source guards проходят независимую проверку; это не live PASS.
+Пользователь сам коммитит после gates. Любые приведённые ниже запуск/stop/restore
+команды выполняются только после его явной отмашки на deployment.
+До первой PROD записи обновить TEST backend и collector, принять capacity и
+согласованный backup/restore. Общую network создать с `--internal` только после
+разрешения, проверить существующую network без её удаления. Существующие TEST
+database/credentials/volume сохранить; не заменять их примерными значениями.
+Первый PROD запускает только backend/frontend, без Worker/Analytics/collector.
+Точные wrappers/preflight и открытые token gates — в
+[PROD runbook](production-cutover.md).
+
+Все инструкции backup/restore ниже относятся к общей PG и durable Worker
+хранилищам вместе. Если PROD уже развёрнут, остановить также его Core и Worker;
+остановки только TEST writers недостаточно. Helper `develop/scripts/paired_backup.py`
+принимает повторяемый `--worker`, требует `--writers-quiesced` и приватный новый
+`--output`; сам процессы не останавливает. Защищённые PG credentials передавать
+через PGPASSFILE/env, не argv. Restore — только в новые изолированные test volumes,
+без запуска торгового Worker. Price repair journals и pending typed facts/ACK
+проверяются в rehearsal, не удаляются как cache. Использовать `pg_dump` и
+`pg_restore` major16, совпадающий с server; SKIP при другом major не является PASS.
+
+### Файлы конфигурации
 
 - `deploy/remote/compose.remote.yml`: overlay, закрытые порты, теги образов, singleton Worker.
 - `deploy/remote/.env.example`: имена переменных и пример стратегии; не содержит реальных credentials.
 - `deploy/remote/compose.sh`: единый wrapper с явными compose/env путями; запускать через `sh`.
+- `deploy/remote/compose.production.sh` и `compose.production.yml`: явный PROD wrapper и overlay общей БД.
 - `deploy/remote/preflight.py`: read-only проверка разрешённой конфигурации; не выводит её секреты.
 - `deploy/remote/nginx-ip.conf`: HTTPS reverse proxy для текущего IP и rate limit входа.
 - `deploy/remote/reload-nginx.sh`: hook Certbot после успешного продления сертификата.
@@ -119,6 +152,11 @@ sh deploy/remote/compose.sh stop frontend portfolio-snapshot-worker analytics ba
 
 Перед продолжением проверить `compose ps --all`: все перечисленные writers остановлены. Проверить завершение Worker (код выхода 0, `APPLICATION_STOPPED`, отсутствие принудительного SIGKILL); при ошибке сохранить диагностику и провести recovery до обычного запуска. Рабочая PostgreSQL остаётся включённой.
 
+При наличии PROD повторить остановку его `trading-automaton`, frontend, analytics
+и backend через `compose.production.sh` с точным PROD env. Подтвердить отсутствие
+всех TEST/PROD writers до dump и последовательного копирования Worker; обе среды
+остаются остановленными до окончания согласованной процедуры.
+
 ```sh
 sh deploy/remote/compose.sh exec -T database sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "$BACKUP_DIR/core.dump"
 WORKER_CONTAINER=$(sh deploy/remote/compose.sh ps --all --quiet trading-automaton)
@@ -180,6 +218,8 @@ sh deploy/remote/compose.sh --profile trading up -d --no-deps trading-automaton
 3. Применить миграции новой версии. Запустить Core/Analytics/UI, проверить health и audit. Включить единственный Worker последним.
 4. Если приложение сломано **до возобновления торговли** и схема совместима, вернуть старый `RELEASE_TAG` и прежний checkout, запускать `up --no-build`; не выполнять rebuild старого tag из новых исходников.
 5. При несовместимой схеме не делать слепой Alembic downgrade. Восстановить согласованную пару backup в **новые** volumes, переключить env на них, сохранив повреждённые volumes для расследования. Проверить совместимость версии Worker SQLite отдельно.
+   Общая PG затрагивает обе среды: перед restore остановить все TEST/PROD writers;
+   после переключения оба Core должны указывать на одну восстановленную database.
 6. Если после backup уже были новые брокерские действия, откат данных к backup может потерять intent и привести к повторной торговле. Сначала остановить Worker и провести reconciliation с брокером; обычное восстановление старого backup запрещено как автоматическая процедура. Брокерское исполнение откатом БД не отменяется.
 
 ## Эксплуатационные проверки

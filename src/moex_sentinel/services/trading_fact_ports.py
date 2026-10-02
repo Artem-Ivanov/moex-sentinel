@@ -150,6 +150,8 @@ class TradingAnalyticsPort(Protocol):
 
 
 class TradingFactsUnitOfWorkPort(Protocol):
+    def scope_matches_environment(self, user_broker_id: str, environment: str) -> bool: ...
+
     @property
     def automations(self) -> AutomationFactsPort: ...
 

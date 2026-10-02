@@ -18,8 +18,9 @@ from sentinel_contracts.trading_facts import (
 
 
 class AutomationCommandRepository:
-    def __init__(self, factory: sessionmaker[Session]) -> None:
+    def __init__(self, factory: sessionmaker[Session], *, environment: str | None = None) -> None:
         self._factory = factory
+        self._environment = environment
 
     def claim(self, limit: int) -> list[AutomationCommand]:
         if limit <= 0:
@@ -35,6 +36,7 @@ class AutomationCommandRepository:
                 )
                 .where(
                     UserBrokerModel.state == "ACTIVE",
+                    True if self._environment is None else UserBrokerModel.environment == self._environment,
                     UserBrokerModel.external_account_id.is_not(None),
                     or_(
                         TradingAutomationModel.state == AutomationState.IN_QUEUE.value,
@@ -58,7 +60,12 @@ class AutomationCommandRepository:
         by_text = {str(value): value for value in requested}
         with self._factory() as session:
             rows = session.scalars(
-                select(TradingAutomationModel).where(TradingAutomationModel.id.in_(tuple(by_text)))
+                select(TradingAutomationModel)
+                .join(UserBrokerModel, UserBrokerModel.id == TradingAutomationModel.user_broker_id)
+                .where(
+                    TradingAutomationModel.id.in_(tuple(by_text)),
+                    True if self._environment is None else UserBrokerModel.environment == self._environment,
+                )
             ).all()
         by_id = {row.id: row for row in rows}
         return AutomationStatusesResult(

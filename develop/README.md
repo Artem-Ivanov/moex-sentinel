@@ -7,7 +7,8 @@ Python-дистрибутива; runtime не должен импортиров�
 - `scripts/` — миграция схемы и наполнение sandbox через штатный API.
 - `tests/` — проверки вспомогательных скриптов; запускаются отдельно.
 - `benchmarks/` — изолированные измерения Analytics/Worker/Core с имитацией брокера.
-- `reports/` — агрегированные результаты проверок и снимки синтетического UI.
+- `reports/` — локальные, игнорируемые результаты проверок и снимки синтетического UI.
+- `reviews/` — локальные копии прежнего кода и разовые probes; в clean clone отсутствуют.
 - `legacy-bytecode/` — локальный архив кэша удалённых Python-модулей с сохранением
   путей относительно корня проекта. Файлы `.pyc` игнорируются Git. Архив может
   отсутствовать в новом checkout и не требуется для работы или тестов.
@@ -20,7 +21,21 @@ Python-дистрибутива; runtime не должен импортиров�
 со схемой назначения.
 
 Исходный контракт описан в
-[историческом плане миграции](../docs/superpowers/plans/2026-08-10-user-broker-reference-migration.md).
+[историческом плане миграции](../docs/superpowers/specs/trading-data-schema-migration-design.md).
+
+## Локальная точка продолжения
+
+Если `develop/CURRENT.md` есть, прочитать его и сверить с `git status`.
+В новом checkout сначала прочитать README, AGENT_BRIEF и актуальный phase plan,
+затем создать локальный файл из [шаблона](CURRENT.example.md):
+
+```sh
+test -e develop/CURRENT.md || cp develop/CURRENT.example.md develop/CURRENT.md
+```
+
+CURRENT, WORK_LOG, reports и review copies могут отсутствовать в clean clone.
+Существующий CURRENT не заменять. Шаблон не подтверждает состояние сервисов;
+важные решения сохраняются в tracked тематических документах.
 
 ## Подготовка пустой базы
 
@@ -79,7 +94,7 @@ T-Invest Sandbox. Историческая база для этого проце
 ## Проверка Analytics и продвижения Worker
 
 Результаты проверки SDK, VPN и stream RPC, включая независимый HTTP/2-клиент:
-[расследование Sandbox stream](market-stream-investigation-2026-09-09.md).
+[расследование Sandbox stream](market-stream-investigation.md).
 
 `check_analytics_runtime.py` читает конфигурацию активных автоматов из SQLite
 Worker в режиме `mode=ro` и запрашивает штатный Analytics. Не отправляет заявки

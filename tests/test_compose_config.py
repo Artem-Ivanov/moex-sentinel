@@ -1,5 +1,8 @@
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +99,7 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
         "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
         "DATABASE_URL": (
             "postgresql+psycopg://${POSTGRES_USER}:"
-            "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@database:5432/${POSTGRES_DB}"
+            "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@${DATABASE_HOST:-database}:5432/${POSTGRES_DB}"
         ),
         "LOG_FORMAT": "json",
         "LOG_LEVEL": "INFO",
@@ -203,3 +206,104 @@ def test_contour_and_access_mode_propagate_to_all_broker_owners() -> None:
         == "${AUTH_ALLOWED_ORIGIN:?AUTH_ALLOWED_ORIGIN must be configured}"
     )
     assert services["trading-automaton"]["environment"]["STRATEGY_ENABLED"] == "${STRATEGY_ENABLED:-false}"
+
+
+def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose CLI unavailable")
+    configs = {}
+    for contour, wrapper, example in (
+        ("TEST", "compose.sh", ".env.example"),
+        ("PROD", "compose.production.sh", ".env.production.example"),
+    ):
+        environment = os.environ.copy()
+        environment.update(
+            line.split("=", 1)
+            for line in (PROJECT_ROOT / "deploy/remote" / example).read_text().splitlines()
+            if line and not line.startswith("#")
+        )
+        environment["REMOTE_ENV_FILE"] = "/dev/null"
+        result = subprocess.run(
+            [
+                shutil.which("sh"),
+                str(PROJECT_ROOT / "deploy/remote" / wrapper),
+                "--profile",
+                "trading",
+                "--profile",
+                "migrations",
+                "config",
+                "--format",
+                "json",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        configs[contour] = json.loads(result.stdout)
+    test, prod = configs["TEST"], configs["PROD"]
+    assert {"database", "migrations", "portfolio-snapshot-worker"} <= test["services"].keys()
+    assert not {"database", "migrations", "portfolio-snapshot-worker"} & prod["services"].keys()
+    assert "postgres-data" not in prod["volumes"]
+    assert (
+        test["services"]["backend"]["environment"]["DATABASE_URL"]
+        == prod["services"]["backend"]["environment"]["DATABASE_URL"]
+    )
+    assert test["services"]["portfolio-snapshot-worker"]["environment"]["PORTFOLIO_SNAPSHOT_ALL_ENVIRONMENTS"] == "true"
+    assert test["services"]["database"]["networks"]["data"]["aliases"] == ["sentinel-shared-postgres"]
+    assert set(prod["services"]["backend"]["networks"]) == {"default", "data"}
+    assert test["networks"]["default"]["name"] != prod["networks"]["default"]["name"]
+    assert test["volumes"]["automaton-data"]["name"] != prod["volumes"]["automaton-data"]["name"]
+
+    module_spec = importlib.util.spec_from_file_location(
+        "shared_preflight", PROJECT_ROOT / "deploy/remote/preflight.py"
+    )
+    assert module_spec is not None
+    assert module_spec.loader is not None
+    preflight = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(preflight)
+    preflight.validate_shared_database_pair(test, prod)
+    from copy import deepcopy  # noqa: PLC0415
+
+    for mutation in (
+        "database",
+        "network",
+        "collector",
+        "alias",
+        "duplicate",
+        "client_network",
+        "project",
+        "app_network",
+        "pg_volume",
+        "worker_volume",
+    ):
+        bad = deepcopy(test)
+        if mutation == "database":
+            bad["services"]["migrations"]["environment"]["DATABASE_URL"] += "_wrong"
+        elif mutation == "network":
+            bad["networks"]["data"]["name"] = "other-network"
+        elif mutation == "collector":
+            bad["services"]["portfolio-snapshot-worker"]["environment"]["PORTFOLIO_SNAPSHOT_ALL_ENVIRONMENTS"] = "false"
+        elif mutation == "alias":
+            bad["services"]["database"]["networks"]["data"]["aliases"] = ["database"]
+        elif mutation == "duplicate":
+            bad["services"]["second-database"] = {"image": "postgres:16-alpine"}
+        elif mutation == "client_network":
+            bad["services"]["migrations"]["networks"].pop("data")
+        elif mutation == "project":
+            bad["name"] = "moex-sentinel-prod"
+        elif mutation == "app_network":
+            bad["networks"]["default"]["name"] = prod["networks"]["default"]["name"]
+        elif mutation == "pg_volume":
+            bad["volumes"]["postgres-data"]["name"] = "moex-sentinel-prod-postgres-data"
+        elif mutation == "worker_volume":
+            bad["volumes"]["automaton-data"]["name"] = prod["volumes"]["automaton-data"]["name"]
+        with pytest.raises(SystemExit, match="FAIL"):
+            preflight.validate_shared_database_pair(bad, prod)
+
+
+def test_production_wrapper_defaults_to_separate_environment_file():
+    wrapper = (PROJECT_ROOT / "deploy/remote/compose.production.sh").read_text()
+    example = (PROJECT_ROOT / "deploy/remote/.env.production.example").read_text()
+    assert ".env.production" in wrapper
+    assert "Copy to deploy/remote/.env.production," in example

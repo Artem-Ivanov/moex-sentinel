@@ -190,6 +190,6 @@ AST/import-графа не добавляются. Разовые скрипты
 в `develop/`, их результаты не являются runtime-тестами архитектуры.
 
 План и свидетельства текущего упрощения:
-[план](superpowers/plans/2026-09-15-code-and-test-simplification.md),
-[код](audits/2026-09-15-code-simplification.md),
-[тесты](audits/2026-09-15-test-simplification.md).
+[план](superpowers/plans/code-and-test-simplification.md),
+[код](audits/code-simplification.md),
+[тесты](audits/test-simplification.md).

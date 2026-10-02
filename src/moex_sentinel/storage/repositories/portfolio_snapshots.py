@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from moex_sentinel.domain.portfolio import BrokerReadError
 from moex_sentinel.domain.trading_summary import PortfolioSnapshotRunValue, PortfolioSnapshotValue
 from moex_sentinel.storage.models.trading_analytics import PortfolioSnapshotModel, PortfolioSnapshotRunModel
+from moex_sentinel.storage.models.user_brokers import UserBrokerModel
 from sentinel_contracts.time import floor_utc_millisecond
 
 
@@ -79,8 +80,25 @@ def portfolio_snapshot_run_lock(engine: Engine, bucket_start: datetime) -> Itera
 class PortfolioSnapshotRepository:
     """Session-bound atomic snapshot repository."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, environment: str | None = None) -> None:
         self._session = session
+        self._environment = environment
+
+    def _run_value(self, model: PortfolioSnapshotRunModel) -> PortfolioSnapshotRunValue:
+        run = _run_value(model)
+        if self._environment is None or not run.errors:
+            return run
+        broker_ids = set(
+            self._session.scalars(select(UserBrokerModel.id).where(UserBrokerModel.environment == self._environment))
+        )
+        return run.model_copy(update={"errors": tuple(error for error in run.errors if error.broker_id in broker_ids)})
+
+    def _scope_query(self, statement):
+        if self._environment is None:
+            return statement
+        return statement.join(UserBrokerModel, UserBrokerModel.id == PortfolioSnapshotModel.user_broker_id).where(
+            UserBrokerModel.environment == self._environment
+        )
 
     def append_run_with_snapshots(
         self,
@@ -91,7 +109,7 @@ class PortfolioSnapshotRepository:
             select(PortfolioSnapshotRunModel).where(PortfolioSnapshotRunModel.bucket_start == run.bucket_start)
         )
         if existing is not None:
-            return _run_value(existing)
+            return self._run_value(existing)
         if any(value.run_id != run.id for value in snapshots):
             raise ValueError("Every snapshot must belong to the appended run.")
         run_model = PortfolioSnapshotRunModel(
@@ -113,7 +131,7 @@ class PortfolioSnapshotRepository:
             )
             if existing is None:
                 raise
-            return _run_value(existing)
+            return self._run_value(existing)
         self._session.add_all(PortfolioSnapshotModel(**value.model_dump(mode="python")) for value in snapshots)
         self._session.flush()
         return run
@@ -122,7 +140,7 @@ class PortfolioSnapshotRepository:
         model = self._session.scalar(
             select(PortfolioSnapshotRunModel).order_by(PortfolioSnapshotRunModel.captured_at.desc()).limit(1)
         )
-        return None if model is None else _run_value(model)
+        return None if model is None else self._run_value(model)
 
     def run_for_bucket(self, bucket_start: datetime) -> PortfolioSnapshotRunValue | None:
         model = self._session.scalar(
@@ -130,11 +148,11 @@ class PortfolioSnapshotRepository:
                 PortfolioSnapshotRunModel.bucket_start == floor_utc_millisecond(bucket_start)
             )
         )
-        return None if model is None else _run_value(model)
+        return None if model is None else self._run_value(model)
 
     def latest_snapshots(self, run_id: str) -> tuple[PortfolioSnapshotValue, ...]:
         models = self._session.scalars(
-            select(PortfolioSnapshotModel)
+            self._scope_query(select(PortfolioSnapshotModel))
             .where(PortfolioSnapshotModel.run_id == run_id)
             .order_by(
                 PortfolioSnapshotModel.currency,
@@ -195,7 +213,7 @@ class PortfolioSnapshotRepository:
             PortfolioSnapshotModel.account_id,
         ).in_(identities)
         common_runs = (
-            select(PortfolioSnapshotModel.run_id, PortfolioSnapshotModel.captured_at)
+            self._scope_query(select(PortfolioSnapshotModel.run_id, PortfolioSnapshotModel.captured_at))
             .where(
                 PortfolioSnapshotModel.currency == next(iter(currencies)),
                 identity_filter,
@@ -214,7 +232,7 @@ class PortfolioSnapshotRepository:
         if run_id is None:
             return ()
         models = self._session.scalars(
-            select(PortfolioSnapshotModel)
+            self._scope_query(select(PortfolioSnapshotModel))
             .where(
                 PortfolioSnapshotModel.run_id == run_id,
                 PortfolioSnapshotModel.currency == next(iter(currencies)),
@@ -224,9 +242,8 @@ class PortfolioSnapshotRepository:
         )
         return tuple(_snapshot_value(model) for model in models)
 
-    @staticmethod
-    def _account_currency_query(user_broker_id: str, account_id: str, currency: str):
-        return select(PortfolioSnapshotModel).where(
+    def _account_currency_query(self, user_broker_id: str, account_id: str, currency: str):
+        return self._scope_query(select(PortfolioSnapshotModel)).where(
             PortfolioSnapshotModel.user_broker_id == user_broker_id,
             PortfolioSnapshotModel.account_id == account_id,
             PortfolioSnapshotModel.currency == currency.upper(),

@@ -57,7 +57,7 @@ class FakeBrokerRepository:
         self.records[record.id] = record
         return record
 
-    def replace(self, broker_id: str, draft: UserBrokerDraft) -> UserBroker:
+    def replace(self, broker_id: str, draft: UserBrokerDraft, *, expected_environment: str | None = None) -> UserBroker:
         current = self.records[broker_id]
         record = current.model_copy(
             update={
@@ -73,7 +73,7 @@ class FakeBrokerRepository:
         self.records[broker_id] = record
         return record
 
-    def disable(self, broker_id: str) -> UserBroker:
+    def disable(self, broker_id: str, *, expected_environment: str | None = None) -> UserBroker:
         record = self.records[broker_id].model_copy(update={"state": UserBrokerState.DISABLED})
         self.records[broker_id] = record
         return record

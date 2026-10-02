@@ -2,8 +2,10 @@
 
 from types import TracebackType
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from moex_sentinel.storage.models.user_brokers import UserBrokerModel
 from moex_sentinel.storage.repositories.automation_facts import AutomationFactsRepository
 from moex_sentinel.storage.repositories.order_facts import OrderFactsRepository
 from moex_sentinel.storage.repositories.position_ledger import PositionLedgerRepository
@@ -33,6 +35,18 @@ class TradingFactsUnitOfWork:
         self.audit = TradingAuditRepository(session)
         self.analytics = TradingAnalyticsRepository(session)
         return self
+
+    def scope_matches_environment(self, user_broker_id: str, environment: str) -> bool:
+        if self._session is None:
+            raise RuntimeError("Fact unit of work is not active.")
+        return (
+            self._session.scalar(
+                select(UserBrokerModel.id)
+                .where(UserBrokerModel.id == user_broker_id, UserBrokerModel.environment == environment)
+                .with_for_update()
+            )
+            is not None
+        )
 
     def __exit__(
         self,

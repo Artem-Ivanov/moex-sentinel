@@ -1,0 +1,9 @@
+# Applied after compose.remote.yml; shared database belongs to TEST.
+services:
+  database: !reset null
+  migrations: !reset null
+  portfolio-snapshot-worker: !reset null
+  backend:
+    depends_on: !reset {}
+volumes:
+  postgres-data: !reset null
