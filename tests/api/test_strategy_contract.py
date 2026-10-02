@@ -10,9 +10,11 @@ from moex_sentinel.api.app import create_app
 def test_strategy_routes_are_absent_and_creation_rejects_strategy(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(),
+        lambda _factory, *, settings: SimpleNamespace(),
     )
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'strategy-free.db'}")) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'strategy-free.db'}")
+    ) as client:
         template = client.get("/api/strategy-templates")
         patch = client.patch(
             "/api/trading-automations/automation-1/strategy",

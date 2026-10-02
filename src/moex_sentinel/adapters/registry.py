@@ -20,10 +20,24 @@ TINVEST_SANDBOX = BrokerAdapterDefinition(
 )
 
 
+TINVEST_PROD = BrokerAdapterDefinition(
+    adapter_code="TINVEST_PROD",
+    provider_code="TINVEST",
+    environment_code="PROD",
+    fields=(
+        BrokerFieldDefinition(name="token", required=True),
+        BrokerFieldDefinition(name="fqdn", required=True, default_value="invest-public-api.tbank.ru:443"),
+    ),
+)
+
+
 class BrokerAdapterRegistry:
     """Immutable adapter declaration registry."""
 
-    _adapters = (TINVEST_SANDBOX,)
+    _adapters = (
+        TINVEST_SANDBOX,
+        TINVEST_PROD,
+    )
 
     def list(self) -> tuple[BrokerAdapterDefinition, ...]:
         return self._adapters

@@ -114,7 +114,7 @@ class PersistentFills(ExecutionSession):
 
 class OutageHarness(ContractHarness):
     def __init__(self, tmp_path, *, held=False):
-        super().__init__(tmp_path, StrategySettings(), pending_low="90")
+        super().__init__(tmp_path, StrategySettings(enabled=True), pending_low="90")
         if held:
             self.value = self.value.model_copy(update={"state": AutomationState.HOLD})
             with self.factory.begin() as db:

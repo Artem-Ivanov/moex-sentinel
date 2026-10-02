@@ -1,7 +1,7 @@
 """Trading-worker runtime and strategy configuration."""
 
 from decimal import Decimal
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -68,11 +68,14 @@ class StrategySettings(BaseSettings):
         validation_alias="STRATEGY_CORE_RETRY_LIMIT",
         ge=0,
     )
-    enabled: bool = Field(True, validation_alias="STRATEGY_ENABLED")
+    enabled: bool = Field(False, validation_alias="STRATEGY_ENABLED")
 
 
 class AutomatonSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
+
+    application_environment: Literal["TEST", "PROD"] = Field("TEST", validation_alias="APPLICATION_ENVIRONMENT")
+    broker_access_mode: Literal["READ_ONLY", "TRADE"] = Field(validation_alias="BROKER_ACCESS_MODE")
 
     core_url: str = Field("http://backend:8000", validation_alias="CORE_URL")
     analytics_url: str = Field("http://analytics:8001", validation_alias="ANALYTICS_URL")
@@ -91,6 +94,8 @@ class AutomatonSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime(self) -> Self:
+        if self.application_environment == "PROD" and self.broker_access_mode == "TRADE":
+            raise ValueError("PROD TRADE is not enabled in this phase")
         if not self.database_url.startswith("sqlite:///"):
             raise ValueError("Trading worker supports only SQLite.")
         if self.iteration_seconds <= 0:

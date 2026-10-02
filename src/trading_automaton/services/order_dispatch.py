@@ -38,8 +38,14 @@ class OrderDispatchService:
         broker: DispatchBrokerPort,
         *,
         now: Callable[[], datetime],
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
         audit: OrderStageAuditPort | None = None,
     ) -> None:
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        self._access_mode = access_mode
+        self._account_id = account_id
         self._repository = repository
         self._broker = broker
         self._now = now
@@ -51,6 +57,10 @@ class OrderDispatchService:
         started: "asyncio.Future[datetime]",
     ) -> BrokerOrderState:
         """Record submission, then return or reconcile its result; unresolved intents become UNCERTAIN."""
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        if self._account_id and request.account_id != self._account_id:
+            raise ValueError("Broker account mismatch")
         dispatched_at = self._now()
         if self._market_expired(request):
             return self._cancel_expired(request, started)

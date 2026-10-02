@@ -131,7 +131,7 @@ def context(**changes: object) -> DecisionContext:
         "averaging_step_percent": Decimal("0.5"),
         "minimum_net_profit_percent": Decimal("0.5"),
         "completed_partial_sell_steps": 0,
-        "settings": StrategySettings(),
+        "settings": StrategySettings(enabled=True),
         "currency": "RUB",
         "available_free_cash": Decimal("10000"),
         "cycle": TradingCycleState("automation-1", Decimal("98"), None, True, None, NOW),
@@ -251,7 +251,7 @@ def test_decline_from_last_buy_anchor_buys_configured_lots() -> None:
         context(
             current_price=Decimal("99.5"),
             best_ask=Decimal("99.5"),
-            settings=StrategySettings(STRATEGY_BUY_ORDER_LOTS=2),
+            settings=StrategySettings(STRATEGY_BUY_ORDER_LOTS=2, enabled=True),
         )
     )
 

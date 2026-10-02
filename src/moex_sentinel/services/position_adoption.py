@@ -79,7 +79,7 @@ class PositionAdoptionService:
         adopted = existing = held = skipped = 0
         diagnostics: list[PositionAdoptionDiagnostic] = []
         for position in await broker.get_positions(account_id):
-            reason = None
+            reason = PositionAdoptionReason.BOOTSTRAP_BLOCKED_INVENTORY if position.blocked else None
             if position.quantity_lots == 0:
                 skipped += 1
                 continue

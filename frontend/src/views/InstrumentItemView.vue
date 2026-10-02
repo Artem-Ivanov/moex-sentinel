@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tradingAllowed, tradingDisabledReason } from "../runtime"
 import { onBeforeUnmount, onMounted, ref } from "vue"
 import { RouterLink, useRoute, useRouter } from "vue-router"
 
@@ -25,6 +26,7 @@ let refreshTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
 
 async function openTrade(): Promise<void> {
+  if (!tradingAllowed.value) return
   tradeOpen.value = true
   tradeLoading.value = true
   tradeError.value = ""
@@ -37,7 +39,7 @@ async function openTrade(): Promise<void> {
 }
 
 async function startTrade(): Promise<void> {
-  if (!selectedAccount.value) return
+  if (!tradingAllowed.value || !selectedAccount.value) return
   tradeLoading.value = true
   tradeError.value = ""
   try {
@@ -127,6 +129,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <p v-if="!tradingAllowed" role="status">{{ tradingDisabledReason }}</p>
   <section class="page">
     <RouterLink :to="{ name: 'instruments' }" class="hint">← К списку инструментов</RouterLink>
     <p v-if="error" class="error">{{ error }}</p>
@@ -136,9 +139,9 @@ onBeforeUnmount(() => {
       <h2>{{ data.instrument.ticker }} — {{ data.instrument.name }}</h2>
       <div class="toolbar">
         <button
-          :disabled="!data.instrument.is_active || !data.instrument.api_trade_available"
+          :disabled="!tradingAllowed || !data.instrument.is_active || !data.instrument.api_trade_available"
           @click="openTrade"
-        >Торговля</button>
+        :title="!tradingAllowed ? tradingDisabledReason : undefined">Торговля</button>
       </div>
       <article v-if="tradeOpen" class="grid-row trade-panel">
         <strong>Новый торговый автомат</strong>
@@ -149,7 +152,7 @@ onBeforeUnmount(() => {
           </select>
         </label>
         <p v-if="tradeError" class="error">{{ tradeError }}</p>
-        <button :disabled="tradeLoading || !selectedAccount" @click="startTrade">Создать автомат</button>
+        <button :disabled="!tradingAllowed || tradeLoading || !selectedAccount" @click="startTrade">Создать автомат</button>
       </article>
       <div class="detail-grid">
         <article class="grid-row"><strong>Идентификаторы</strong><p>UID: {{ data.instrument.instrument_id }}</p><p>FIGI: {{ data.instrument.figi }}</p><p>Class code: {{ data.instrument.class_code }}</p></article>

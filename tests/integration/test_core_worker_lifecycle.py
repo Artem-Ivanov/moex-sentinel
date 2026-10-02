@@ -104,8 +104,10 @@ class LifecycleContext:
 
 
 @pytest.fixture
-def lifecycle(tmp_path: Path) -> Iterator[LifecycleContext]:
-    app = create_app(database_url=f"sqlite:///{tmp_path / 'core.db'}")
+def lifecycle(tmp_path: Path, monkeypatch) -> Iterator[LifecycleContext]:
+    monkeypatch.setenv("APPLICATION_ENVIRONMENT", "TEST")
+    monkeypatch.setenv("BROKER_ACCESS_MODE", "TRADE")
+    app = create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'core.db'}")
     worker_engine = create_engine(f"sqlite:///{tmp_path / 'worker.db'}")
     WorkerBase.metadata.create_all(worker_engine)
     worker_factory = sessionmaker(worker_engine, expire_on_commit=False)

@@ -24,6 +24,8 @@ class HydrationRepositoryPort(Protocol):
 
     def get_cycle_state(self, automation_id: str, *, now: datetime) -> TradingCycleState: ...
 
+    def get_position_cycle_id(self, automation_id: str) -> str | None: ...
+
     def get_active_intent(self, automation_id: str) -> object | None: ...
 
     def realized_pnl(self, automation_id: str) -> Decimal: ...
@@ -112,8 +114,14 @@ class PositionStateHydrationService:
         self._consistency = consistency
         self._audit = audit
         self._id_factory = id_factory
+        # One committed success per currently monitored automation; restart records it again.
+        self._successful_reconciliations: dict[str, tuple[object, ...]] = {}
 
     async def hydrate(self, commands: tuple[AutomationCommand, ...]) -> None:
+        active_ids = {str(command.automation_id) for command in commands}
+        self._successful_reconciliations = {
+            key: value for key, value in self._successful_reconciliations.items() if key in active_ids
+        }
         results = await asyncio.gather(*(self._hydrate_one(command) for command in commands))
         await self._cache.replace(
             {
@@ -140,39 +148,76 @@ class PositionStateHydrationService:
                 broker_lots = int(position.quantity_lots.to_integral_exact())
             except ArithmeticError:
                 broker_lots = -1
-            await self._audit_reconciliation(
-                command,
-                process_id,
-                BusinessAuditStage.POSITION_RECONCILIATION_STARTED,
-                broker_quantity_lots=broker_lots,
-                worker_quantity_lots=sum(item.remaining_lots for item in lots),
-                reason_code="POSITION_RECONCILIATION_STARTED",
+            automation_id = str(command.automation_id)
+            started_at = self._now()
+            worker_lots_before = sum(item.remaining_lots for item in lots)
+            cycle_id = (
+                await asyncio.to_thread(self._repository.get_position_cycle_id, automation_id)
+                if self._audit is not None
+                else None
             )
-            consistency = await asyncio.to_thread(
-                self._consistency.reconcile,
-                automation_id=str(command.automation_id),
-                broker_lots=broker_lots,
-                average_price=position.average_price,
-            )
-            if not consistency.consistent:
+            try:
+                consistency = await asyncio.to_thread(
+                    self._consistency.reconcile,
+                    automation_id=automation_id,
+                    broker_lots=broker_lots,
+                    average_price=position.average_price,
+                )
+            except Exception:
+                self._successful_reconciliations.pop(automation_id, None)
                 await self._audit_reconciliation(
                     command,
                     process_id,
                     BusinessAuditStage.POSITION_RECONCILIATION_FAILED,
                     broker_quantity_lots=broker_lots,
-                    worker_quantity_lots=sum(item.remaining_lots for item in lots),
+                    worker_quantity_lots=worker_lots_before,
+                    reason_code="POSITION_RECONCILIATION_ERROR",
+                    include_started=True,
+                    started_at=started_at,
+                    started_worker_quantity_lots=worker_lots_before,
+                )
+                raise
+            if not consistency.consistent:
+                self._successful_reconciliations.pop(automation_id, None)
+                await self._audit_reconciliation(
+                    command,
+                    process_id,
+                    BusinessAuditStage.POSITION_RECONCILIATION_FAILED,
+                    broker_quantity_lots=broker_lots,
+                    worker_quantity_lots=worker_lots_before,
                     reason_code=str(consistency.reason_code),
+                    include_started=True,
+                    started_at=started_at,
+                    started_worker_quantity_lots=worker_lots_before,
                 )
                 return None
             lots = list(consistency.lots)
-            await self._audit_reconciliation(
-                command,
-                process_id,
-                BusinessAuditStage.POSITION_RECONCILED,
-                broker_quantity_lots=broker_lots,
-                worker_quantity_lots=sum(item.remaining_lots for item in lots),
-                reason_code="POSITION_CONSISTENT",
+            worker_lots = sum(item.remaining_lots for item in lots)
+            fingerprint = (
+                str(command.broker_id),
+                command.account_id,
+                command.external_instrument_id,
+                cycle_id,
+                position.quantity_lots,
+                worker_lots,
+                position.average_price,
+                "POSITION_CONSISTENT",
             )
+            if cycle_id is None or self._successful_reconciliations.get(automation_id) != fingerprint:
+                self._successful_reconciliations.pop(automation_id, None)
+                await self._audit_reconciliation(
+                    command,
+                    process_id,
+                    BusinessAuditStage.POSITION_RECONCILED,
+                    broker_quantity_lots=broker_lots,
+                    worker_quantity_lots=worker_lots,
+                    reason_code="POSITION_CONSISTENT",
+                    include_started=True,
+                    started_at=started_at,
+                    started_worker_quantity_lots=worker_lots_before,
+                )
+                if cycle_id is not None:
+                    self._successful_reconciliations[automation_id] = fingerprint
         fallback = AdaptiveThresholds(
             self._settings.averaging_step_percent,
             self._settings.partial_take_profit_percent,

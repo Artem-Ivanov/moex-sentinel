@@ -1,3 +1,4 @@
+import { runtime } from "../runtime"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/vue"
 import { createMemoryHistory, createRouter } from "vue-router"
 import { flushPromises } from "@vue/test-utils"
@@ -25,6 +26,7 @@ const candles = { items: [{
 }] }
 
 beforeEach(() => {
+  runtime.value = { environment: "TEST", access_mode: "TRADE" }
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] })
   vi.setSystemTime("2026-08-05T10:00:00Z")
 })
@@ -292,4 +294,18 @@ it("creates trading automation for a user-selected account", async () => {
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
   expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/instruments/broker-1/row-1/trade", expect.objectContaining({ method: "POST" }))
+})
+
+it("explains READ_ONLY and prevents a trading dialog or command", async () => {
+  runtime.value = { environment: "PROD", access_mode: "READ_ONLY" }
+  const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(details)).mockResolvedValueOnce(Response.json(candles))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderView()
+  expect(await screen.findByRole("heading", { name: "SBER — Sber" })).toBeTruthy()
+  const button = screen.getByRole("button", { name: "Торговля" }) as HTMLButtonElement
+  expect(button.disabled).toBe(true)
+  expect(screen.getByText("Только чтение: торговые команды запрещены сервером.")).toBeTruthy()
+  await fireEvent.click(button)
+  expect(screen.queryByRole("button", { name: "Создать автомат" })).toBeNull()
+  expect(fetchMock.mock.calls.every(([url]) => !String(url).endsWith("/accounts") && !String(url).endsWith("/trade"))).toBe(true)
 })

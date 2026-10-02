@@ -48,7 +48,7 @@ def context(**changes: object) -> DecisionContext:
         "averaging_step_percent": Decimal("0.5"),
         "minimum_net_profit_percent": Decimal("0.5"),
         "completed_partial_sell_steps": 0,
-        "settings": StrategySettings(),
+        "settings": StrategySettings(enabled=True),
         "currency": "RUB",
         "min_price_increment": Decimal("0.1"),
         "lots": (),
@@ -82,7 +82,7 @@ def test_buy_requires_reversal_and_blocks_downtrend_and_same_candle() -> None:
 
 
 def test_entry_and_averaging_use_the_same_global_buy_lot_count() -> None:
-    settings = StrategySettings(STRATEGY_BUY_ORDER_LOTS=2)
+    settings = StrategySettings(STRATEGY_BUY_ORDER_LOTS=2, enabled=True)
     entry = AdaptiveScalpingStrategy().decide(
         context(
             quantity_lots=0,

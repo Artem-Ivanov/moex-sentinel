@@ -19,7 +19,7 @@ from moex_sentinel.adapters.tinvest.converters import (
     execution_unit_price,
     quotation_to_decimal,
 )
-from moex_sentinel.adapters.tinvest.portfolio import SANDBOX_TARGET, TInvestPortfolioAdapter
+from moex_sentinel.adapters.tinvest.portfolio import TInvestPortfolioAdapter
 from moex_sentinel.domain.portfolio import ActiveBrokerOrder, ExternalPosition
 from sentinel_contracts.broker_execution import (
     BrokerOrderState,
@@ -30,6 +30,7 @@ from sentinel_contracts.broker_execution import (
     OrderBookSnapshot,
     OrderSide,
 )
+from sentinel_contracts.tinvest import tinvest_environment
 
 ClientFactory = Callable[..., Any]
 
@@ -44,12 +45,29 @@ class TInvestOrderExecutionAdapter:
         token: str,
         target: str,
         client_factory: ClientFactory = _default_client_factory,
+        *,
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
     ) -> None:
-        if target != SANDBOX_TARGET:
-            raise ValueError("Only T-Invest Sandbox execution is allowed.")
+        self._environment = tinvest_environment(target)
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode.")
+        if self._environment == "PROD" and access_mode == "TRADE":
+            raise ValueError("PROD TRADE requires a separate trading admission.")
+        self._access_mode = access_mode
+        self._account_id = account_id
         self._token = token
         self._target = target
         self._client_factory = client_factory
+
+    def _require_trade(self, account_id: str) -> None:
+        if self._access_mode != "TRADE":
+            raise ValueError("Broker mutations are forbidden in READ_ONLY.")
+        self._require_account(account_id)
+
+    def _require_account(self, account_id: str) -> None:
+        if self._account_id and account_id != self._account_id:
+            raise ValueError("Broker account does not match selected scope.")
 
     async def get_order_book(self, instrument_id: str, *, depth: int = 20) -> OrderBookSnapshot:
         async with self._client_factory(self._token, target=self._target) as services:
@@ -68,6 +86,7 @@ class TInvestOrderExecutionAdapter:
         quantity_lots: int,
         price: Decimal,
     ) -> LimitOrderEstimate:
+        self._require_account(account_id)
         request = GetOrderPriceRequest(
             account_id=account_id,
             instrument_id=instrument_id,
@@ -92,6 +111,7 @@ class TInvestOrderExecutionAdapter:
         price: Decimal,
         idempotency_key: str,
     ) -> BrokerOrderState:
+        self._require_trade(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
             response = await services.orders.post_order(
                 instrument_id=instrument_id,
@@ -106,6 +126,7 @@ class TInvestOrderExecutionAdapter:
         return _order_state(response)
 
     async def get_order_state(self, account_id: str, broker_order_id: str) -> BrokerOrderState:
+        self._require_account(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
             response = await services.orders.get_order_state(
                 account_id=account_id,
@@ -115,11 +136,13 @@ class TInvestOrderExecutionAdapter:
         return _order_state(response, order_state=True)
 
     async def cancel_order(self, account_id: str, broker_order_id: str) -> datetime:
+        self._require_trade(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
             response = await services.orders.cancel_order(account_id=account_id, order_id=broker_order_id)
         return cast(datetime, response.time)
 
     async def find_by_idempotency_key(self, account_id: str, idempotency_key: str) -> BrokerOrderState | None:
+        self._require_account(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
             response = await services.orders.get_orders(account_id=account_id)
         for order in response.orders:
@@ -132,8 +155,14 @@ class TInvestOrderExecutionAdapter:
         account_id: str,
         instrument_id: str,
     ) -> tuple[ActiveBrokerOrder, ...]:
+        self._require_account(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
             response = await services.orders.get_orders(account_id=account_id)
+            stops = (
+                await services.stop_orders.get_stop_orders(account_id=account_id)
+                if self._environment == "PROD"
+                else None
+            )
         terminal = {
             "EXECUTION_REPORT_STATUS_FILL",
             "EXECUTION_REPORT_STATUS_CANCELLED",
@@ -149,9 +178,14 @@ class TInvestOrderExecutionAdapter:
             for order in response.orders
             if str(getattr(order, "instrument_uid", "")) == instrument_id
             and enum_name(order.execution_report_status) not in terminal
+        ) + tuple(
+            ActiveBrokerOrder(account_id, instrument_id, str(order.stop_order_id), "ACTIVE_STOP_ORDER")
+            for order in getattr(stops, "stop_orders", ())
+            if str(order.instrument_uid) == instrument_id
         )
 
     async def get_positions(self, account_id: str) -> tuple[ExternalPosition, ...]:
+        self._require_account(account_id)
         return await TInvestPortfolioAdapter(
             self._token,
             self._target,
@@ -159,8 +193,13 @@ class TInvestOrderExecutionAdapter:
         ).get_positions(account_id)
 
     async def get_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None:
+        self._require_account(account_id)
         async with self._client_factory(self._token, target=self._target) as services:
-            response = await services.sandbox.get_sandbox_portfolio(account_id=account_id)
+            response = await (
+                services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                if self._environment == "TEST"
+                else services.operations.get_portfolio(account_id=account_id)
+            )
         for position in response.positions:
             if position.instrument_uid == instrument_id:
                 average = position.average_position_price

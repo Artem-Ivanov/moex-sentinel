@@ -33,5 +33,7 @@ def map_request_error(error: AioRequestError | AioRpcError) -> TInvestAdapterErr
 def invalid_response_error() -> TInvestAdapterError:
     """Keep malformed broker values non-retryable and exclude their contents from messages."""
     return TInvestAdapterError(
-        "BROKER_UNAVAILABLE", "Не удалось получить данные площадки.", retryable=False  # noqa: RUF001
+        "BROKER_UNAVAILABLE",
+        "Не удалось получить данные площадки.",
+        retryable=False,  # noqa: RUF001
     )

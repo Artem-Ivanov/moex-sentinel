@@ -12,6 +12,7 @@ from moex_sentinel.domain.instrument_catalog import (
     CatalogReconciliationResult,
     InstrumentDetailsView,
 )
+from moex_sentinel.domain.position_adoption import PositionAdoptionResult
 from moex_sentinel.views.schemas.market_data import LastPriceSchema
 from sentinel_contracts.base import PositionalModel
 
@@ -97,6 +98,7 @@ class ReconciliationResultSchema(StrictSchema):
     updated: int
     deactivated: int
     synchronized_at: datetime
+    adoption: PositionAdoptionResult | None = None
 
     @classmethod
     def from_domain(cls, value: CatalogReconciliationResult) -> "ReconciliationResultSchema":

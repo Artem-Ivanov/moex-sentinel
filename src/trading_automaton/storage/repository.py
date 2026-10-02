@@ -800,6 +800,14 @@ class LocalAutomationRepository:
                 model.last_sequence_number,
             )
 
+    def get_cached_command(self, automation_id: str) -> TypedAutomationCommand:
+        """Return scope metadata even after an automation has reached CLOSED."""
+        with self._factory() as session:
+            model = session.get(CachedAutomationModel, automation_id)
+            if model is None:
+                raise ValueError("Fact delivery scope is missing from the Worker ledger")
+            return self._command(model)
+
     def cache_command(self, command: TypedAutomationCommand) -> bool:
         with self._factory.begin() as session:
             automation_id = str(command.automation_id)
@@ -1634,6 +1642,14 @@ class LocalAutomationRepository:
             )
             return None if model is None else self._intent_record(model)
 
+    def has_active_intents(self) -> bool:
+        """Check all pending execution, including orphan intents and SELLs."""
+        with self._factory() as session:
+            return (
+                session.scalar(select(LocalIntentModel.idempotency_key).where(self._active_intent_predicate()).limit(1))
+                is not None
+            )
+
     def list_active_buy_intent_reservations(
         self,
         broker_id: str | None = None,
@@ -2042,6 +2058,15 @@ class LocalAutomationRepository:
                 )
                 lot.remaining_lots -= allocated
                 remaining -= allocated
+
+    def get_position_cycle_id(self, automation_id: str) -> str | None:
+        """Read the current financial cycle identity without creating state."""
+        with self._factory() as session:
+            return session.scalar(
+                select(CachedAutomationModel.position_cycle_id).where(
+                    CachedAutomationModel.automation_id == automation_id
+                )
+            )
 
     def get_cycle_state(self, automation_id: str, *, now: datetime) -> TradingCycleState:
         with self._factory.begin() as session:

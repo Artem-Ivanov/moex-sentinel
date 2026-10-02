@@ -81,7 +81,11 @@ class FactSynchronizationService:
         retry_limit: int = 5,
         batch_size: int = 100,
         deadline_ms: int = 1000,
+        validate_commands: Callable[[list[AutomationCommand]], None] | None = None,
+        validate_facts: Callable[[list[FactEnvelope]], None] | None = None,
     ) -> None:
+        self._validate_facts = validate_facts
+        self._validate_commands = validate_commands
         self._repository = repository
         self._client = client
         self._now = now
@@ -93,6 +97,8 @@ class FactSynchronizationService:
 
     def claim_commands(self, worker_id: str, limit: int) -> list[AutomationCommand]:
         commands = self._client.claim_commands(worker_id, limit)
+        if self._validate_commands is not None:
+            self._validate_commands(commands)
         return [command for command in commands if self._repository.cache_command(command)]
 
     def flush_outbox(self) -> bool:
@@ -105,6 +111,8 @@ class FactSynchronizationService:
         if not rows:
             return True
         facts = [self._envelope(row) for row in rows]
+        if self._validate_facts is not None:
+            self._validate_facts(facts)
         attempt = 0
         while True:
             try:

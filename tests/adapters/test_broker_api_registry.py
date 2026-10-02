@@ -19,7 +19,7 @@ def test_registry_exposes_tinvest_by_stable_slug() -> None:
 
     assert registry.list() == (module.descriptor,)
     assert module.descriptor.api_slug == "t_invest"
-    assert module.descriptor.environments == ("TEST",)
+    assert module.descriptor.environments == ("TEST", "PROD")
     assert module.default_fqdn("TEST") == "sandbox-invest-public-api.tbank.ru:443"
 
 
@@ -54,8 +54,8 @@ def test_tinvest_settings_reject_provisioning_fields() -> None:
 
 
 def test_tinvest_module_rejects_unsupported_environment() -> None:
-    with pytest.raises(BrokerApiEnvironmentError, match="PROD"):
-        TInvestApiModule().default_fqdn("PROD")
+    with pytest.raises(BrokerApiEnvironmentError, match="UNKNOWN"):
+        TInvestApiModule().default_fqdn("UNKNOWN")
 
 
 def test_registry_rejects_duplicate_api_slugs() -> None:

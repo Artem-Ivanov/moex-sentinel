@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tradingAllowed, tradingDisabledReason } from "../runtime"
 import { computed, onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 
@@ -69,7 +70,7 @@ const details = () => selected.value && router.push({
 })
 
 async function action(operation: (id: string) => Promise<Automation>): Promise<void> {
-  if (!selected.value || actionPending.value || refreshing.value) return
+  if ((!tradingAllowed.value && operation !== holdAutomation) || !selected.value || actionPending.value || refreshing.value) return
   actionPending.value = true
   error.value = ""
   try {
@@ -82,6 +83,7 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
 </script>
 
 <template>
+  <p v-if="!tradingAllowed" role="status">{{ tradingDisabledReason }}</p>
   <section class="page">
     <div class="page-title">
       <div><p class="eyebrow">Портфель и операции</p><h2>Торговля</h2></div>
@@ -98,8 +100,8 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
       <div class="toolbar">
         <button :disabled="!selected || actionPending || refreshing" @click="details">Подробнее</button>
         <button :disabled="!selected || actionPending || refreshing || !['IN_QUEUE', 'IN_WORK'].includes(selected.state)" @click="action(holdAutomation)">Hold</button>
-        <button :disabled="!selected || actionPending || refreshing || selected.state !== 'HOLD' || selected.resume_requested" @click="action(resumeAutomation)">Resume</button>
-        <button :disabled="!selected || actionPending || refreshing || selected.state === 'CLOSED'" @click="action(closeAutomation)">Закрыть автомат</button>
+        <button :disabled="!tradingAllowed || !selected || actionPending || refreshing || selected.state !== 'HOLD' || selected.resume_requested" @click="action(resumeAutomation)">Resume</button>
+        <button :disabled="!tradingAllowed || !selected || actionPending || refreshing || selected.state === 'CLOSED'" @click="action(closeAutomation)">Закрыть автомат</button>
       </div>
     </div>
     <p v-if="error" class="error">{{ error }}</p>

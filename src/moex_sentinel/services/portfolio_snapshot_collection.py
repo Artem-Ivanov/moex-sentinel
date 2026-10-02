@@ -15,6 +15,7 @@ from moex_sentinel.domain.trading_summary import (
     advance_cumulative_pnl,
     cash_flows,
 )
+from moex_sentinel.services.environment import EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
 from moex_sentinel.services.ports import BrokerRepositoryPort
 from sentinel_contracts.time import floor_utc_millisecond
@@ -53,11 +54,13 @@ class PortfolioSnapshotCollectionService:
         history: LatestPortfolioSnapshotPort,
         *,
         clock: Callable[[], datetime],
+        environment: EnvironmentStatePort | None = None,
         retry_limit: int = 2,
         retry_base_seconds: float = 1.0,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._brokers = brokers
+        self._environment = environment
         self._adapter_factory = adapter_factory
         self._history = history
         self._clock = clock
@@ -72,7 +75,10 @@ class PortfolioSnapshotCollectionService:
         snapshots: list[PortfolioSnapshotValue] = []
         errors: list[BrokerReadError] = []
         for broker in self._brokers.list():
-            if not broker.enabled:
+            if not broker.enabled or (
+                self._environment is not None
+                and broker.is_test != (self._environment.view().active_environment == "TEST")
+            ):
                 continue
             try:
                 adapter = self._adapter_factory(broker)

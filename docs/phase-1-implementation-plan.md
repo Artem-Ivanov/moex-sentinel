@@ -6,6 +6,53 @@
 объясняет судьбу каждого прежнего требования. [Предыдущая версия этого файла](phase-1-implementation-plan-archive-2026-09-09.md)
 сохранена как история приёмок, а не инструкция к повторному выполнению.
 
+## Дополнение 02.10.2026: VPS, эксплуатация и реальный API
+
+Уточнение владельца: одна PostgreSQL/одна database для TEST и PROD, без отдельной
+PROD БД. Первоначальный prototype остановлен, volumes сохранены. Перед
+объединением Core нужны contour guards/summary/collector и обновление Sandbox.
+Сначала завершить [анализ оркестрации и Worker storage](audits/2026-10-02-orchestration-and-worker-storage.md):
+Worker оркестрирует исполнение, его durable состояние не заменяется чтением
+брокерского портфеля; перенос Worker/Redis/RabbitMQ ещё не выбраны.
+Отдельный dedup audit реализован и интегрирован, независимое ревью81 PASS,
+root44 PASS; deployment и измерение уменьшения роста ещё открыты.
+
+Пользователь добавил новую очередь; прежний performance backlog ниже сохранён.
+Каталог и шесть позиций Sandbox получены из API, Worker завершил bootstrap.
+Повторная read-only проверка02.10: SSH/sudo работают; running strategy=false,
+broker/Core/Worker qty/avg и scope сверены, intent/order/execution отсутствуют,
+12 событий доставлены с ACK, frontend r2/каталог/позиции видны в браузере.
+Финальный browser прогон exit0: logout204, session401, ошибок нет.
+Полная runtime приёмка остаётся открытой в части restart без дублей.
+Storage baseline измерен и независимо
+перепроверен; S1 ещё требует24ч/7суток. Доказательства:
+`develop/reports/vps-audit-20261002/`. Предыдущая auto-review ошибка403 не повторилась.
+
+| Порядок | Веха | Условие готовности |
+|---|---|---|
+| 1 | Завершить текущую Sandbox приёмку | Свежая сверка и независимый runtime review; состояние из CURRENT не заменяет проверку |
+| 2 | O1/S1: диагностика и ёмкость | Статус/audit доступны оператору; замеры24ч и подтверждение7дней дают диапазон хранения30/180дней |
+| 3 | PROD P1/P2: базовый код/tests PASS, объединение БД открыто | Одна Core PostgreSQL, все scope guards и collector, новый capacity gate и live приёмка |
+| 4 | O2/PROD P3/P4: готовность | Уведомления, лимиты/controlled takeover, восстановление и сверка реального счёта приняты |
+| 5 | PROD P5: canary | Отдельный допуск владельца, численные лимиты и один разрешённый UID; расширение отдельно |
+
+Документы перехода: [PROD design](superpowers/specs/2026-10-02-production-api-design.md),
+[план перехода](superpowers/plans/2026-10-02-production-api.md),
+[наблюдаемость](deployment/observability-plan.md),
+[хранение30/180дней](deployment/storage-capacity.md).
+Идентификаторы P1–P5 здесь относятся к PROD плану, а не оценкам приоритета
+P1/P2 прежнего performance backlog. Код PROD P1/P2 реализован; независимый
+`/root/prod_integration_review_retry` — code PASS (150 Python,29 UI).
+Наблюдаемость, retention и P3/P4/P5 остаются открытыми. PROD не развёрнут;
+capacity gate требуемой общей БД ещё не пройден, реальные авторизованные чтения не проверены.
+SDK1.49.3 AsyncClient с синтетическим неверным токеном дал UNAUTHENTICATED:
+подтверждены TLS/gRPC, без авторизации RPC; evidence
+`develop/reports/prod-api-20261002/prod-sdk-network.json`.
+Владелец вводит реальный read-only PROD токен через UI; Sandbox token/account/
+ledger не копируются. Текущее развёртывание Sandbox не изменено.
+Пользователь разрешил поэтапную реализацию чтение→торговля; реальные
+заявки и очистка рабочих фактов требуют отдельного допуска.
+
 ## Завершённая веха: 0.9.8 — ограниченная по памяти доставка outbox и корректные повторы
 
 **[x] Принята 28.09.** W1, W2a, W2b и V0 выполнены. Сквозные

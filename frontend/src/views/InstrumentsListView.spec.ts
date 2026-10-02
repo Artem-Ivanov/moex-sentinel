@@ -23,6 +23,43 @@ const catalogWithTwoItems = {
   categories: [{ code: "SHARE", label: "Акции", count: 2 }],
 }
 
+it.each([{ brokers: [] }, { brokers: [{ id: "draft-1", display_name: "Sandbox", enabled: false }] }])(
+  "guides users to broker settings when no enabled connection exists (%j)",
+  async ({ brokers }) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ adapters: [], brokers }))
+    vi.stubGlobal("fetch", fetchMock)
+    const router = createRouter({ history: createMemoryHistory(), routes: [
+      { path: "/instruments", name: "instruments", component: InstrumentsListView },
+      { path: "/brokers", name: "brokers", component: { template: "<div>Настройки брокера</div>" } },
+    ] })
+    await router.push({ name: "instruments" }); await router.isReady()
+    render(InstrumentsListView, { global: { plugins: [router] } })
+
+    expect(await screen.findByText("Чтобы загрузить инструменты, настройте подключение брокера и выберите счёт.")).toBeTruthy()
+    expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole("option", { name: "Sandbox" })).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await fireEvent.click(screen.getByRole("link", { name: "Настроить брокера" }))
+    await waitFor(() => expect(router.currentRoute.value.name).toBe("brokers"))
+  },
+)
+
+it("does not show broker setup guidance while settings load or fail", async () => {
+  let rejectSettings!: (reason: Error) => void
+  vi.stubGlobal("fetch", vi.fn().mockReturnValue(new Promise((_resolve, reject) => { rejectSettings = reject })))
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: "/instruments", name: "instruments", component: InstrumentsListView },
+    { path: "/brokers", name: "brokers", component: { template: "<div/>" } },
+  ] })
+  await router.push({ name: "instruments" }); await router.isReady()
+  render(InstrumentsListView, { global: { plugins: [router] } })
+
+  expect(screen.queryByRole("link", { name: "Настроить брокера" })).toBeNull()
+  rejectSettings(new Error("Settings unavailable"))
+  expect(await screen.findByText("Не удалось загрузить справочник инструментов.")).toBeTruthy()
+  expect(screen.queryByRole("link", { name: "Настроить брокера" })).toBeNull()
+})
+
 it("renders backend categories, highlights selected item and opens ItemView", async () => {
   vi.stubGlobal("fetch", vi.fn()
     .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [{ id: "broker-1", display_name: "Sandbox", enabled: true }] }))
@@ -197,4 +234,39 @@ it("uses an accessible boolean switch to update selection", async () => {
     "/api/brokers/broker-1/instruments/row-1/selection",
     expect.objectContaining({ method: "PUT" }),
   )
+})
+
+it.each([false, true])("shows adoption exceptions despite catalog success or refresh failure (%s)", async (refreshFails) => {
+  const account = "production-account-12345678"
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [{ id: "broker-1", display_name: "PROD", enabled: true }] }))
+    .mockResolvedValueOnce(Response.json(catalog))
+    .mockResolvedValueOnce(Response.json({ broker_id: "broker-1", added: 0, updated: 1, deactivated: 0, synchronized_at: "2026-10-02T00:00:00Z", adoption: {
+      adopted: 2, existing: 3, held: 1, skipped: 2, diagnostics: [
+        { account_id: account, external_instrument_id: "uid-blocked", reason: "BOOTSTRAP_BLOCKED_INVENTORY" },
+        { account_id: account, external_instrument_id: "uid-short", reason: "BOOTSTRAP_INVALID_QUANTITY" },
+        { account_id: account, external_instrument_id: "uid-order", reason: "BOOTSTRAP_ACTIVE_ORDER" },
+        { account_id: account, external_instrument_id: "uid-conflict", reason: "BOOTSTRAP_CONFLICT" },
+      ],
+    } }))
+    .mockResolvedValueOnce(refreshFails
+      ? Response.json({ detail: { message: "Catalog refresh unavailable." } }, { status: 503 })
+      : Response.json(catalog))
+  vi.stubGlobal("fetch", fetchMock)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: "/instruments", name: "instruments", component: InstrumentsListView }] })
+  await router.push("/instruments"); await router.isReady()
+  render(InstrumentsListView, { global: { plugins: [router] } })
+  await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  expect(await screen.findByText("Позиции: принято 2, уже учтено 3, требуют сверки 1, пропущено 2.")).toBeTruthy()
+  expect(screen.getByRole("alert").textContent).toContain("Заблокированный остаток")
+  expect(screen.getByRole("alert").textContent).toContain("Короткая позиция или некорректное количество")
+  expect(screen.getByRole("alert").textContent).toContain("Есть активная заявка")
+  expect(screen.getByRole("alert").textContent).toContain("Новый снимок не принят")
+  expect(screen.getByRole("alert").textContent).toContain("не подтверждает остановку автомата")
+  expect(document.body.textContent).not.toContain("HOLD")
+  expect(screen.getByRole("alert").textContent).toContain("••••5678")
+  expect(document.body.textContent).not.toContain(account)
+  expect(screen.getByText(/Добавлено: 0, обновлено: 1/)).toBeTruthy()
+  if (refreshFails) expect(await screen.findByText("Catalog refresh unavailable.")).toBeTruthy()
 })

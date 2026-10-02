@@ -8,7 +8,7 @@ from moex_sentinel.api.app import create_app
 
 
 def test_health_reports_available_database(tmp_path: Path) -> None:
-    application = create_app(database_url=f"sqlite:///{tmp_path / 'health.db'}")
+    application = create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'health.db'}")
 
     with TestClient(application) as client:
         response = client.get("/api/health")
@@ -29,6 +29,7 @@ def test_health_reports_database_failure_without_exposing_error() -> None:
         raise RuntimeError("sensitive connection detail")
 
     application = create_app(
+        test_auth_bypass=True,
         database_url="sqlite:///:memory:",
         database_checker=unavailable,
     )
@@ -52,6 +53,7 @@ def test_health_reports_schema_incompatibility_separately_without_exposing_revis
         raise RuntimeError("synthetic-actual-revision")
 
     application = create_app(
+        test_auth_bypass=True,
         database_url="sqlite:///:memory:",
         schema_checker=incompatible,
     )
@@ -72,7 +74,7 @@ def test_health_reports_schema_incompatibility_separately_without_exposing_revis
 
 def test_http_process_id_is_inherited_when_header_is_valid(tmp_path: Path) -> None:
     process_id = "9c8a54fd-0000-4000-8000-000000000001"
-    application = create_app(database_url=f"sqlite:///{tmp_path / 'health-context.db'}")
+    application = create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'health-context.db'}")
 
     with TestClient(application) as client:
         response = client.get("/api/health", headers={"X-Process-ID": process_id})
@@ -88,6 +90,7 @@ def test_unavailable_database_skips_schema_probe() -> None:
         return True
 
     application = create_app(
+        test_auth_bypass=True,
         database_url="sqlite:///:memory:",
         database_checker=lambda _engine: False,
         schema_checker=schema_probe,

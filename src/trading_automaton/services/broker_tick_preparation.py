@@ -128,6 +128,7 @@ class BrokerTickPreparationService:
         position = await self._portfolio.position(command.account_id, command.external_instrument_id)
         if (
             position is None
+            or position.blocked
             or position.quantity_lots != expected.quantity_lots
             or position.average_price != expected.average_price
             or position.currency.upper() != expected.currency.upper()

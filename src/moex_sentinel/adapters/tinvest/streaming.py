@@ -20,7 +20,7 @@ from sentinel_contracts.streaming_market import (
     StreamTradingStatus,
 )
 
-type MarketStreamEvent = (StreamOrderBook | StreamLastPrice | StreamTradingStatus | StreamCandle)
+type MarketStreamEvent = StreamOrderBook | StreamLastPrice | StreamTradingStatus | StreamCandle
 
 
 class SubscriptionManager(Protocol):

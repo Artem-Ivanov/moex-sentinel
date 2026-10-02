@@ -56,7 +56,7 @@ def test_remote_snapshot_expiry_prevents_durable_batch(after_load):
             DelayedStates(),
             batch,
             now=lambda: clock[0],
-            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            materializer=DecisionMaterializerService(settings=StrategySettings(enabled=True)),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable("remote", NOW, {}).model_copy(
@@ -90,7 +90,7 @@ def test_invalid_book_isolated_from_valid_position_batch(invalid: str, caplog, m
                 now=lambda: NOW, cycles=TradingCycleService(), order_books=OrderBookValidationService()
             ),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            materializer=DecisionMaterializerService(settings=StrategySettings(enabled=True)),
             order_books=OrderBookValidationService(),
         )
         valid_book = StreamOrderBook(
@@ -146,7 +146,7 @@ def test_snapshot_clock_is_shared_by_cycle_and_decision() -> None:
                 order_books=OrderBookValidationService(),
             ),
             now=lambda: NOW + timedelta(seconds=3),
-            materializer=DecisionMaterializerService(settings=StrategySettings()),
+            materializer=DecisionMaterializerService(settings=StrategySettings(enabled=True)),
             order_books=OrderBookValidationService(),
         )
         market = InstrumentMarketState(
@@ -245,7 +245,9 @@ def test_assembles_decision_intent_and_dispatch_from_one_snapshot() -> None:
             cash=cash,
             now=lambda: NOW,
             audit=audit,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -318,7 +320,9 @@ def test_batch_reuses_prepared_commission_for_persistence_dispatch_and_audit() -
             batch,
             now=lambda: NOW,
             audit=audit,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -384,7 +388,9 @@ def test_batch_never_reestimates_prepared_buy_or_sell_commission() -> None:
             batch,
             now=lambda: NOW,
             audit=audit,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: next(ids)
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -434,7 +440,9 @@ def test_applies_cycle_transition_before_decision_and_persists_updated_cycle() -
             batch,
             cycles=Cycles(),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -486,7 +494,9 @@ def test_batch_rollback_does_not_publish_cycle_transition_to_hot_state() -> None
             FailingBatch(),
             cycles=Cycles(),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -538,7 +548,9 @@ def test_postcommit_failure_publishes_committed_cycle_before_propagating() -> No
             PostCommitFailingBatch(),
             cycles=Cycles(),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -606,7 +618,9 @@ def test_budgets_parallel_buy_intents_without_publishing_precommit_reservation()
             cash=cash,
             now=lambda: NOW,
             audit=audit,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: next(ids)
+            ),
             order_books=OrderBookValidationService(),
         )
         second = baseline_command(automation="automation-2", instrument="instrument-2")
@@ -655,7 +669,9 @@ def test_does_not_publish_decision_audit_when_batch_persistence_fails() -> None:
             FailingBatch(),
             now=lambda: NOW,
             audit=audit,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -719,7 +735,9 @@ def test_does_not_read_cash_for_non_buy_decisions(kind: DecisionKind) -> None:
             Batch(),
             cash=ForbiddenCash(),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -771,7 +789,7 @@ def test_serializes_concurrent_ticks_before_cash_budgeting() -> None:
             cash=cash,
             now=lambda: NOW,
             materializer=DecisionMaterializerService(
-                settings=StrategySettings(), id_factory=lambda: f"id-{next(counter)}"
+                settings=StrategySettings(enabled=True), id_factory=lambda: f"id-{next(counter)}"
             ),
             order_books=OrderBookValidationService(),
         )
@@ -824,7 +842,9 @@ def test_marks_position_as_having_active_intent_immediately_after_persistence() 
             states,
             PersistingBatch(),
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "intent-1"),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: "intent-1"
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(
@@ -908,11 +928,7 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
         scheduler = PositionBatchSchedulerService(decider, active_intents=active_intents)
         repository = Repository()
         batch = BatchTradingRuntimeService(
-            repository,
-            Dispatcher(),
-            Tracking(),
-            now=lambda: NOW,
-            active_intents=active_intents,
+            repository, Dispatcher(), Tracking(), now=lambda: NOW, active_intents=active_intents, access_mode="TRADE"
         )
         ids = iter(("process-1", "intent-1", "process-2"))
         tick = StreamingBatchTickService(
@@ -920,7 +936,9 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
             states,
             batch,
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: next(ids)),
+            materializer=DecisionMaterializerService(
+                settings=StrategySettings(enabled=True), id_factory=lambda: next(ids)
+            ),
             order_books=OrderBookValidationService(),
         )
         snapshot = MarketBatchSnapshot.immutable(

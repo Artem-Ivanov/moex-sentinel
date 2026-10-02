@@ -59,10 +59,10 @@ def test_trading_summary_contract_reports_currencies_periods_and_safe_errors(mon
     )
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(view_trading_summary=Execute(summary)),
+        lambda _factory, *, settings: SimpleNamespace(view_trading_summary=Execute(summary)),
     )
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'summary.db'}")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'summary.db'}")) as client:
         response = client.get("/api/trading/summary")
 
     assert response.status_code == 200
@@ -92,10 +92,12 @@ def test_trading_summary_contract_reports_currencies_periods_and_safe_errors(mon
 def test_trading_summary_contract_has_explicit_empty_state(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(view_trading_summary=Execute(TradingSummaryView(None, (), ()))),
+        lambda _factory, *, settings: SimpleNamespace(view_trading_summary=Execute(TradingSummaryView(None, (), ()))),
     )
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'empty-summary.db'}")) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'empty-summary.db'}")
+    ) as client:
         response = client.get("/api/trading/summary")
 
     assert response.status_code == 200

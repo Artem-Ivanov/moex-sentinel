@@ -8,6 +8,14 @@
 
 ```bash
 cp .env.example .env
+uv sync --all-extras
+uv run python -m moex_sentinel.api.auth hash-password
+```
+
+Сохраните выведенный verifier в `AUTH_PASSWORD_HASH` файла `.env`. Для локального
+HTTP задайте там `AUTH_INSECURE_LOOPBACK=true`.
+
+```bash
 docker volume create moex-sentinel-postgres-data
 docker volume create moex-sentinel_automaton-data
 docker compose -f compose.yml --profile build build python-base

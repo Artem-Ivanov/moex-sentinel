@@ -1,8 +1,11 @@
+import { runtime } from "../runtime"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/vue"
 import { createMemoryHistory, createRouter } from "vue-router"
-import { afterEach, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, expect, it, vi } from "vitest"
 
 import PositionsListView from "./PositionsListView.vue"
+
+beforeEach(() => { runtime.value = { environment: "TEST", access_mode: "TRADE" } })
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 

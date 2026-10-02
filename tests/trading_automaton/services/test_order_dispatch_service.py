@@ -87,7 +87,7 @@ def test_expired_market_cancels_persisted_intent_without_broker_call(delay_in_au
         release.set()
         broker = Broker(release)
         repository = Repository()
-        service = OrderDispatchService(repository, broker, now=lambda: clock[0], audit=Audit())
+        service = OrderDispatchService(repository, broker, now=lambda: clock[0], audit=Audit(), access_mode="TRADE")
         started = asyncio.get_running_loop().create_future()
         value = request().model_copy(update={"market_valid_until": NOW + timedelta(seconds=2), "process_id": "process"})
         result = await service.dispatch(value, started)
@@ -107,7 +107,7 @@ def test_marks_sdk_start_before_waiting_for_broker_response() -> None:
         broker = Broker(release)
         started = asyncio.get_running_loop().create_future()
         repository = Repository()
-        service = OrderDispatchService(repository, broker, now=lambda: NOW)
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, access_mode="TRADE")
         task = asyncio.create_task(service.dispatch(request(), started))
         await broker.called.wait()
         assert started.result() == NOW
@@ -149,7 +149,7 @@ def test_ambiguous_sdk_failure_marks_intent_uncertain() -> None:
         repository = Repository()
         broker = Broker(release, error=TimeoutError("synthetic timeout"))
         started = asyncio.get_running_loop().create_future()
-        service = OrderDispatchService(repository, broker, now=lambda: NOW)
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, access_mode="TRADE")
         with pytest.raises(TimeoutError):
             await service.dispatch(request(), started)
         return repository
@@ -182,7 +182,7 @@ def test_sdk_failure_recovers_order_by_idempotency_key() -> None:
         )
         repository = Repository()
         broker = Broker(release, error=TimeoutError("synthetic timeout"), reconciled=reconciled)
-        service = OrderDispatchService(repository, broker, now=lambda: NOW)
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, access_mode="TRADE")
         started = asyncio.get_running_loop().create_future()
         result = await service.dispatch(request(), started)
         return result, repository, broker
@@ -242,7 +242,7 @@ def test_ambiguous_dispatch_audit_preserves_only_safe_error_details(failure, exp
                 records.append(values)
 
         repository = OrderedRepository()
-        service = OrderDispatchService(repository, broker, now=lambda: NOW, audit=Audit())
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, audit=Audit(), access_mode="TRADE")
         value = request().model_copy(update={"process_id": "process"})
         started = asyncio.get_running_loop().create_future()
 

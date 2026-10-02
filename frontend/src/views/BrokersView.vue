@@ -110,6 +110,7 @@ function selectAdapter(code: string) {
   draft.value.adapter_code = code
   draft.value.provider_code = selected.value.provider_code
   draft.value.environment_code = selected.value.environment_code
+  draft.value.is_test = selected.value.environment_code !== "PROD"
   draft.value.fields = selected.value.fields.map((field) => ({
     name: field.name,
     value: field.default_value ?? "",
@@ -181,6 +182,7 @@ async function remove(id: string) {
         <div>
           <strong>{{ broker.display_name }}</strong>
           <small>{{ broker.provider_code }} · {{ broker.environment_code }}</small>
+          <small>Счёт: {{ broker.account_id ?? "не выбран" }}</small>
           <p v-if="status[broker.id]" class="hint">{{ status[broker.id] }}</p>
         </div>
         <div class="actions" @dblclick.stop>
@@ -195,6 +197,7 @@ async function remove(id: string) {
       v-model:draft="draft"
       :mode="formMode"
       :adapters="data?.adapters ?? []"
+      :account-locked="!!editingBrokerId && !!data?.brokers.find(broker => broker.id === editingBrokerId)?.account_id"
       :field-errors="fieldErrors"
       @select-adapter="selectAdapter"
       @clear-field="clearField"

@@ -161,9 +161,18 @@ def test_two_positions_complete_one_http_batch_and_publish_terminal_facts(tmp_pa
             transport=httpx.ASGITransport(create_app(source, now=lambda: clock[0])), base_url="http://analytics"
         )
         bundle = await build_broker_runtime(
-            BrokerConnection(str(values[0].broker_id), "TINVEST_SANDBOX", "fixture-target", "synthetic-token", True),
+            BrokerConnection(
+                str(values[0].broker_id),
+                "TINVEST_SANDBOX",
+                "sandbox-invest-public-api.tbank.ru:443",
+                "synthetic-token",
+                True,
+                access_mode="TRADE",
+            ),
             repository,
-            strategy_settings=StrategySettings(),
+            worker_access_mode="TRADE",
+            application_environment="TEST",
+            strategy_settings=StrategySettings(enabled=True),
             session_factory=lambda _: session,
             now=lambda: clock[0],
             analytics_client=AnalyticsClient(client),
@@ -216,9 +225,18 @@ def test_real_http_outage_runs_recovery_without_market_fallback_then_recovers(tm
             transport=httpx.ASGITransport(create_app(source, now=lambda: clock[0])), base_url="http://analytics"
         )
         bundle = await build_broker_runtime(
-            BrokerConnection(str(value.broker_id), "TINVEST_SANDBOX", "fixture-target", "synthetic-token", True),
+            BrokerConnection(
+                str(value.broker_id),
+                "TINVEST_SANDBOX",
+                "sandbox-invest-public-api.tbank.ru:443",
+                "synthetic-token",
+                True,
+                access_mode="TRADE",
+            ),
             repository,
-            strategy_settings=StrategySettings(),
+            worker_access_mode="TRADE",
+            application_environment="TEST",
+            strategy_settings=StrategySettings(enabled=True),
             session_factory=lambda _: session,
             now=lambda: clock[0],
             analytics_client=AnalyticsClient(client),

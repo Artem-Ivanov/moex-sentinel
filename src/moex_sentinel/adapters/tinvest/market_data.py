@@ -11,7 +11,6 @@ from t_tech.invest.schemas import CandleInterval as SdkCandleInterval
 from t_tech.invest.schemas import InstrumentIdType, InstrumentStatus
 
 from moex_sentinel.adapters.tinvest.converters import enum_name, quotation_to_decimal
-from moex_sentinel.adapters.tinvest.portfolio import SANDBOX_TARGET
 from moex_sentinel.adapters.tinvest.request_errors import (
     SDK_REQUEST_ERRORS,
     invalid_response_error,
@@ -24,6 +23,7 @@ from moex_sentinel.domain.market_data import (
     LastPrice,
     MarketInstrument,
 )
+from sentinel_contracts.tinvest import tinvest_environment
 
 ClientFactory = Callable[..., Any]
 logger = logging.getLogger(f"uvicorn.error.{__name__}")
@@ -49,8 +49,7 @@ class TInvestMarketDataAdapter:
         target: str,
         client_factory: ClientFactory = _default_client_factory,
     ) -> None:
-        if target != SANDBOX_TARGET:
-            raise ValueError("Only the configured Sandbox target is allowed.")
+        self._environment = tinvest_environment(target)
         self._token = token
         self._target = target
         self._client_factory = client_factory

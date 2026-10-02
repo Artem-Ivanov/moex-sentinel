@@ -25,6 +25,7 @@ from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.market_data import HistoricCandle
 from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
 from sentinel_contracts.time import floor_utc_millisecond
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
 
 LOGGER = logging.getLogger(__name__)
@@ -41,10 +42,23 @@ class BrokerSdkSession:
         token: str,
         target: str,
         *,
+        environment: str = "TEST",
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
         client_factory: Callable[..., Any] = _default_client_factory,
         snapshot_ttl_seconds: float = 60.0,
         monotonic: Callable[[], float] = system_monotonic,
     ) -> None:
+        resolve_tinvest_endpoint(environment, "TINVEST_SANDBOX" if environment == "TEST" else "TINVEST_PROD", target)
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        if environment == "PROD" and not account_id.strip():
+            raise ValueError("PROD requires selected account_id")
+        if environment == "PROD" and access_mode == "TRADE":
+            raise ValueError("PROD TRADE is not enabled in this phase")
+        self._environment = environment
+        self._access_mode = access_mode
+        self._account_id = account_id
         if snapshot_ttl_seconds <= 0:
             raise ValueError("Account snapshot TTL must be positive.")
         self._token = token
@@ -81,6 +95,7 @@ class BrokerSdkSession:
             self._money_cache.clear()
 
     async def quote(self, request: CommissionRefreshRequest, side: str) -> CommissionQuote:
+        self._validate_account(request.key.account_id)
         direction = OrderDirection.ORDER_DIRECTION_BUY if side == "BUY" else OrderDirection.ORDER_DIRECTION_SELL
         response = await self._broker_request(
             self.services.orders.get_order_price(
@@ -104,15 +119,28 @@ class BrokerSdkSession:
         return self.services.create_market_data_stream()
 
     async def get_positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
+        self._validate_account(account_id)
         async with self._snapshot_lock:
             cached = self._positions_cache.get(account_id)
             now = self._monotonic()
             if cached is not None and cached[0] > now:
                 return cached[1]
             response = await self._broker_request(
-                self.services.sandbox.get_sandbox_portfolio(account_id=account_id),
-                snapshot_operation="GetSandboxPortfolio",
+                (
+                    self.services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                    if self._environment == "TEST"
+                    else self.services.operations.get_portfolio(account_id=account_id)
+                ),
+                snapshot_operation="GetSandboxPortfolio" if self._environment == "TEST" else "GetPortfolio",
             )
+            blocked_instruments: set[str] = set()
+            if self._environment == "PROD":
+                inventory = await self._broker_request(
+                    self.services.operations.get_positions(account_id=account_id), snapshot_operation="GetPositions"
+                )
+                blocked_instruments = {
+                    item.instrument_uid for item in inventory.securities if item.blocked != 0 or item.exchange_blocked
+                }
             positions = tuple(
                 BrokerPosition(
                     instrument_id=item.instrument_uid,
@@ -120,6 +148,9 @@ class BrokerSdkSession:
                     average_price=quotation_to_decimal(item.average_position_price),
                     current_price=quotation_to_decimal(item.current_price),
                     currency=str(item.average_position_price.currency).upper(),
+                    blocked=item.instrument_uid in blocked_instruments
+                    or bool(getattr(item, "blocked", False))
+                    or quotation_to_decimal(getattr(item, "blocked_lots", Quotation(units=0, nano=0))) != 0,
                 )
                 for item in response.positions
             )
@@ -127,18 +158,28 @@ class BrokerSdkSession:
             return positions
 
     async def get_free_cash(self, account_id: str, currency: str) -> Decimal:
+        self._validate_account(account_id)
         async with self._snapshot_lock:
             cached = self._money_cache.get(account_id)
             now = self._monotonic()
             if cached is None or cached[0] <= now:
                 response = await self._broker_request(
-                    self.services.sandbox.get_sandbox_positions(account_id=account_id),
-                    snapshot_operation="GetSandboxPositions",
+                    (
+                        self.services.sandbox.get_sandbox_positions(account_id=account_id)
+                        if self._environment == "TEST"
+                        else self.services.operations.get_positions(account_id=account_id)
+                    ),
+                    snapshot_operation="GetSandboxPositions" if self._environment == "TEST" else "GetPositions",
                 )
                 values: dict[str, Decimal] = {}
                 for item in response.money:
                     item_currency = str(item.currency).upper()
-                    values[item_currency] = values.get(item_currency, Decimal()) + quotation_to_decimal(item)
+                    values[item_currency] = values.get(item_currency, Decimal()) + _money_value(item)
+                for item in getattr(response, "blocked", ()):
+                    item_currency = str(item.currency).upper()
+                    values[item_currency] = values.get(item_currency, Decimal()) - _money_value(item)
+                if any(value < 0 for value in values.values()):
+                    raise ValueError("Blocked cash exceeds available balance")
                 cached = (now + self._snapshot_ttl_seconds, values)
                 self._money_cache[account_id] = cached
             return cached[1].get(currency.upper(), Decimal())
@@ -179,6 +220,9 @@ class BrokerSdkSession:
         )
 
     async def dispatch_limit_order(self, request: DispatchRequest) -> BrokerOrderState:
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        self._validate_account(request.account_id)
         response = await self._broker_request(
             self.services.orders.post_order(
                 instrument_id=request.instrument_id,
@@ -199,11 +243,16 @@ class BrokerSdkSession:
         await self._invalidate_if_terminal(request.account_id, state)
         return state
 
+    def _validate_account(self, account_id: str) -> None:
+        if self._account_id and account_id != self._account_id:
+            raise ValueError("Broker account mismatch")
+
     async def get_order_state(
         self,
         account_id: str,
         broker_order_id: str,
     ) -> BrokerOrderState:
+        self._validate_account(account_id)
         response = await self._broker_request(
             self.services.orders.get_order_state(
                 account_id=account_id,
@@ -220,6 +269,7 @@ class BrokerSdkSession:
         account_id: str,
         idempotency_key: str,
     ) -> BrokerOrderState | None:
+        self._validate_account(account_id)
         response = await self._broker_request(self.services.orders.get_orders(account_id=account_id))
         for order in response.orders:
             if order.order_request_id == idempotency_key:
@@ -255,7 +305,9 @@ class BrokerSdkSession:
         self,
         request: Awaitable[Any],
         *,
-        snapshot_operation: Literal["GetSandboxPortfolio", "GetSandboxPositions"] | None = None,
+        snapshot_operation: (
+            Literal["GetSandboxPortfolio", "GetSandboxPositions", "GetPortfolio", "GetPositions"] | None
+        ) = None,
     ) -> Any:
         """Translate SDK failures once; the runtime owns retry delays and recovery probes."""
         try:
@@ -295,6 +347,7 @@ class BrokerSdkSession:
         instrument_id: str,
         limit: int,
     ) -> tuple[dict[str, object], ...]:
+        self._validate_account(account_id)
         response = await self._broker_request(
             self.services.operations.get_operations_by_cursor(
                 GetOperationsByCursorRequest(
@@ -318,6 +371,24 @@ class BrokerSdkSession:
             }
             for item in response.items
         )
+
+
+def _money_value(item: Any) -> Decimal:
+    units, nano = item.units, item.nano
+    currency = str(item.currency)
+    if (
+        type(units) is not int
+        or type(nano) is not int
+        or abs(nano) >= 1_000_000_000
+        or units * nano < 0
+        or units < 0
+        or nano < 0
+        or len(currency) != 3
+        or not currency.isascii()
+        or not currency.isalpha()
+    ):
+        raise ValueError("Invalid broker money units or currency")
+    return quotation_to_decimal(item)
 
 
 def _quotation(value: Decimal) -> Quotation:

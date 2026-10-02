@@ -35,3 +35,20 @@ class EnvironmentService:
     def _state(environment: str) -> EnvironmentState:
         is_test = environment == "TEST"
         return EnvironmentState(cast(Environment, environment), is_test, is_test)
+
+
+class PinnedEnvironment:
+    """A process contour is fixed by server configuration."""
+
+    def __init__(self, environment: str) -> None:
+        if environment not in {"TEST", "PROD"}:
+            raise ValueError("Unsupported application environment.")
+        self._environment = environment
+
+    def view(self) -> EnvironmentState:
+        return EnvironmentService._state(self._environment)
+
+    def switch(self, environment: str) -> EnvironmentState:
+        if environment != self._environment:
+            raise ValueError("Application environment is pinned by server configuration.")
+        return self.view()

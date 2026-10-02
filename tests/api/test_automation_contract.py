@@ -62,7 +62,7 @@ def test_public_automation_contract_is_strategy_free(monkeypatch, tmp_path) -> N
     close = Execute(automation(state=AutomationState.CLOSED, revision=4))
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(
+        lambda _factory, *, settings: SimpleNamespace(
             create_trading_automation=create,
             view_trading_automations=listing,
             view_trading_automation=details,
@@ -73,7 +73,7 @@ def test_public_automation_contract_is_strategy_free(monkeypatch, tmp_path) -> N
         ),
     )
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'api.db'}")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'api.db'}")) as client:
         created = client.post(
             "/api/instruments/broker-1/instrument-1/trade",
             json={"account_id": "account-1"},

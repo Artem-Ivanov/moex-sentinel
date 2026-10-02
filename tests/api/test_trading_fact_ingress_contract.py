@@ -83,14 +83,14 @@ def test_baseline_routes_delegate_strict_typed_values(
     publish = Execute(batch_result)
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(
+        lambda _factory, *, settings: SimpleNamespace(
             claim_automation_commands=claims,
             view_automation_statuses=statuses,
             publish_trading_facts=publish,
         ),
     )
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'typed-api.db'}")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'typed-api.db'}")) as client:
         commands_response = client.post(
             "/internal/automation-commands",
             json={"worker_id": "synthetic-worker", "limit": 10},
@@ -117,7 +117,7 @@ def test_baseline_routes_delegate_strict_typed_values(
 
 
 def test_openapi_exposes_only_baseline_worker_routes(tmp_path: Path) -> None:
-    application = create_app(database_url=f"sqlite:///{tmp_path / 'openapi.db'}")
+    application = create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'openapi.db'}")
     paths = set(application.openapi()["paths"])
 
     assert {
@@ -138,12 +138,14 @@ def test_malformed_fact_batch_returns_422_without_calling_usecase(
     publish = Execute(FactBatchResult(results=()))
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(publish_trading_facts=publish),
+        lambda _factory, *, settings: SimpleNamespace(publish_trading_facts=publish),
     )
     malformed = all_envelopes()[0].model_dump(mode="json")
     malformed["payload"]["unexpected"] = True
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'invalid-typed-api.db'}")) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'invalid-typed-api.db'}")
+    ) as client:
         response = client.post("/internal/automation-facts", json={"facts": [malformed]})
 
     assert response.status_code == 422

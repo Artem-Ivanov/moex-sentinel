@@ -27,6 +27,7 @@ from moex_sentinel.domain.portfolio import (
     Money,
     OperationsPage,
 )
+from sentinel_contracts.tinvest import tinvest_environment
 
 SANDBOX_TARGET = "sandbox-invest-public-api.tbank.ru:443"
 ClientFactory = Callable[..., Any]
@@ -43,8 +44,7 @@ class TInvestPortfolioAdapter:
         target: str,
         client_factory: ClientFactory = _default_client_factory,
     ) -> None:
-        if target != SANDBOX_TARGET:
-            raise ValueError("Only the configured Sandbox target is allowed.")
+        self._environment = tinvest_environment(target)
         self._token = token
         self._target = target
         self._client_factory = client_factory
@@ -53,7 +53,11 @@ class TInvestPortfolioAdapter:
         """Return sandbox account identities and statuses."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
-                response = await services.sandbox.get_sandbox_accounts()
+                response = await (
+                    services.sandbox.get_sandbox_accounts()
+                    if self._environment == "TEST"
+                    else services.users.get_accounts()
+                )
         except SDK_REQUEST_ERRORS as error:
             raise map_request_error(error) from error
         try:
@@ -73,14 +77,25 @@ class TInvestPortfolioAdapter:
         """Read portfolio and cash balances, summing only the portfolio currency."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
-                portfolio = await services.sandbox.get_sandbox_portfolio(account_id=account_id)
-                positions = await services.sandbox.get_sandbox_positions(account_id=account_id)
+                portfolio = await (
+                    services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                    if self._environment == "TEST"
+                    else services.operations.get_portfolio(account_id=account_id)
+                )
+                positions = await (
+                    services.sandbox.get_sandbox_positions(account_id=account_id)
+                    if self._environment == "TEST"
+                    else services.operations.get_positions(account_id=account_id)
+                )
         except SDK_REQUEST_ERRORS as error:
             raise map_request_error(error) from error
         try:
             total = money_to_domain(portfolio.total_amount_portfolio)
             currency = total.currency if total is not None else None
             free_cash = self._sum_money(positions.money, currency) if currency is not None else None
+            if self._environment == "PROD" and free_cash is not None:
+                blocked = self._sum_money(positions.blocked, currency)
+                free_cash = Money(free_cash.amount - blocked.amount, free_cash.currency)
             unrealized = self._quotation_as_money(portfolio.expected_yield, currency)
             return AccountPortfolio(
                 account_id=account_id,
@@ -96,7 +111,16 @@ class TInvestPortfolioAdapter:
         """Return broker lot quantities and nullable prices without fabricating missing money."""
         try:
             async with self._client_factory(self._token, target=self._target) as services:
-                response = await services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                response = await (
+                    services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                    if self._environment == "TEST"
+                    else services.operations.get_portfolio(account_id=account_id)
+                )
+                balances = (
+                    await services.operations.get_positions(account_id=account_id)
+                    if self._environment == "PROD"
+                    else None
+                )
         except SDK_REQUEST_ERRORS as error:
             raise map_request_error(error) from error
         try:
@@ -104,7 +128,16 @@ class TInvestPortfolioAdapter:
                 ExternalPosition(
                     account_id=account_id,
                     instrument_id=position.instrument_uid,
-                    ticker=position.ticker,
+                    ticker=getattr(position, "ticker", ""),
+                    blocked=bool(getattr(position, "blocked", False))
+                    or (
+                        getattr(position, "blocked_lots", None) is not None
+                        and quotation_to_decimal(position.blocked_lots) > 0
+                    )
+                    or any(
+                        item.instrument_uid == position.instrument_uid and (item.blocked != 0 or item.exchange_blocked)
+                        for item in getattr(balances, "securities", ())
+                    ),
                     quantity_lots=quotation_to_decimal(position.quantity_lots),
                     average_price=money_to_domain(position.average_position_price),
                     current_price=money_to_domain(position.current_price),

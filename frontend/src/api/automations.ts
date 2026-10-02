@@ -1,4 +1,5 @@
 import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+import { apiFetch } from "./request"
 
 export interface Automation {
   id: string
@@ -44,7 +45,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init)
+  const response = await apiFetch(url, init)
   if (!response.ok) {
     const payload = await readErrorPayload(response)
     throw new ApiError(payload.detail?.message ?? "Не удалось выполнить запрос.", payload.detail?.fields)

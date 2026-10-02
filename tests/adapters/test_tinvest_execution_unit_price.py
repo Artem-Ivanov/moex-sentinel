@@ -68,9 +68,11 @@ async def fetch_state(adapter_kind, operation, value):
         return Context()
 
     adapter = (
-        BrokerSdkSession("synthetic-token", SANDBOX_TARGET, client_factory=factory)
+        BrokerSdkSession("synthetic-token", SANDBOX_TARGET, client_factory=factory, access_mode="TRADE")
         if adapter_kind == "worker"
-        else TInvestOrderExecutionAdapter("synthetic-token", SANDBOX_TARGET, client_factory=factory)
+        else TInvestOrderExecutionAdapter(
+            "synthetic-token", SANDBOX_TARGET, client_factory=factory, access_mode="TRADE"
+        )
     )
     if adapter_kind == "worker":
         await adapter.start()

@@ -170,8 +170,17 @@ class ContractHarness:
             base_url="http://analytics",
         )
         self.bundle = await build_broker_runtime(
-            BrokerConnection(str(self.value.broker_id), "TINVEST_SANDBOX", "fixture-target", "synthetic-token", True),
+            BrokerConnection(
+                str(self.value.broker_id),
+                "TINVEST_SANDBOX",
+                "sandbox-invest-public-api.tbank.ru:443",
+                "synthetic-token",
+                True,
+                access_mode="TRADE",
+            ),
             self.repository,
+            worker_access_mode="TRADE",
+            application_environment="TEST",
             strategy_settings=self.settings,
             session_factory=lambda _: self.session,
             now=lambda: self.clock[0],
@@ -244,7 +253,7 @@ def strategy_settings(monkeypatch):
         monkeypatch.delenv(field.validation_alias, raising=False)
     monkeypatch.setenv("STRATEGY_AVERAGING_STEP_PERCENT", "0.7")
     monkeypatch.setenv("STRATEGY_PARTIAL_TAKE_PROFIT_PERCENT", "0.3")
-    return StrategySettings()
+    return StrategySettings(enabled=True)
 
 
 def assert_thresholds(payload, averaging, net_profit, source):

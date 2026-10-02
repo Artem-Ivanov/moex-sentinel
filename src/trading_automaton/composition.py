@@ -12,6 +12,8 @@ from sqlalchemy.orm import sessionmaker
 from sentinel_contracts.analytics import AdaptiveThresholds
 from sentinel_contracts.broker_execution import BrokerConnection
 from sentinel_contracts.time import utc_now_ms
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
+from sentinel_contracts.trading_facts import AutomationCommand, FactEnvelope
 from trading_automaton.adapters.analytics_client import AnalyticsClient
 from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
@@ -136,9 +138,15 @@ async def build_broker_runtime(
     repository: LocalAutomationRepository,
     *,
     strategy_settings: StrategySettings,
+    worker_access_mode: str = "READ_ONLY",
+    application_environment: str = "TEST",
     now: Callable[[], datetime],
     session_factory: Callable[[BrokerConnection], Any] = lambda connection: BrokerSdkSession(
-        connection.token, connection.target
+        connection.token,
+        connection.target,
+        environment=connection.environment,
+        access_mode=connection.access_mode,
+        account_id=connection.account_id,
     ),
     tick_seconds: float = 1.0,
     retry_limit: int = 5,
@@ -146,8 +154,23 @@ async def build_broker_runtime(
     analytics_client: AnalyticsPort | None = None,
 ) -> BrokerRuntimeBundle:
     """Assemble a broker bundle whose close releases Analytics and the started SDK session."""
-    if connection.adapter_code != "TINVEST_SANDBOX" or not connection.is_test:
-        raise ValueError("Only T-Invest Sandbox brokers are enabled in this MVP.")
+    if connection.environment != application_environment:
+        raise ValueError("Worker/Core environment mismatch")
+    resolve_tinvest_endpoint(connection.environment, connection.adapter_code, connection.target)
+    if worker_access_mode not in {"READ_ONLY", "TRADE"}:
+        raise ValueError("Invalid Worker broker access mode")
+    if worker_access_mode != connection.access_mode:
+        raise ValueError("Core/Worker access mode mismatch")
+    if connection.environment == "PROD" and worker_access_mode == "TRADE":
+        raise ValueError("PROD TRADE is not enabled in this phase")
+    if worker_access_mode == "READ_ONLY":
+        if strategy_settings.enabled:
+            raise ValueError("READ_ONLY requires strategy disabled")
+        if repository.has_active_intents():
+            raise ValueError(
+                "READ_ONLY cannot start with active intents; "
+                "preserve history and reconcile in the original trading contour"
+            )
     session = session_factory(connection)
     await session.start()
     portfolio = PortfolioStateCacheService()
@@ -194,7 +217,14 @@ async def build_broker_runtime(
         cash=cash,
         active_intents=active_intents,
     )
-    dispatcher = OrderDispatchService(repository, session, now=now, audit=business_audit)
+    dispatcher = OrderDispatchService(
+        repository,
+        session,
+        now=now,
+        audit=business_audit,
+        access_mode=worker_access_mode,
+        account_id=connection.account_id,
+    )
     batch = BatchTradingRuntimeService(
         repository,
         dispatcher,
@@ -202,6 +232,8 @@ async def build_broker_runtime(
         now=now,
         cash=cash,
         active_intents=active_intents,
+        access_mode=worker_access_mode,
+        account_id=connection.account_id,
     )
     tick = StreamingBatchTickService(
         scheduler,
@@ -252,6 +284,7 @@ async def build_broker_runtime(
         iteration,
         tick_seconds=tick_seconds,
         retry_limit=retry_limit,
+        account_id=connection.account_id,
     )
     return BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
 
@@ -272,14 +305,53 @@ def build_streaming_runtime(
     """Return the coordinator, repository and Core HTTP client.
 
     The caller closes the coordinator, finishes its run marker and closes HTTP."""
+    if settings.broker_access_mode == "READ_ONLY" and strategy_settings.enabled:
+        raise ValueError("READ_ONLY requires strategy disabled")
     engine = create_worker_engine(settings.database_url)
     initialize_worker_schema(engine)
     repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    if settings.broker_access_mode == "READ_ONLY" and repository.has_active_intents():
+        engine.dispose()
+        raise ValueError(
+            "READ_ONLY cannot start with active intents; preserve history and reconcile in the original trading contour"
+        )
     http = httpx.Client(base_url=settings.core_url, timeout=10.0)
-    core = CoreClient(http)
+    core = CoreClient(
+        http, application_environment=settings.application_environment, access_mode=settings.broker_access_mode
+    )
 
     def now() -> datetime:
         return utc_now_ms()
+
+    def validate_commands(commands: list[AutomationCommand]) -> None:
+        for broker_id in {str(command.broker_id) for command in commands}:
+            connection = core.broker_connection(broker_id)
+            if connection.environment != settings.application_environment:
+                raise ValueError("Worker/Core environment mismatch")
+            if connection.access_mode != settings.broker_access_mode:
+                raise ValueError("Worker/Core access mode mismatch")
+            if connection.account_id and any(
+                str(command.broker_id) == broker_id and command.account_id != connection.account_id
+                for command in commands
+            ):
+                raise ValueError("Broker command account mismatch")
+
+    def validate_facts(facts: list[FactEnvelope]) -> None:
+        scopes = {broker_id: core.broker_scope(broker_id) for broker_id in {str(fact.user_broker_id) for fact in facts}}
+        commands = {
+            automation_id: repository.get_cached_command(automation_id)
+            for automation_id in {str(fact.automation_id) for fact in facts}
+        }
+        for fact in facts:
+            broker_id = str(fact.user_broker_id)
+            scope = scopes[broker_id]
+            command = commands[str(fact.automation_id)]
+            if scope.broker_id != broker_id or str(command.user_broker_id) != broker_id:
+                raise ValueError("Fact delivery broker scope mismatch")
+            if scope.environment != settings.application_environment:
+                raise ValueError("Worker/Core environment mismatch")
+            if scope.account_id != command.account_id:
+                raise ValueError("Fact delivery account mismatch")
 
     synchronization: CoordinatorSynchronizationPort = FactSynchronizationService(
         repository,
@@ -289,6 +361,8 @@ def build_streaming_runtime(
         retry_limit=strategy_settings.core_retry_limit,
         batch_size=settings.fact_outbox_batch_size,
         deadline_ms=settings.fact_outbox_deadline_ms,
+        validate_commands=validate_commands,
+        validate_facts=validate_facts,
     )
     coordinator_core: CoordinatorCorePort = FactCoordinatorCoreAdapter(core)
 
@@ -297,6 +371,8 @@ def build_streaming_runtime(
             connection,
             repository,
             strategy_settings=strategy_settings,
+            worker_access_mode=settings.broker_access_mode,
+            application_environment=settings.application_environment,
             now=now,
             tick_seconds=settings.iteration_seconds,
             retry_limit=settings.sandbox_retry_limit,

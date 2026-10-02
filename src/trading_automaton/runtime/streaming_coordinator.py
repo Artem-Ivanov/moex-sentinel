@@ -200,6 +200,8 @@ class StreamingRuntimeCoordinator:
                 bundle = None
             if bundle is None:
                 connection = await asyncio.to_thread(self._core.broker_connection, broker_id)
+                if connection.account_id and any(command.account_id != connection.account_id for command in commands):
+                    raise ValueError("Broker command account mismatch")
                 bundle = await self._builder(connection)
                 self._bundles[broker_id] = bundle
                 self._tasks[broker_id] = asyncio.create_task(bundle.runtime.run())

@@ -76,7 +76,9 @@ def test_builds_one_started_sdk_session_for_broker_runtime() -> None:
     async def scenario():
         session = Session()
         bundle = await build_broker_runtime(
-            BrokerConnection("broker", "TINVEST_SANDBOX", "sandbox-target", "synthetic-token", True),
+            BrokerConnection(
+                "broker", "TINVEST_SANDBOX", "sandbox-invest-public-api.tbank.ru:443", "synthetic-token", True
+            ),
             repository(),
             strategy_settings=StrategySettings(),
             session_factory=lambda _connection: session,
@@ -115,7 +117,13 @@ def test_composed_preparation_bootstraps_hold_through_real_recovery_service(tmp_
     async def scenario():
         session = PreparedSession()
         bundle = await build_broker_runtime(
-            BrokerConnection(str(value.broker_id), "TINVEST_SANDBOX", "sandbox-target", "synthetic-token", True),
+            BrokerConnection(
+                str(value.broker_id),
+                "TINVEST_SANDBOX",
+                "sandbox-invest-public-api.tbank.ru:443",
+                "synthetic-token",
+                True,
+            ),
             repo,
             strategy_settings=StrategySettings(),
             session_factory=lambda _connection: session,

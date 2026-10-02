@@ -5,6 +5,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.domain.user_brokers import (
+    UserBrokerConstraintError,
     UserBrokerDraft,
     UserBrokerDuplicateError,
     UserBrokerNotFoundError,
@@ -12,6 +13,7 @@ from moex_sentinel.domain.user_brokers import (
 )
 from moex_sentinel.storage.database import create_session_factory
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
+from tests.storage.test_position_adoption_repository import SCOPE_ID, candidate, repository
 
 
 @pytest.fixture
@@ -97,3 +99,37 @@ def test_missing_user_broker_maps_to_not_found(
         repository.replace("missing", draft())
     with pytest.raises(UserBrokerNotFoundError):
         repository.disable("missing")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"environment": "PROD"}, {"fqdn": "foreign"}, {"external_account_id": "foreign"}, {"api_slug": "foreign"}],
+)
+def test_scope_cannot_change_after_position_bootstrap(changes):
+    adoption, factory = repository()
+    try:
+        adoption.adopt(candidate())
+        repo = UserBrokerRepository(factory)
+        current = repo.get(SCOPE_ID)
+        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at"}))
+        with pytest.raises(UserBrokerConstraintError, match="immutable"):
+            repo.replace(SCOPE_ID, value.model_copy(update=changes))
+        assert repo.get(SCOPE_ID) == current
+    finally:
+        factory.kw["bind"].dispose()
+
+
+@pytest.mark.parametrize("disabled", [True, False])
+def test_selected_scope_change_is_rejected_before_delayed_old_snapshot_adoption(disabled):
+    adoption, factory = repository()
+    try:
+        repo = UserBrokerRepository(factory)
+        old_snapshot = candidate()
+        current = repo.disable(SCOPE_ID) if disabled else repo.get(SCOPE_ID)
+        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at"}))
+        with pytest.raises(UserBrokerConstraintError, match="immutable"):
+            repo.replace(SCOPE_ID, value.model_copy(update={"external_account_id": "account-B"}))
+        adoption.adopt(old_snapshot)
+        assert repo.get(SCOPE_ID).external_account_id == "account-1"
+    finally:
+        factory.kw["bind"].dispose()

@@ -11,7 +11,7 @@ from tests.storage.test_automation_command_repository import AUTOMATION_ID, repo
 
 def test_repeated_resume_is_a_noop_after_entering_queue() -> None:
     _, factory = repository()
-    service = AutomationService(AutomationRepository(factory))
+    service = AutomationService(AutomationRepository(factory), access_mode="TRADE")
     held = service.hold(AUTOMATION_ID, "USER_HOLD")
     first = service.resume(AUTOMATION_ID)
 
@@ -26,7 +26,7 @@ def test_repeated_resume_is_a_noop_after_entering_queue() -> None:
 @pytest.mark.parametrize("command", ["hold", "close"])
 def test_repeated_public_state_command_does_not_change_metadata(command: str) -> None:
     _, factory = repository()
-    service = AutomationService(AutomationRepository(factory))
+    service = AutomationService(AutomationRepository(factory), access_mode="TRADE")
     invoke = (
         (lambda: service.hold(AUTOMATION_ID, "USER_HOLD"))
         if command == "hold"
@@ -46,7 +46,7 @@ def test_repeated_public_state_command_does_not_change_metadata(command: str) ->
 @pytest.mark.parametrize("command", ["hold", "resume"])
 def test_closed_automation_reports_existing_business_conflict(command: str) -> None:
     _, factory = repository()
-    service = AutomationService(AutomationRepository(factory))
+    service = AutomationService(AutomationRepository(factory), access_mode="TRADE")
     closed = service.close(AUTOMATION_ID)
 
     invoke = (

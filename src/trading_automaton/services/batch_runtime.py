@@ -65,10 +65,16 @@ class BatchTradingRuntimeService:
         tracking: BatchTrackingPort,
         *,
         now: Callable[[], datetime],
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
         sla: TradingSlaService | None = None,
         cash: BatchCashPort | None = None,
         active_intents: ActiveIntentGateService | None = None,
     ) -> None:
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        self._access_mode = access_mode
+        self._account_id = account_id
         self._repository = repository
         self._dispatcher = dispatcher
         self._tracking = tracking
@@ -84,6 +90,10 @@ class BatchTradingRuntimeService:
         *,
         snapshot_at: datetime,
     ) -> BatchTickResult:
+        if self._access_mode != "TRADE" and (requests or any(item.intent is not None for item in items)):
+            raise ValueError("READ_ONLY forbids creating broker intents")
+        if self._account_id and any(item.account_id != self._account_id for item in items):
+            raise ValueError("Broker account mismatch")
         request_by_id = self._validate_mapping(items, requests)
         try:
             persisted = self._repository.save_decision_batch(

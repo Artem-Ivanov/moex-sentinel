@@ -3,6 +3,8 @@
 from typing import Protocol
 
 from moex_sentinel.domain.repository_records import AutomationRecord
+from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
+from moex_sentinel.services.ports import BrokerRepositoryPort
 from sentinel_contracts.automation_lifecycle import (
     InvalidAutomationTransition,
     TransitionOrigin,
@@ -32,23 +34,39 @@ class AutomationRepositoryPort(Protocol):
 
 
 class AutomationService:
-    def __init__(self, repository: AutomationRepositoryPort) -> None:
+    def __init__(
+        self,
+        repository: AutomationRepositoryPort,
+        *,
+        access_mode: str = "READ_ONLY",
+        environment: EnvironmentStatePort | None = None,
+        brokers: BrokerRepositoryPort | None = None,
+    ) -> None:
         self._repository = repository
+        self._access_mode = access_mode
+        self._environment = environment
+        self._brokers = brokers
 
     def create(self, *, broker_id: str, account_id: str, instrument_id: str) -> AutomationRecord:
+        self._require_trade()
+        if not self._broker_in_environment(broker_id):
+            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
         return self._repository.create(broker_id=broker_id, account_id=account_id, instrument_id=instrument_id)
 
     def get(self, automation_id: str) -> AutomationRecord:
-        return self._repository.get(automation_id)
+        value = self._repository.get(automation_id)
+        if not self._in_environment(value):
+            raise EnvironmentMismatchError("Automation belongs to inactive environment.")
+        return value
 
     def get_many(self, automation_ids: list[str]) -> list[AutomationRecord]:
-        return self._repository.get_many(automation_ids)
+        return [value for value in self._repository.get_many(automation_ids) if self._in_environment(value)]
 
     def list_active(self) -> list[AutomationRecord]:
-        return self._repository.list_active()
+        return [value for value in self._repository.list_active() if self._in_environment(value)]
 
     def hold(self, automation_id: str, reason: str) -> AutomationRecord:
-        current = self._repository.get(automation_id)
+        current = self.get(automation_id)
         if not self._validate_transition(current.state, AutomationState.HOLD):
             return current
         return self._repository.set_state(
@@ -59,13 +77,15 @@ class AutomationService:
         )
 
     def resume(self, automation_id: str) -> AutomationRecord:
-        current = self._repository.get(automation_id)
+        self._require_trade()
+        current = self.get(automation_id)
         if not self._validate_transition(current.state, AutomationState.IN_QUEUE):
             return current
         return self._repository.resume_to_queue(automation_id, expected_revision=current.revision)
 
     def close(self, automation_id: str) -> AutomationRecord:
-        current = self._repository.get(automation_id)
+        self._require_trade()
+        current = self.get(automation_id)
         if not self._validate_transition(current.state, AutomationState.CLOSED):
             return current
         return self._repository.set_state(
@@ -73,6 +93,20 @@ class AutomationService:
             AutomationState.CLOSED,
             expected_revision=current.revision,
         )
+
+    def _in_environment(self, value: AutomationRecord) -> bool:
+        return self._broker_in_environment(value.broker_id)
+
+    def _broker_in_environment(self, broker_id: str) -> bool:
+        return (
+            self._environment is None
+            or self._brokers is None
+            or self._brokers.get(broker_id).is_test == (self._environment.view().active_environment == "TEST")
+        )
+
+    def _require_trade(self) -> None:
+        if self._access_mode != "TRADE":
+            raise ValueError("Trading commands are forbidden in READ_ONLY.")
 
     @staticmethod
     def _validate_transition(current: AutomationState, target: AutomationState) -> bool:

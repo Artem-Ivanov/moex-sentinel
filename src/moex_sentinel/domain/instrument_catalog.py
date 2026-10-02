@@ -6,6 +6,7 @@ from decimal import Decimal
 from pydantic import ConfigDict
 
 from moex_sentinel.domain.market_data import LastPrice
+from moex_sentinel.domain.position_adoption import PositionAdoptionResult
 from sentinel_contracts.base import PositionalModel
 
 
@@ -126,6 +127,7 @@ class CatalogReconciliationResult(PositionalModel):
     updated: int
     deactivated: int
     synchronized_at: datetime
+    adoption: PositionAdoptionResult | None = None
 
 
 class CatalogCategory(PositionalModel):

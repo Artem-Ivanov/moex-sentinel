@@ -51,10 +51,17 @@ services:
       database:
         condition: service_healthy
     environment:
+      APPLICATION_ENVIRONMENT: "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}"
+      BROKER_ACCESS_MODE: "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}"
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@database:5432/${POSTGRES_DB}
       LOG_LEVEL: INFO
       LOG_FORMAT: json
       SANDBOX_RETRY_LIMIT: "${SANDBOX_RETRY_LIMIT:-5}"
+      AUTH_USERNAME: "${AUTH_USERNAME:?AUTH_USERNAME must be configured}"
+      AUTH_PASSWORD_HASH: "${AUTH_PASSWORD_HASH:?AUTH_PASSWORD_HASH must be configured}"
+      AUTH_SESSION_COOKIE_NAME: "${AUTH_SESSION_COOKIE_NAME:-__Host-moex-session}"
+      AUTH_ALLOWED_ORIGIN: "${AUTH_ALLOWED_ORIGIN:?AUTH_ALLOWED_ORIGIN must be configured}"
+      AUTH_INSECURE_LOOPBACK: "${AUTH_INSECURE_LOOPBACK:-false}"
     healthcheck:
       test:
         - CMD
@@ -76,6 +83,8 @@ services:
       database:
         condition: service_healthy
     environment:
+      APPLICATION_ENVIRONMENT: "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}"
+      BROKER_ACCESS_MODE: "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}"
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@database:5432/${POSTGRES_DB}
       PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS: "${PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:-60}"
       LOG_LEVEL: INFO
@@ -117,6 +126,8 @@ services:
       analytics:
         condition: service_healthy
     environment:
+      APPLICATION_ENVIRONMENT: "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}"
+      BROKER_ACCESS_MODE: "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}"
       AUTOMATON_DATABASE_URL: sqlite:////app/data/trading_automaton.db
       CORE_URL: http://backend:8000
       ANALYTICS_URL: http://analytics:8001
@@ -133,7 +144,7 @@ services:
       STRATEGY_ORDER_TTL_SECONDS: "${STRATEGY_ORDER_TTL_SECONDS:-10}"
       STRATEGY_ORDER_RETRY_LIMIT: "${STRATEGY_ORDER_RETRY_LIMIT:-3}"
       STRATEGY_CORE_RETRY_LIMIT: "${STRATEGY_CORE_RETRY_LIMIT:-5}"
-      STRATEGY_ENABLED: "${STRATEGY_ENABLED:-true}"
+      STRATEGY_ENABLED: "${STRATEGY_ENABLED:-false}"
       SANDBOX_RETRY_LIMIT: "${SANDBOX_RETRY_LIMIT:-5}"
       LOG_LEVEL: INFO
       LOG_FORMAT: json

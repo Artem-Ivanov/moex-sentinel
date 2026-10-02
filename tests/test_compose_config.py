@@ -1,6 +1,9 @@
+import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -48,6 +51,8 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert automaton["depends_on"]["backend"]["condition"] == "service_healthy"
     assert automaton["volumes"] == ["automaton-data:/app/data"]
     assert automaton["environment"] == {
+        "APPLICATION_ENVIRONMENT": "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}",
+        "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
         "AUTOMATON_DATABASE_URL": "sqlite:////app/data/trading_automaton.db",
         "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS": "3",
         "CORE_URL": "http://backend:8000",
@@ -67,7 +72,7 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
         "STRATEGY_ORDER_TTL_SECONDS": "${STRATEGY_ORDER_TTL_SECONDS:-10}",
         "STRATEGY_ORDER_RETRY_LIMIT": "${STRATEGY_ORDER_RETRY_LIMIT:-3}",
         "STRATEGY_CORE_RETRY_LIMIT": "${STRATEGY_CORE_RETRY_LIMIT:-5}",
-        "STRATEGY_ENABLED": "${STRATEGY_ENABLED:-true}",
+        "STRATEGY_ENABLED": "${STRATEGY_ENABLED:-false}",
     }
     assert "volumes" not in backend
     assert backend["environment"]["SANDBOX_RETRY_LIMIT"] == "${SANDBOX_RETRY_LIMIT:-5}"
@@ -79,9 +84,16 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert backend["depends_on"]["database"]["condition"] == "service_healthy"
     assert backend["environment"]["DATABASE_URL"].startswith("postgresql+psycopg://")
     assert "ports" not in backend
+    assert backend["environment"]["AUTH_USERNAME"] == "${AUTH_USERNAME:?AUTH_USERNAME must be configured}"
+    assert backend["environment"]["AUTH_PASSWORD_HASH"] == (
+        "${AUTH_PASSWORD_HASH:?AUTH_PASSWORD_HASH must be configured}"
+    )
+    assert backend["environment"]["AUTH_INSECURE_LOOPBACK"] == "${AUTH_INSECURE_LOOPBACK:-false}"
     assert snapshot_worker["build"]["dockerfile"] == "docker/portfolio-snapshot-worker.Dockerfile"
     assert snapshot_worker["depends_on"] == {"database": {"condition": "service_healthy"}}
     assert snapshot_worker["environment"] == {
+        "APPLICATION_ENVIRONMENT": "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}",
+        "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
         "DATABASE_URL": (
             "postgresql+psycopg://${POSTGRES_USER}:"
             "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@database:5432/${POSTGRES_DB}"
@@ -143,3 +155,51 @@ def test_worker_recovery_volume_has_stable_external_identity() -> None:
 def test_gitignore_excludes_ide_metadata() -> None:
     gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".idea/" in gitignore
+
+
+def test_remote_auth_configuration_fails_closed() -> None:
+    remote = (PROJECT_ROOT / "deploy/remote/compose.remote.yml").read_text(encoding="utf-8")
+    assert 'AUTH_INSECURE_LOOPBACK: "false"' in remote
+
+
+def test_vite_dev_server_listens_only_on_loopback() -> None:
+    package = json.loads((PROJECT_ROOT / "frontend/package.json").read_text(encoding="utf-8"))
+    assert package["scripts"]["dev"] == "vite --host 127.0.0.1"
+
+
+def test_remote_preflight_rejects_invalid_auth_without_echoing_secret() -> None:
+    module_spec = importlib.util.spec_from_file_location(
+        "remote_preflight", PROJECT_ROOT / "deploy/remote/preflight.py"
+    )
+    assert module_spec is not None
+    assert module_spec.loader is not None
+    preflight = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(preflight)
+
+    valid = "scrypt:16384:8:5:" + "a" * 32 + ":" + "b" * 64
+    preflight.validate_auth_config({"AUTH_INSECURE_LOOPBACK": "false", "AUTH_PASSWORD_HASH": valid})
+
+    for value in ("", "replace-with-scrypt-verifier", "scrypt:16384:8:5:bad:bad"):
+        with pytest.raises(SystemExit) as error:
+            preflight.validate_auth_config({"AUTH_INSECURE_LOOPBACK": "false", "AUTH_PASSWORD_HASH": value})
+        assert str(error.value) == "FAIL: Set AUTH_PASSWORD_HASH to a generated scrypt verifier."
+
+    with pytest.raises(SystemExit) as error:
+        preflight.validate_auth_config({"AUTH_INSECURE_LOOPBACK": "true", "AUTH_PASSWORD_HASH": valid})
+    assert str(error.value) == "FAIL: Remote deployment requires AUTH_INSECURE_LOOPBACK=false."
+
+
+def test_contour_and_access_mode_propagate_to_all_broker_owners() -> None:
+    services = load_compose()["services"]
+    for name in ("backend", "portfolio-snapshot-worker", "trading-automaton"):
+        environment = services[name]["environment"]
+        assert (
+            environment["APPLICATION_ENVIRONMENT"]
+            == "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}"
+        )
+        assert environment["BROKER_ACCESS_MODE"] == "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}"
+    assert (
+        services["backend"]["environment"]["AUTH_ALLOWED_ORIGIN"]
+        == "${AUTH_ALLOWED_ORIGIN:?AUTH_ALLOWED_ORIGIN must be configured}"
+    )
+    assert services["trading-automaton"]["environment"]["STRATEGY_ENABLED"] == "${STRATEGY_ENABLED:-false}"

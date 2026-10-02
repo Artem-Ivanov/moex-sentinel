@@ -147,8 +147,8 @@ def test_adapter_rejects_non_sandbox_target_before_client_creation() -> None:
         nonlocal called
         called = True
 
-    with pytest.raises(ValueError, match="Sandbox target"):
-        TInvestPortfolioAdapter("synthetic-token", "invest-public-api.tbank.ru:443", factory)
+    with pytest.raises(ValueError, match="target"):
+        TInvestPortfolioAdapter("synthetic-token", "foreign-public-api.tbank.ru:443", factory)
 
     assert called is False
 

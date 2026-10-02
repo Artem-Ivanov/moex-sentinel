@@ -189,6 +189,14 @@ button:disabled { opacity: .4; }
 }
 .data-table tbody tr:last-child td { border-bottom: 0; }
 
+.login-page { display: grid; min-height: 100vh; place-items: center; padding: 24px; }
+.auth-loading { display: grid; min-height: 100vh; place-items: center; color: #aebdd0; }
+.login-card { display: grid; gap: 16px; width: min(100%, 420px); padding: 32px; border: 1px solid #223650; border-radius: 16px; background: #101d2e; }
+.login-card h1 { margin: 0; font-size: 1.8rem; }
+.login-card label { display: grid; gap: 7px; color: #aebdd0; }
+.login-card input { width: 100%; padding: 11px; border: 1px solid #314763; border-radius: 8px; color: #e7edf7; background: #08111f; }
+.login-card button { margin-top: 4px; }
+
 main {
   min-width: 0;
   padding: 32px clamp(24px, 5vw, 72px);

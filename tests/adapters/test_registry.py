@@ -12,7 +12,8 @@ from moex_sentinel.adapters.registry import (
 def test_registry_declares_only_tinvest_sandbox() -> None:
     adapters = BrokerAdapterRegistry().list()
 
-    assert len(adapters) == 1
+    assert len(adapters) == 2
+    assert adapters[1].adapter_code == "TINVEST_PROD"
     adapter = adapters[0]
     assert adapter.adapter_code == "TINVEST_SANDBOX"
     assert adapter.provider_code == "TINVEST"

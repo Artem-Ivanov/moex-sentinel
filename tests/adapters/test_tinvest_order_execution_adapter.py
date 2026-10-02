@@ -149,6 +149,7 @@ def execution_adapter() -> tuple[Services, TInvestOrderExecutionAdapter]:
         "synthetic-token",
         "sandbox-invest-public-api.tbank.ru:443",
         client_factory=lambda *_args, **_kwargs: ClientContext(services),
+        access_mode="TRADE",
     )
     return services, adapter
 
@@ -235,5 +236,5 @@ def test_maps_trading_status(execution_adapter: tuple[Services, TInvestOrderExec
 
 
 def test_rejects_non_sandbox_target_before_network_io() -> None:
-    with pytest.raises(ValueError, match="Sandbox"):
-        TInvestOrderExecutionAdapter("synthetic-token", "invest-public-api.tbank.ru:443")
+    with pytest.raises(ValueError, match="target"):
+        TInvestOrderExecutionAdapter("synthetic-token", "foreign-public-api.tbank.ru:443")

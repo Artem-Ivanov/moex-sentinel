@@ -26,7 +26,7 @@ def test_broker_api_returns_safe_field_errors(tmp_path: Path) -> None:
         ],
     }
 
-    with TestClient(create_app(database_url=database_url)) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=database_url)) as client:
         response = client.post("/api/brokers", json=payload)
 
     assert response.status_code == 422

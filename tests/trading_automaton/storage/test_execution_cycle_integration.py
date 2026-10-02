@@ -285,7 +285,7 @@ def test_stale_actionable_cycle_does_not_create_intent_or_dispatch(storage):
         required_cash=Decimal("1001"),
     )
     runtime = BatchTradingRuntimeService(
-        repo, ForbiddenDispatch(), ForbiddenDispatch(), now=lambda: NOW + timedelta(seconds=3)
+        repo, ForbiddenDispatch(), ForbiddenDispatch(), now=lambda: NOW + timedelta(seconds=3), access_mode="TRADE"
     )
     result = asyncio.run(runtime.run_batch((stale_item,), (request,), snapshot_at=NOW))
     persisted = result.persisted
@@ -383,7 +383,7 @@ def test_rehydrated_fill_blocks_same_candle_then_allows_next_candle_reversal(sto
             CommissionProfile(),
             cash=AvailableCash(),
             decisions=TradeDecisionService(),
-            contexts=DecisionContextService(StrategySettings()),
+            contexts=DecisionContextService(StrategySettings(enabled=True)),
         )
 
         def market(price):

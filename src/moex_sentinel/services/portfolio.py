@@ -125,6 +125,8 @@ class PortfolioAggregationService:
             raise EnvironmentMismatchError("Broker belongs to inactive environment.")
         if self._instruments is None:
             raise ValueError("Position operations require an instrument catalog.")
+        if broker.account_id and account_id != broker.account_id:
+            raise ValueError("Broker account does not match selected scope.")
         instrument = self._instruments.get(broker_id, instrument_id)
         try:
             page = await self._adapter_factory(broker).get_operations(
@@ -165,6 +167,8 @@ class PortfolioAggregationService:
         snapshots: list[BrokerAccountSnapshot] = []
         errors: list[BrokerReadError] = []
         for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
             try:
                 portfolio = await adapter.get_portfolio(account.account_id)
                 snapshots.append(BrokerAccountSnapshot(broker.id, broker.display_name, account, portfolio))
@@ -182,6 +186,8 @@ class PortfolioAggregationService:
         items: list[BrokerPosition] = []
         errors: list[BrokerReadError] = []
         for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
             try:
                 positions = await adapter.get_positions(account.account_id)
                 items.extend(
@@ -206,6 +212,8 @@ class PortfolioAggregationService:
         errors: list[BrokerReadError] = []
         instruments: dict[str, UserBrokerCatalogInstrument | None] = {}
         for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
             try:
                 page = await adapter.get_operations(account.account_id, None, limit)
                 items.extend(

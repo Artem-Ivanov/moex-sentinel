@@ -8,6 +8,7 @@ from moex_sentinel.domain.user_brokers import (
     BrokerApiEnvironmentError,
     BrokerApiFieldDescriptor,
 )
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 
 TINVEST_API_SLUG = "t_invest"
 TINVEST_SANDBOX_FQDN = "sandbox-invest-public-api.tbank.ru:443"
@@ -27,14 +28,15 @@ class TInvestApiModule(BrokerApiModule):
     descriptor = BrokerApiDescriptor(
         api_slug=TINVEST_API_SLUG,
         display_name="T-Invest",
-        environments=("TEST",),
+        environments=("TEST", "PROD"),
         fields=(BrokerApiFieldDescriptor(name="token", required=True, value_type="string"),),
     )
 
     def default_fqdn(self, environment: str) -> str:
-        if environment != "TEST":
-            raise BrokerApiEnvironmentError(environment)
-        return TINVEST_SANDBOX_FQDN
+        try:
+            return resolve_tinvest_endpoint(environment, TINVEST_API_SLUG)
+        except ValueError as error:
+            raise BrokerApiEnvironmentError(environment) from error
 
     def validate_settings(self, value: object) -> dict[str, object]:
         return TInvestSettings.model_validate(value).model_dump(mode="json")

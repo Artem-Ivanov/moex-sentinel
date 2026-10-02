@@ -9,8 +9,8 @@ from t_tech.invest.schemas import CandleInterval
 
 from moex_sentinel.adapters.tinvest.converters import quotation_to_decimal
 from moex_sentinel.adapters.tinvest.streaming import MarketStreamEvent, TInvestStreamingAdapter
-from moex_sentinel.services.broker_factory import TINVEST_SANDBOX_TARGET
 from sentinel_contracts.streaming_market import StreamCandle
+from sentinel_contracts.tinvest import tinvest_environment
 
 
 class TInvestMarketStreamSource:
@@ -21,8 +21,7 @@ class TInvestMarketStreamSource:
         *,
         client_factory: Callable[..., Any] = AsyncClient,
     ) -> None:
-        if target != TINVEST_SANDBOX_TARGET:
-            raise ValueError("Only the configured Sandbox market target is allowed.")
+        self._environment = tinvest_environment(target)
         self._token = token
         self._target = target
         self._client_factory = client_factory

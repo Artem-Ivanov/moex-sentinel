@@ -46,8 +46,9 @@ def test_reuses_one_async_client_context_for_broker_lifetime() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         first = session.services
@@ -210,8 +211,9 @@ def test_quotes_commission_through_existing_sdk_context() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         request = CommissionRefreshRequest(
@@ -238,8 +240,9 @@ def test_bootstrap_dispatch_and_stream_reuse_existing_sdk_context() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         positions = await session.get_positions("account")
@@ -344,8 +347,9 @@ def test_reads_free_cash_for_requested_currency_from_sandbox_positions() -> None
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         rub = await session.get_free_cash("account", "RUB")
@@ -365,10 +369,11 @@ def test_reuses_account_snapshot_for_one_minute() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
             snapshot_ttl_seconds=60,
             monotonic=lambda: clock[0],
+            access_mode="TRADE",
         )
         await session.start()
         await session.get_positions("account")
@@ -397,10 +402,11 @@ def test_expired_snapshot_is_not_returned_when_refresh_fails() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
             snapshot_ttl_seconds=60,
             monotonic=lambda: clock[0],
+            access_mode="TRADE",
         )
         await session.start()
         await session.get_positions("account")
@@ -421,10 +427,11 @@ def test_terminal_order_state_invalidates_account_snapshot() -> None:
         client = FakeClient()
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
             snapshot_ttl_seconds=60,
             monotonic=lambda: 10.0,
+            access_mode="TRADE",
         )
         await session.start()
         await session.get_positions("account")
@@ -444,8 +451,9 @@ def test_maps_account_snapshot_rate_limit_to_retryable_broker_error() -> None:
         client.sandbox.rate_limit_portfolio = True
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         with pytest.raises(TInvestAdapterError) as captured:
@@ -465,8 +473,9 @@ def test_maps_reconciliation_rate_limit_to_retryable_broker_error() -> None:
         client.operations.rate_limited = True
         session = BrokerSdkSession(
             "synthetic-token",
-            "sandbox-target",
+            "sandbox-invest-public-api.tbank.ru:443",
             client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
         )
         await session.start()
         with pytest.raises(TInvestAdapterError) as captured:
@@ -483,7 +492,12 @@ def test_maps_reconciliation_rate_limit_to_retryable_broker_error() -> None:
 def test_finds_recent_order_by_client_idempotency_key() -> None:
     async def scenario():
         client = FakeClient()
-        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_args, **_kwargs: client)
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
+        )
         await session.start()
         result = await session.find_by_idempotency_key("account", "intent-1")
         await session.close()
@@ -498,7 +512,12 @@ def test_finds_recent_order_by_client_idempotency_key() -> None:
 def test_inspects_position_and_recent_operations_after_dispatch_failure() -> None:
     async def scenario():
         client = FakeClient()
-        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_args, **_kwargs: client)
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
+        )
         await session.start()
         position = await session.inspect_position("account", "instrument")
         operations = await session.inspect_recent_operations("account", "instrument", 20)
@@ -553,7 +572,12 @@ def test_only_snapshot_exact_tls_unwrap_failure_is_retryable(
         client.sandbox.get_sandbox_portfolio = fail
         client.sandbox.get_sandbox_positions = fail
         client.orders.post_order = fail
-        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_a, **_k: client)
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_a, **_k: client,
+            access_mode="TRADE",
+        )
         await session.start()
         try:
             if operation == "positions":
@@ -594,7 +618,12 @@ def test_snapshot_cancellation_is_not_converted_to_broker_error(operation):
 
         client.sandbox.get_sandbox_portfolio = cancelled
         client.sandbox.get_sandbox_positions = cancelled
-        session = BrokerSdkSession("synthetic-token", "sandbox-target", client_factory=lambda *_a, **_k: client)
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_a, **_k: client,
+            access_mode="TRADE",
+        )
         await session.start()
         try:
             request = (

@@ -50,3 +50,11 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> object | None:
                 loop.close()
             return True
     return None
+
+
+@pytest.fixture(autouse=True)
+def explicit_test_broker_mode(monkeypatch):
+    import os
+
+    if "BROKER_ACCESS_MODE" not in os.environ:
+        monkeypatch.setenv("BROKER_ACCESS_MODE", "READ_ONLY")

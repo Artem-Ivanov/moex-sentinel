@@ -57,7 +57,8 @@ class SynchronizeBrokerInstrumentsUsecase:
         try:
             result = await self._service.synchronize(broker_id)
             if self._position_adoption is not None:
-                await self._position_adoption.adopt(broker_id)
+                adoption = await self._position_adoption.adopt(broker_id)
+                result = result.model_copy(update={"adoption": adoption})
             return result
         except CatalogInstrumentNotFoundError as error:
             raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error

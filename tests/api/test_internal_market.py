@@ -31,13 +31,13 @@ def test_market_route_owns_lifecycle_and_rejects_execution_fields(monkeypatch, t
     gateway = Gateway()
     retry_limits = []
 
-    def build_gateway(_, *, retry_limit):
+    def build_gateway(_, *, retry_limit, settings):
         retry_limits.append(retry_limit)
         return gateway
 
     monkeypatch.setenv("SANDBOX_RETRY_LIMIT", "2")
     monkeypatch.setattr("moex_sentinel.api.app.build_market_snapshot_gateway", build_gateway, raising=False)
-    app = create_app(database_url=f"sqlite:///{tmp_path / 'market-gateway.db'}")
+    app = create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'market-gateway.db'}")
     with TestClient(app) as client:
         assert client.get("/api/health").status_code == 200
         assert gateway.requests == []
@@ -75,7 +75,7 @@ def test_market_source_errors_preserve_string_detail_contract(monkeypatch, error
 
     gateway = UnavailableGateway()
     monkeypatch.setattr("moex_sentinel.api.app.build_market_snapshot_gateway", lambda *args, **kwargs: gateway)
-    with TestClient(create_app(database_url="sqlite:///:memory:")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url="sqlite:///:memory:")) as client:
         response = client.post(
             "/internal/v1/market/snapshots",
             json={"source_id": "00000000-0000-0000-0000-000000000001", "instrument_ids": ["AAA"]},
@@ -91,7 +91,9 @@ def test_unexpected_market_failure_uses_server_error_without_private_details(mon
             raise RuntimeError("private connector detail")
 
     monkeypatch.setattr("moex_sentinel.api.app.build_market_snapshot_gateway", lambda *args, **kwargs: BrokenGateway())
-    with TestClient(create_app(database_url="sqlite:///:memory:"), raise_server_exceptions=False) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url="sqlite:///:memory:"), raise_server_exceptions=False
+    ) as client:
         response = client.post(
             "/internal/v1/market/snapshots",
             json={"source_id": "00000000-0000-0000-0000-000000000001", "instrument_ids": ["AAA"]},

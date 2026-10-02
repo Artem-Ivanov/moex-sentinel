@@ -23,6 +23,7 @@ from moex_sentinel.services.broker_factory import (
 )
 from moex_sentinel.services.brokers import BrokerConfigurationService
 from moex_sentinel.services.connections import BrokerConnectionService
+from moex_sentinel.services.environment import PinnedEnvironment
 from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
 from moex_sentinel.services.market_data import BrokerMarketDataService
 from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
@@ -51,7 +52,10 @@ from moex_sentinel.usecases.automations import (
     ViewTradingAutomationsUsecase,
     ViewTradingAutomationUsecase,
 )
-from moex_sentinel.usecases.automaton_brokers import ViewAutomatonBrokerConnectionUsecase
+from moex_sentinel.usecases.automaton_brokers import (
+    ViewAutomatonBrokerConnectionUsecase,
+    ViewAutomatonBrokerScopeUsecase,
+)
 from moex_sentinel.usecases.automaton_sync import (
     RecordAutomatonHeartbeatUsecase,
 )
@@ -93,6 +97,7 @@ from sentinel_contracts.time import utc_now_ms
 
 class ApplicationUsecases(PositionalModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    view_automaton_broker_scope: ViewAutomatonBrokerScopeUsecase
     view_automaton_broker_connection: ViewAutomatonBrokerConnectionUsecase
     record_automaton_heartbeat: RecordAutomatonHeartbeatUsecase
     create_trading_automation: CreateTradingAutomationUsecase
@@ -152,15 +157,23 @@ def build_portfolio_snapshot_collector(
         adapter_factory.create,
         store,
         clock=clock,
+        environment=PinnedEnvironment(settings.application_environment),
         retry_limit=settings.portfolio_snapshot_retry_limit,
         retry_base_seconds=settings.portfolio_snapshot_retry_base_seconds,
     )
     return CollectPortfolioSnapshotsUsecase(collection, store, clock=clock)
 
 
-def build_market_snapshot_gateway(factory: sessionmaker[Session], *, retry_limit: int = 5) -> MarketSnapshotGateway:
+def build_market_snapshot_gateway(
+    factory: sessionmaker[Session], *, retry_limit: int = 5, settings: Settings | None = None
+) -> MarketSnapshotGateway:
     """Revalidate Core-owned configuration on each read and rotate changed sessions."""
-    connections = AutomatonBrokerService(UserBrokerRepository(factory))
+    settings = settings or Settings()
+    connections = AutomatonBrokerService(
+        UserBrokerRepository(factory),
+        access_mode=settings.broker_access_mode,
+        environment=PinnedEnvironment(settings.application_environment),
+    )
 
     def source(configuration: object) -> TInvestMarketStreamSource:
         connection = cast(BrokerConnection, configuration)
@@ -172,38 +185,50 @@ def build_market_snapshot_gateway(factory: sessionmaker[Session], *, retry_limit
     return MarketSnapshotGateway(source, configuration_resolver=resolve, retry_limit=retry_limit)
 
 
-def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUsecases:
+def build_application_usecases(factory: sessionmaker[Session], settings: Settings | None = None) -> ApplicationUsecases:
     """Assemble application actors sharing configured services and the supplied session factory."""
+    settings = settings or Settings()
+    environment = PinnedEnvironment(settings.application_environment)
     repository = UserBrokerRepository(factory)
     registry = BrokerAdapterRegistry()
-    broker_service = BrokerConfigurationService(repository, registry)
+    broker_service = BrokerConfigurationService(repository, registry, environment)
     adapter_factory = PortfolioAdapterFactory(TInvestPortfolioAdapter)
-    connection_service = BrokerConnectionService(repository, adapter_factory.create)
+    connection_service = BrokerConnectionService(repository, adapter_factory.create, environment)
     instrument_repository = ReferenceCatalogRepository(factory)
-    portfolio_service = PortfolioAggregationService(repository, adapter_factory.create, None, instrument_repository)
+    portfolio_service = PortfolioAggregationService(
+        repository, adapter_factory.create, environment, instrument_repository
+    )
     market_data_factory = MarketDataAdapterFactory(TInvestMarketDataAdapter)
-    market_data_service = BrokerMarketDataService(repository, market_data_factory.create)
+    market_data_service = BrokerMarketDataService(repository, market_data_factory.create, environment)
     position_adoption = ConfiguredPositionAdoptionService(
         PositionAdoptionService(PositionAdoptionRepository(factory)),
         repository.get,
         lambda broker: TInvestOrderExecutionAdapter(
             str(broker.settings.get("token", "")),
             broker.fqdn,
+            account_id=broker.account_id or "",
         ),
     )
     instrument_catalog_service = InstrumentCatalogService(
         repository,
         instrument_repository,
         market_data_factory.create,
+        environment,
     )
     automation_repository = AutomationRepository(factory)
-    automation_service = AutomationService(automation_repository)
+    automation_service = AutomationService(
+        automation_repository, access_mode=settings.broker_access_mode, environment=environment, brokers=repository
+    )
     automaton_sync_service = AutomatonSyncService()
-    automaton_broker_service = AutomatonBrokerService(repository)
+    automaton_broker_service = AutomatonBrokerService(
+        repository, access_mode=settings.broker_access_mode, environment=environment
+    )
     trading_session_service = TradingSessionService(
         automation_service,
         automaton_broker_service,
-        lambda connection: TInvestOrderExecutionAdapter(connection.token, connection.target),
+        lambda connection: TInvestOrderExecutionAdapter(
+            connection.token, connection.target, access_mode=connection.access_mode, account_id=connection.account_id
+        ),
         instrument_repository,
     )
     automation_commands = AutomationCommandRepository(factory)
@@ -212,6 +237,7 @@ def build_application_usecases(factory: sessionmaker[Session]) -> ApplicationUse
         TradingFactMapper(),
     )
     return ApplicationUsecases(
+        view_automaton_broker_scope=ViewAutomatonBrokerScopeUsecase(automaton_broker_service),
         view_automaton_broker_connection=ViewAutomatonBrokerConnectionUsecase(automaton_broker_service),
         record_automaton_heartbeat=RecordAutomatonHeartbeatUsecase(automaton_sync_service),
         create_trading_automation=CreateTradingAutomationUsecase(automation_service),

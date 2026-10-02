@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 
 import { fetchBrokerSettings, type Broker } from "../api/brokers"
@@ -9,6 +9,8 @@ import {
   synchronizeInstruments,
   type CatalogInstrument,
   type CatalogListResponse,
+  type PositionAdoptionResult,
+  type PositionAdoptionReason,
 } from "../api/instruments"
 
 const router = useRouter()
@@ -23,8 +25,27 @@ const lotPriceTo = ref("")
 const currency = ref("RUB")
 const selectedRow = ref<string | null>(null)
 const loading = ref(false)
+const settingsLoaded = ref(false)
 const error = ref("")
 const syncMessage = ref("")
+const adoption = ref<PositionAdoptionResult | null>(null)
+watch(brokerId, () => { adoption.value = null; syncMessage.value = "" })
+const adoptionReasons: Record<PositionAdoptionReason, string> = {
+  BOOTSTRAP_BLOCKED_INVENTORY: "Заблокированный остаток: нужна сверка доступного количества.",
+  BOOTSTRAP_INVALID_QUANTITY: "Короткая позиция или некорректное количество (включая дробные лоты): автомат не создан.",
+  BOOTSTRAP_PRICE_UNAVAILABLE: "Средняя цена недоступна: нужна сверка стоимости позиции.",
+  BOOTSTRAP_INSTRUMENT_NOT_FOUND: "Инструмент не найден в каталоге: автомат не создан.",
+  BOOTSTRAP_ACTIVE_ORDER: "Есть активная заявка: нужна сверка её состояния.",
+  BOOTSTRAP_COMMISSION_UNAVAILABLE: "Комиссия недоступна: нужна сверка финансовых данных.",
+  BOOTSTRAP_CURRENCY_MISMATCH: "Валюты позиции и инструмента не совпадают: нужна сверка.",
+  BOOTSTRAP_CONFLICT: "Новый снимок не принят: сверьте уже учтённую позицию. Это не подтверждает остановку автомата.",
+}
+function adoptionReason(reason: PositionAdoptionReason): string {
+  return adoptionReasons[reason] ?? "Неизвестная причина: проверьте результат сверки позиций."
+}
+function maskedAccount(account: string): string {
+  return account.length > 4 ? `••••${account.slice(-4)}` : "••••"
+}
 const visibleItems = computed(() => {
   const query = searchQuery.value.trim().toLocaleLowerCase()
   if (!query) return data.value?.items ?? []
@@ -39,6 +60,7 @@ onMounted(async () => {
     const settings = await fetchBrokerSettings()
     brokers.value = settings.brokers.filter((broker) => broker.enabled)
     brokerId.value = brokers.value[0]?.id ?? ""
+    settingsLoaded.value = true
     if (brokerId.value) await loadCatalog()
   } catch {
     error.value = "Не удалось загрузить справочник инструментов."
@@ -91,8 +113,10 @@ async function synchronize(): Promise<void> {
   loading.value = true
   error.value = ""
   syncMessage.value = ""
+  adoption.value = null
   try {
     const result = await synchronizeInstruments(brokerId.value)
+    adoption.value = result.adoption ?? null
     syncMessage.value = `Добавлено: ${result.added}, обновлено: ${result.updated}, деактивировано: ${result.deactivated}`
     await loadCatalog()
   } catch (caught: unknown) {
@@ -175,9 +199,25 @@ function openDetails(item?: CatalogInstrument): void {
       >{{ item.label }} {{ item.count }}</button>
     </div>
     <p v-if="syncMessage" class="hint">{{ syncMessage }}</p>
+    <section v-if="adoption" aria-label="Результат сверки позиций">
+      <p>Позиции: принято {{ adoption.adopted }}, уже учтено {{ adoption.existing }}, требуют сверки {{ adoption.held }}, пропущено {{ adoption.skipped }}.</p>
+      <div v-if="adoption.held || adoption.skipped || adoption.diagnostics.length" class="error" role="alert">
+        <p>Некоторые позиции требуют сверки. Успешное обновление каталога не означает принятия всех позиций.</p>
+        <ul v-if="adoption.diagnostics.length">
+          <li v-for="(diagnostic, index) in adoption.diagnostics" :key="index">
+            Счёт {{ maskedAccount(diagnostic.account_id) }} · инструмент {{ diagnostic.external_instrument_id }}:
+            {{ adoptionReason(diagnostic.reason) }}
+          </li>
+        </ul>
+      </div>
+    </section>
     <p v-if="data?.sync_state.last_success_at" class="hint">Последняя синхронизация: {{ data.sync_state.last_success_at }}</p>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="loading && !data">Загрузка…</p>
+    <div v-else-if="settingsLoaded && brokers.length === 0" class="empty">
+      <p>Чтобы загрузить инструменты, настройте подключение брокера и выберите счёт.</p>
+      <RouterLink :to="{ name: 'brokers' }">Настроить брокера</RouterLink>
+    </div>
     <div v-else-if="data && data.items.length === 0" class="empty">Справочник инструментов пуст</div>
     <div v-else-if="data && visibleItems.length === 0" class="empty">По вашему запросу инструменты не найдены</div>
     <div v-else-if="data" class="table-scroll">

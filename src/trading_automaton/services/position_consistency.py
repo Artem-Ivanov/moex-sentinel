@@ -25,6 +25,8 @@ class PositionLedgerPort(Protocol):
 
 class PositionHoldPort(Protocol):
     def hold_active(self, reason: str, automation_id: str | None = None) -> None: ...
+
+
 class PositionConsistencyService:
     def __init__(
         self,

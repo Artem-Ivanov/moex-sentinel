@@ -13,6 +13,7 @@ from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle
 from moex_sentinel.domain.portfolio import BrokerOperation, BrokerOperationsView
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.automations import AutomationStateConflictError
+from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.storage.repositories import DuplicateRecordError, RecordNotFoundError
 from moex_sentinel.storage.repositories.automations import RevisionConflictError
 from moex_sentinel.usecases.errors import UseCaseError
@@ -69,6 +70,8 @@ class CreateTradingAutomationUsecase:
                 account_id=account_id,
                 instrument_id=instrument_id,
             )
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
@@ -89,6 +92,8 @@ class ViewTradingAutomationUsecase:
         """Return one automation; translate known lookup and lifecycle failures to UseCaseError."""
         try:
             return self._service.get(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
@@ -140,6 +145,8 @@ class ViewTradingAutomationDetailsUsecase:
         """Return details with independent source errors; fail if the automation cannot be read."""
         try:
             automation = self._automations.get(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
@@ -199,6 +206,8 @@ class HoldAutomationUsecase:
         """Return the automation after HOLD; translate known lifecycle failures to UseCaseError."""
         try:
             return self._service.hold(automation_id, "User requested hold")
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
@@ -219,6 +228,8 @@ class ResumeAutomationUsecase:
         """Return the resumed automation; translate known lifecycle failures to UseCaseError."""
         try:
             return self._service.resume(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
@@ -239,6 +250,8 @@ class CloseAutomationUsecase:
         """Return the automation after requesting closure; translate known lifecycle failures."""
         try:
             return self._service.close(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:

@@ -52,6 +52,9 @@ class Repository:
     def get_cycle_state(self, automation_id, *, now):
         return TradingCycleState(automation_id, None, None, True, None, now)
 
+    def get_position_cycle_id(self, automation_id):
+        return None
+
     def get_active_intent(self, automation_id):
         return object()
 

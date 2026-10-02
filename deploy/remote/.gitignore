@@ -1,4 +1,5 @@
 .env
 .env.*
+!.env.production.example
 !.env.example
 backups/

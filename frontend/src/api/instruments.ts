@@ -1,3 +1,5 @@
+import { apiFetch } from "./request"
+
 export interface CatalogInstrument {
   id: string
   broker_id: string
@@ -27,11 +29,28 @@ export interface CatalogInstrumentPrice extends CatalogInstrument {
 export interface CatalogCategory { code: string; label: string; count: number }
 export interface CatalogSyncState { broker_id: string; status: string; last_attempt_at: string | null; last_success_at: string | null; safe_error: string | null }
 export interface CatalogListResponse { broker_id: string; items: CatalogInstrumentPrice[]; categories: CatalogCategory[]; sync_state: CatalogSyncState; currencies: string[] }
-export interface ReconciliationResult { broker_id: string; added: number; updated: number; deactivated: number; synchronized_at: string }
+export type PositionAdoptionReason =
+  | "BOOTSTRAP_BLOCKED_INVENTORY" | "BOOTSTRAP_INVALID_QUANTITY"
+  | "BOOTSTRAP_PRICE_UNAVAILABLE" | "BOOTSTRAP_INSTRUMENT_NOT_FOUND"
+  | "BOOTSTRAP_ACTIVE_ORDER" | "BOOTSTRAP_COMMISSION_UNAVAILABLE"
+  | "BOOTSTRAP_CURRENCY_MISMATCH" | "BOOTSTRAP_CONFLICT"
+export interface PositionAdoptionDiagnostic {
+  account_id: string
+  external_instrument_id: string
+  reason: PositionAdoptionReason
+}
+export interface PositionAdoptionResult {
+  adopted: number
+  existing: number
+  held: number
+  skipped: number
+  diagnostics: PositionAdoptionDiagnostic[]
+}
+export interface ReconciliationResult { broker_id: string; added: number; updated: number; deactivated: number; synchronized_at: string; adoption: PositionAdoptionResult | null }
 export interface InstrumentDetails { broker_name: string; instrument: CatalogInstrument; last_price: { price: string; captured_at: string } | null; lot_price: string | null; sync_state: CatalogSyncState }
 
 async function load<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await (init ? fetch(url, init) : fetch(url))
+  const response = await (init ? apiFetch(url, init) : apiFetch(url))
   if (!response.ok) {
     try {
       const payload = (await response.json()) as { detail?: { message?: string } }

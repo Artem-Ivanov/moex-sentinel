@@ -210,11 +210,23 @@ class BusinessAuditService:
         broker_id: str,
         account_id: str,
         instrument_id: str,
+        include_started: bool = False,
+        started_at: datetime | None = None,
+        started_worker_quantity_lots: int | None = None,
         **data: object,
     ) -> None:
-        failed = stage is BusinessAuditStage.POSITION_RECONCILIATION_FAILED
-        self._repository.append_audit_events(
-            [
+        safe_data = {key: value for key, value in data.items() if key in _RECONCILIATION_FIELDS}
+        stages = (BusinessAuditStage.POSITION_RECONCILIATION_STARTED, stage) if include_started else (stage,)
+        occurred_at = self._now()
+        events = []
+        for current_stage in stages:
+            failed = current_stage is BusinessAuditStage.POSITION_RECONCILIATION_FAILED
+            event_data = dict(safe_data)
+            if current_stage is BusinessAuditStage.POSITION_RECONCILIATION_STARTED:
+                event_data["reason_code"] = "POSITION_RECONCILIATION_STARTED"
+                if started_worker_quantity_lots is not None:
+                    event_data["worker_quantity_lots"] = started_worker_quantity_lots
+            events.append(
                 BusinessAuditEvent(
                     event_id=self._id_factory(),
                     process_id=process_id,
@@ -224,11 +236,15 @@ class BusinessAuditService:
                     account_id=account_id,
                     instrument_id=instrument_id,
                     level=BusinessAuditLevel.ERROR if failed else BusinessAuditLevel.INFO,
-                    stage=stage,
-                    message=stage.value.replace("_", " ").title(),
-                    data={key: value for key, value in data.items() if key in _RECONCILIATION_FIELDS},
-                    occurred_at=self._now(),
+                    stage=current_stage,
+                    message=current_stage.value.replace("_", " ").title(),
+                    data=event_data,
+                    occurred_at=(
+                        (started_at or occurred_at)
+                        if current_stage is BusinessAuditStage.POSITION_RECONCILIATION_STARTED
+                        else occurred_at
+                    ),
                     critical=failed,
                 )
-            ]
-        )
+            )
+        self._repository.append_audit_events(events)

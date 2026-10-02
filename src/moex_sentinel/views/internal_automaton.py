@@ -8,6 +8,7 @@ from moex_sentinel.views.schemas.automations import (
     HeartbeatRequestSchema,
     HeartbeatResponseSchema,
 )
+from sentinel_contracts.broker_execution import BrokerScope
 
 router = APIRouter(prefix="/internal/automaton", tags=["internal-automaton"])
 
@@ -21,3 +22,8 @@ async def record_heartbeat(payload: HeartbeatRequestSchema, request: Request) ->
 @router.get("/brokers/{broker_id}/connection", response_model=BrokerConnectionSchema)
 async def broker_connection(broker_id: str, request: Request) -> BrokerConnectionSchema:
     return BrokerConnectionSchema.from_domain(_usecases(request).view_automaton_broker_connection.execute(broker_id))
+
+
+@router.get("/brokers/{broker_id}/scope", response_model=BrokerScope)
+async def broker_scope(broker_id: str, request: Request) -> BrokerScope:
+    return _usecases(request).view_automaton_broker_scope.execute(broker_id)

@@ -346,3 +346,46 @@ def test_retryable_group_response_starts_retry_from_response_time_with_selective
     assert service.flush_outbox() is True
     assert len(client.published) == 2
     assert client.published[1][0].model_dump_json() == client.published[0][1].model_dump_json()
+
+
+def test_closed_outbox_scope_validation_does_not_require_live_command_connection():
+    pending = row()
+    repository = RepositoryStub([pending])
+    client = ClientStub(FactBatchResult(results=()))
+    validated = []
+
+    def validate_commands(commands):
+        pytest.fail("delivery requires ACTIVE command connection")
+
+    def validate_facts(facts):
+        validated.extend(str(fact.user_broker_id) for fact in facts)
+
+    service = FactSynchronizationService(
+        repository,
+        client,
+        now=lambda: NOW,
+        sleep=lambda _: None,
+        deadline_ms=0,
+        validate_commands=validate_commands,
+        validate_facts=validate_facts,
+    )
+    assert service.flush_outbox() is True
+    assert validated == [pending.user_broker_id]
+    assert len(client.published) == 1
+
+
+def test_wrong_closed_outbox_scope_prevents_core_publication():
+    pending = row()
+    repository = RepositoryStub([pending])
+    client = ClientStub()
+
+    def validate_facts(facts):
+        raise ValueError("Worker/Core environment mismatch")
+
+    service = FactSynchronizationService(
+        repository, client, now=lambda: NOW, sleep=lambda _: None, deadline_ms=0, validate_facts=validate_facts
+    )
+    with pytest.raises(ValueError, match="environment mismatch"):
+        service.flush_outbox()
+    assert client.published == []
+    assert repository.acknowledged == repository.rejected == []

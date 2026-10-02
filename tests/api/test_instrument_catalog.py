@@ -17,8 +17,11 @@ from moex_sentinel.domain.instrument_catalog import (
     InstrumentDetailsView,
 )
 from moex_sentinel.domain.market_data import LastPrice
+from moex_sentinel.domain.portfolio import ActiveBrokerOrder
 from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
-from moex_sentinel.usecases.instruments import ViewBrokerInstrumentsUsecase
+from moex_sentinel.services.position_adoption import PositionAdoptionService
+from moex_sentinel.usecases.instruments import SynchronizeBrokerInstrumentsUsecase, ViewBrokerInstrumentsUsecase
+from tests.services.test_position_adoption_service import Broker, Repository, instrument, position
 
 NOW = datetime(2026, 8, 5, 12, tzinfo=UTC)
 
@@ -95,14 +98,14 @@ class Selection:
 def catalog_client(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(
+        lambda _factory, *, settings: SimpleNamespace(
             synchronize_broker_instruments=Synchronize(),
             view_broker_instruments=ListCatalog(),
             view_instrument_details=Details(),
             set_instrument_selection=Selection(),
         ),
     )
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'catalog.db'}")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'catalog.db'}")) as client:
         yield client
 
 
@@ -115,6 +118,7 @@ def test_catalog_synchronization_response(catalog_client):
         "updated": 1,
         "deactivated": 1,
         "synchronized_at": "2026-08-05T12:00:00Z",
+        "adoption": None,
     }
 
 
@@ -149,9 +153,11 @@ def test_invalid_category_precedes_range_validation_and_external_reads(monkeypat
     usecase = ViewBrokerInstrumentsUsecase(InstrumentCatalogService(brokers, catalog, adapter_factory))
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory: SimpleNamespace(view_broker_instruments=usecase),
+        lambda _factory, *, settings: SimpleNamespace(view_broker_instruments=usecase),
     )
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'invalid-category.db'}")) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'invalid-category.db'}")
+    ) as client:
         response = client.get(
             "/api/brokers/broker-1/instruments",
             params={
@@ -170,3 +176,47 @@ def test_invalid_category_precedes_range_validation_and_external_reads(monkeypat
         }
     }
     assert brokers.mock_calls == catalog.mock_calls == adapter_factory.mock_calls == []
+
+
+@pytest.mark.parametrize("blocked", [True, False])
+def test_catalog_sync_reports_held_position_without_adopting(monkeypatch, tmp_path, blocked):
+    repository = Repository(instrument())
+    broker = Broker(
+        (position().model_copy(update={"blocked": blocked}),),
+        () if blocked else (ActiveBrokerOrder("account-1", "external-1", "stop", "ACTIVE_STOP_ORDER"),),
+    )
+
+    class Catalog:
+        async def synchronize(self, broker_id):
+            return CatalogReconciliationResult(broker_id, 1, 0, 0, NOW)
+
+    class Adoption:
+        async def adopt(self, broker_id):
+            return await PositionAdoptionService(repository).adopt(
+                "00000000-0000-4000-8000-000000000101", "account-1", broker
+            )
+
+    usecase = SynchronizeBrokerInstrumentsUsecase(Catalog(), Adoption())
+    monkeypatch.setattr(
+        "moex_sentinel.api.app.build_application_usecases",
+        lambda _factory, *, settings: SimpleNamespace(synchronize_broker_instruments=usecase),
+    )
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'diagnostics.db'}")
+    ) as client:
+        response = client.post("/api/brokers/broker-1/instruments/synchronize")
+    assert response.status_code == 200
+    assert response.json()["adoption"] == {
+        "adopted": 0,
+        "existing": 0,
+        "held": 1,
+        "skipped": 0,
+        "diagnostics": [
+            {
+                "account_id": "account-1",
+                "external_instrument_id": "external-1",
+                "reason": "BOOTSTRAP_BLOCKED_INVENTORY" if blocked else "BOOTSTRAP_ACTIVE_ORDER",
+            }
+        ],
+    }
+    assert repository.candidates == []

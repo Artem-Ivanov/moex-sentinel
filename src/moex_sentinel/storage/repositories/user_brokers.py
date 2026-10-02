@@ -73,7 +73,15 @@ class UserBrokerRepository:
     def replace(self, user_broker_id: str, draft: UserBrokerDraft) -> UserBroker:
         try:
             with session_scope(self._factory) as session:
-                model = self._get_model(session, user_broker_id)
+                model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
+                if model is None:
+                    raise UserBrokerNotFoundError(user_broker_id)
+                scope_changed = any(
+                    getattr(model, name) != getattr(draft, name)
+                    for name in ("api_slug", "environment", "fqdn", "external_account_id")
+                )
+                if scope_changed and model.external_account_id:
+                    raise UserBrokerConstraintError("Selected broker scope is immutable; create a new connection.")
                 model.api_slug = draft.api_slug
                 model.display_name = draft.display_name
                 model.environment = draft.environment

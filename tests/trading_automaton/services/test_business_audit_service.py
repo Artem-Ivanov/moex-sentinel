@@ -131,3 +131,47 @@ def test_position_reconciliation_audit_records_compared_quantities() -> None:
         "worker_quantity_lots": 2,
         "reason_code": "POSITION_CONSISTENT",
     }
+
+
+def test_reconciliation_pair_uses_one_append_with_captured_start_and_failed_result():
+    class BatchRepository(Repository):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def append_audit_events(self, events):
+            self.batches.append(events)
+            super().append_audit_events(events)
+
+    started_at = datetime(2026, 10, 2, 12, tzinfo=UTC)
+    finished_at = datetime(2026, 10, 2, 12, 0, 1, tzinfo=UTC)
+    repository = BatchRepository()
+    service = BusinessAuditService(repository, now=lambda: finished_at)
+    service.record_reconciliation(
+        stage=BusinessAuditStage.POSITION_RECONCILIATION_FAILED,
+        process_id="process",
+        automation_id="automation",
+        broker_id="broker",
+        account_id="account",
+        instrument_id="instrument",
+        include_started=True,
+        started_at=started_at,
+        started_worker_quantity_lots=2,
+        broker_quantity_lots=3,
+        worker_quantity_lots=2,
+        reason_code="MISMATCH",
+        unsafe="ignored",
+    )
+    assert len(repository.batches) == 1
+    started, failed = repository.events
+    assert started.stage is BusinessAuditStage.POSITION_RECONCILIATION_STARTED
+    assert started.occurred_at == started_at
+    assert started.data["reason_code"] == "POSITION_RECONCILIATION_STARTED"
+    assert not started.critical
+    assert failed.stage is BusinessAuditStage.POSITION_RECONCILIATION_FAILED
+    assert failed.occurred_at == finished_at
+    assert failed.critical
+    assert failed.level is BusinessAuditLevel.ERROR
+    assert started.process_id == failed.process_id == "process"
+    assert "unsafe" not in started.data
+    assert "unsafe" not in failed.data

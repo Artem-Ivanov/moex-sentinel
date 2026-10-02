@@ -48,22 +48,26 @@ it("loads broker settings without a separate environment request", async () => {
   expect(screen.queryByRole("button", { name: "Заполнить тестовый контур" })).toBeNull()
 })
 
-it("edits account identity through the normal broker resource", async () => {
-  const updated = { ...broker, account_id: "account-2" }
+it("locks a selected account even when the connection is disabled", async () => {
+  const disabledBroker = { ...broker, enabled: false }
+  const updated = { ...disabledBroker, display_name: "Updated" }
   const fetchMock = vi.fn()
-    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [broker] }))
+    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [disabledBroker] }))
     .mockResolvedValueOnce(Response.json(updated))
     .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [updated] }))
   vi.stubGlobal("fetch", fetchMock)
   await renderView()
 
   await fireEvent.dblClick((await screen.findByText("Sandbox")).closest("article") as HTMLElement)
+  expect((screen.getByLabelText("Идентификатор брокерского счёта") as HTMLInputElement).readOnly).toBe(true)
+  expect(screen.getByText("Счёт закреплён за подключением. Для другого счёта создайте новое подключение.")).toBeTruthy()
   await fireEvent.update(screen.getByLabelText("Идентификатор брокерского счёта"), "account-2")
+  await fireEvent.update(screen.getByLabelText("Название"), "Updated")
   await fireEvent.click(screen.getByRole("button", { name: "Сохранить" }))
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
   const request = fetchMock.mock.calls[1][1] as RequestInit
-  expect(JSON.parse(String(request.body))).toMatchObject({ account_id: "account-2" })
+  expect(JSON.parse(String(request.body))).toMatchObject({ account_id: "account-1", display_name: "Updated" })
 })
 
 it("cancels a failed edit without losing the selected broker or keeping its errors", async () => {
@@ -131,4 +135,25 @@ it.each(["backend", "network"])("shows a %s deletion failure and allows retry wi
   expect(screen.queryByText(message)).toBeNull()
   expect(screen.queryByText("Sandbox")).toBeNull()
   expect(document.querySelector(".data-table__row--selected")).toBeNull()
+})
+
+it("derives PROD identity and fixed endpoint from the selected server adapter", async () => {
+  const adapter = { adapter_code: "TINVEST_PROD", provider_code: "TINVEST", environment_code: "PROD", fields: [
+    { name: "token", required: true, default_value: null },
+    { name: "fqdn", required: true, default_value: "invest-public-api.tinkoff.ru:443" },
+  ] }
+  const fetchMock = vi.fn().mockResolvedValue(Response.json({ adapters: [adapter], brokers: [] }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderView()
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+  await fireEvent.click(screen.getByRole("button", { name: "Добавить брокера" }))
+  await screen.findByRole("option", { name: "TINVEST · PROD" })
+  await fireEvent.update(screen.getByLabelText("Адаптер"), "TINVEST_PROD")
+  const testFlag = screen.getByLabelText("Тестовое подключение") as HTMLInputElement
+  expect(testFlag.checked).toBe(false)
+  expect(testFlag.disabled).toBe(true)
+  const endpoint = screen.getByLabelText("fqdn") as HTMLInputElement
+  expect(endpoint.value).toBe("invest-public-api.tinkoff.ru:443")
+  expect(endpoint.readOnly).toBe(true)
+  expect((screen.getByLabelText("token") as HTMLInputElement).type).toBe("password")
 })

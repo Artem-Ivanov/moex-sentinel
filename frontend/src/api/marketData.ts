@@ -1,4 +1,5 @@
 import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+import { apiFetch } from "./request"
 
 export interface MarketLastPrice {
   price: string
@@ -66,7 +67,7 @@ export async function searchMarketInstruments(
 ): Promise<MarketInstrumentSearchResponse> {
   const params = new URLSearchParams({ query, limit: String(limit) })
   const response = await ensureSuccess(
-    await fetch(`/api/brokers/${brokerId}/market/instruments?${params.toString()}`),
+    await apiFetch(`/api/brokers/${brokerId}/market/instruments?${params.toString()}`),
   )
   return (await response.json()) as MarketInstrumentSearchResponse
 }
@@ -80,7 +81,7 @@ export async function fetchHistoricCandles(
 ): Promise<HistoricCandlesResponse> {
   const params = new URLSearchParams({ from, to, interval })
   const response = await ensureSuccess(
-    await fetch(
+    await apiFetch(
       `/api/brokers/${brokerId}/market/instruments/${instrumentId}/candles?${params.toString()}`,
     ),
   )

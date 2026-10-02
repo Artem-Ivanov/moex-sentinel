@@ -77,7 +77,7 @@ def test_successful_internal_heartbeat_does_not_emit_info_http_audit(
     engine = create_database_engine(database_url)
     Base.metadata.create_all(engine)
     engine.dispose()
-    application = create_app(database_url=database_url)
+    application = create_app(test_auth_bypass=True, database_url=database_url)
 
     with caplog.at_level(logging.INFO, logger="moex_sentinel.api.app"), TestClient(application) as client:
         response = client.post(

@@ -383,8 +383,14 @@ def test_held_adopted_position_still_reconciles_pending_broker_execution() -> No
     async def scenario():
         reconciliation = Reconciliation()
         service = BrokerTickPreparationService(
-            Broker(), Portfolio(), Bootstrap(), Commissions(), Hydration(),
-            reconciliation=reconciliation, position_bootstrap=PositionBootstrap(), now=lambda: NOW,
+            Broker(),
+            Portfolio(),
+            Bootstrap(),
+            Commissions(),
+            Hydration(),
+            reconciliation=reconciliation,
+            position_bootstrap=PositionBootstrap(),
+            now=lambda: NOW,
         )
         held = bootstrap_command()
         await service.prepare((held,), MarketBatchSnapshot.immutable("held", NOW, {}))
@@ -392,3 +398,26 @@ def test_held_adopted_position_still_reconciles_pending_broker_execution() -> No
 
     reconciliation, held = asyncio.run(scenario())
     assert reconciliation.calls == [(held,)]
+
+
+@pytest.mark.parametrize(("quantity", "blocked"), [(Decimal(2), True), (Decimal("0.5"), False), (Decimal(-1), False)])
+def test_selected_unsupported_inventory_keeps_adopted_position_on_hold(quantity, blocked):
+    class UnsupportedBroker(AdoptedBroker):
+        async def get_positions(self, account_id):
+            return (BrokerPosition("instrument", quantity, Decimal(100), Decimal(101), "RUB", blocked=blocked),)
+
+    async def scenario():
+        bootstrap = PositionBootstrap()
+        service = BrokerTickPreparationService(
+            UnsupportedBroker(),
+            Portfolio(),
+            Bootstrap(),
+            ReadyCommissions(),
+            Hydration(),
+            position_bootstrap=bootstrap,
+            now=lambda: NOW,
+        )
+        await service.prepare((bootstrap_command(),), bootstrap_market())
+        assert bootstrap.calls == []
+
+    asyncio.run(scenario())

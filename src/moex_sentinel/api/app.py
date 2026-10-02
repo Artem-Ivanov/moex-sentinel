@@ -4,15 +4,19 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from functools import partial
+from hmac import compare_digest
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import Engine, text
 from sqlalchemy.engine import URL
 
 from moex_sentinel import __version__
+from moex_sentinel.api.auth import OperatorAuth
 from moex_sentinel.config import Settings
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
@@ -42,11 +46,11 @@ if TYPE_CHECKING:
     from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
 
 
-def build_application_usecases(factory: object) -> object:
+def build_application_usecases(factory: object, *, settings: Settings | None = None) -> object:
     """Load concrete dependencies only when the application lifespan starts."""
     from moex_sentinel.composition import build_application_usecases as build  # noqa: PLC0415
 
-    return build(factory)  # type: ignore[arg-type]
+    return build(factory, settings=settings)  # type: ignore[arg-type]
 
 
 def check_database(engine: Engine) -> bool:
@@ -55,11 +59,13 @@ def check_database(engine: Engine) -> bool:
         return cast(int, connection.scalar(text("SELECT 1"))) == 1
 
 
-def build_market_snapshot_gateway(factory: object, *, retry_limit: int = 5) -> "MarketSnapshotGateway":
+def build_market_snapshot_gateway(
+    factory: object, *, retry_limit: int = 5, settings: Settings | None = None
+) -> "MarketSnapshotGateway":
     """Construct the lazy market source owner without opening a broker connection."""
     from moex_sentinel.composition import build_market_snapshot_gateway as build  # noqa: PLC0415
 
-    return build(factory, retry_limit=retry_limit)  # type: ignore[arg-type]
+    return build(factory, retry_limit=retry_limit, settings=settings)  # type: ignore[arg-type]
 
 
 def check_schema(engine: Engine) -> bool:
@@ -75,6 +81,7 @@ def create_app(
     database_checker: Callable[[Engine], bool] = check_database,
     schema_checker: Callable[[Engine], bool] = check_schema,
     configure_audit: bool = False,
+    test_auth_bypass: bool = False,
 ) -> FastAPI:
     """Create a configured HTTP application."""
     settings = Settings()
@@ -82,14 +89,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        if not test_auth_bypass:
+            application.state.operator_auth = OperatorAuth(
+                settings.auth_username,
+                settings.auth_password_hash,
+                insecure_loopback=settings.auth_insecure_loopback,
+                session_cookie_name=settings.auth_session_cookie_name,
+                allowed_origin=settings.auth_allowed_origin,
+            )
         if configure_audit:
             configure_logging("backend", level=settings.log_level, format=settings.log_format)
         engine = create_database_engine(configured_url)
         application.state.database_engine = engine
         application.state.session_factory = create_session_factory(engine)
-        application.state.usecases = build_application_usecases(application.state.session_factory)
+        application.state.usecases = build_application_usecases(application.state.session_factory, settings=settings)
         market_gateway = build_market_snapshot_gateway(
-            application.state.session_factory, retry_limit=settings.sandbox_retry_limit
+            application.state.session_factory, retry_limit=settings.sandbox_retry_limit, settings=settings
         )
         application.state.market_snapshot_usecase = GetMarketSnapshotUsecase(market_gateway)
         application.state.readiness_usecase = CheckReadinessUsecase(
@@ -112,6 +127,92 @@ def create_app(
         version=__version__,
         lifespan=lifespan,
     )
+
+    class LoginBody(BaseModel):
+        username: str = Field(max_length=64)
+        password: str = Field(max_length=1024)
+
+    @application.middleware("http")
+    async def protect_browser_api(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        path = request.url.path
+        if test_auth_bypass or not path.startswith("/api/"):
+            return await call_next(request)
+        auth: OperatorAuth = request.app.state.operator_auth
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not auth.origin_allowed(request):
+            return JSONResponse({"detail": "Invalid Origin"}, status_code=403, headers={"Cache-Control": "no-store"})
+        if path not in {"/api/health", "/api/auth/login"}:
+            cookie_name = auth.cookie_name(request)
+            raw_id = request.cookies.get(cookie_name) if cookie_name else None
+            session = auth.get_session(raw_id)
+            if session is None:
+                response: Response = JSONResponse({"detail": "Authentication required"}, status_code=401)
+                response.headers["Cache-Control"] = "no-store"
+                return response
+            request.state.operator_session = session
+            if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+                supplied = request.headers.get("X-CSRF-Token", "")
+                if not compare_digest(supplied.encode("utf-8"), session.csrf_token.encode("ascii")):
+                    response = JSONResponse({"detail": "Invalid CSRF token"}, status_code=403)
+                    response.headers["Cache-Control"] = "no-store"
+                    return response
+        if (
+            settings.broker_access_mode == "READ_ONLY"
+            and request.method == "POST"
+            and (
+                (path.startswith("/api/instruments/") and path.endswith("/trade"))
+                or (path.startswith("/api/trading-automations/") and path.rsplit("/", 1)[-1] in {"resume", "close"})
+            )
+        ):
+            return JSONResponse({"detail": "READ_ONLY: trading commands are disabled"}, status_code=403)
+        response = await call_next(request)
+        if path != "/api/health":
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @application.post("/api/auth/login")
+    async def login(body: LoginBody, request: Request) -> Response:
+        auth: OperatorAuth = request.app.state.operator_auth
+        cookie_name = auth.cookie_name(request)
+        if cookie_name is None:
+            return JSONResponse({"detail": "Local login unavailable for this host"}, status_code=403)
+        verified = await auth.verify(body.username, body.password)
+        if verified is None:
+            return JSONResponse({"detail": "Too many login attempts"}, status_code=429, headers={"Retry-After": "1"})
+        if not verified:
+            return JSONResponse({"detail": "Invalid credentials"}, status_code=401)
+        raw_id, session = auth.create_session()
+        response = JSONResponse({"username": session.username, "csrf_token": session.csrf_token})
+        response.set_cookie(
+            cookie_name,
+            raw_id,
+            max_age=12 * 60 * 60,
+            secure=not auth.insecure_loopback,
+            httponly=True,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    @application.get("/internal/runtime")
+    @application.get("/api/runtime")
+    async def runtime_configuration() -> dict[str, str]:
+        return {"environment": settings.application_environment, "access_mode": settings.broker_access_mode}
+
+    @application.get("/api/auth/session")
+    async def auth_session(request: Request) -> dict[str, str]:
+        session = request.state.operator_session
+        return {"username": session.username, "csrf_token": session.csrf_token}
+
+    @application.post("/api/auth/logout", status_code=204)
+    async def logout(request: Request) -> Response:
+        auth: OperatorAuth = request.app.state.operator_auth
+        cookie_name = auth.cookie_name(request)
+        auth.revoke(request.cookies.get(cookie_name) if cookie_name else None)
+        response = Response(status_code=204)
+        response.delete_cookie(
+            cookie_name or "", path="/", secure=not auth.insecure_loopback, httponly=True, samesite="strict"
+        )
+        return response
 
     @application.middleware("http")
     async def correlate_business_process(

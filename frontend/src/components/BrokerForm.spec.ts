@@ -106,7 +106,7 @@ describe("BrokerForm", () => {
 
     expect(screen.getByRole("heading", { name: "Новая интеграция" })).toBeTruthy()
     expect((screen.getByLabelText("Адаптер") as HTMLSelectElement).disabled).toBe(false)
-    expect((screen.getByLabelText("Тестовое подключение") as HTMLInputElement).disabled).toBe(false)
+    expect((screen.getByLabelText("Тестовое подключение") as HTMLInputElement).disabled).toBe(true)
 
     await fireEvent.update(screen.getByLabelText("Адаптер"), "TINVEST_SANDBOX")
 

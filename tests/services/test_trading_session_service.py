@@ -205,7 +205,7 @@ def test_composed_session_status_resolves_catalog_id_before_broker_request(monke
             session.commit()
         AutomationRepository(factory).create(broker_id="broker", account_id="account", instrument_id="local-instrument")
         monkeypatch.setattr(
-            "moex_sentinel.composition.TInvestOrderExecutionAdapter", lambda *_args: ExternalIdAdapter()
+            "moex_sentinel.composition.TInvestOrderExecutionAdapter", lambda *_args, **_kwargs: ExternalIdAdapter()
         )
 
         result = asyncio.run(build_application_usecases(factory).view_trading_sessions_status.execute())

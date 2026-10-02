@@ -11,7 +11,7 @@ from moex_sentinel.storage.database import create_database_engine
 
 @pytest.mark.postgresql
 def test_core_health_accepts_current_postgresql_schema(isolated_postgresql_database_url: URL) -> None:
-    application = create_app(database_url=isolated_postgresql_database_url)
+    application = create_app(test_auth_bypass=True, database_url=isolated_postgresql_database_url)
 
     with TestClient(application) as client:
         response = client.get("/api/health")
@@ -29,7 +29,7 @@ def test_core_health_rejects_postgresql_without_current_revision(
     with engine.begin() as connection:
         connection.execute(text("DELETE FROM alembic_version"))
     engine.dispose()
-    application = create_app(database_url=isolated_postgresql_database_url)
+    application = create_app(test_auth_bypass=True, database_url=isolated_postgresql_database_url)
 
     with TestClient(application) as client:
         response = client.get("/api/health")

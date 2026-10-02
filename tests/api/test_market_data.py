@@ -78,9 +78,9 @@ def test_market_data_http_contracts(monkeypatch, tmp_path) -> None:
         view_market_instrument=InstrumentUsecase(),
         view_historic_candles=CandlesUsecase(),
     )
-    monkeypatch.setattr("moex_sentinel.api.app.build_application_usecases", lambda _factory: usecases)
+    monkeypatch.setattr("moex_sentinel.api.app.build_application_usecases", lambda _factory, *, settings: usecases)
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'market.db'}")) as client:
+    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'market.db'}")) as client:
         search = client.get("/api/brokers/broker-1/market/instruments", params={"query": "SBER", "limit": 10})
         card = client.get("/api/brokers/broker-1/market/instruments/uid-1")
         candles = client.get(
@@ -125,9 +125,11 @@ def test_market_search_validation_is_returned_as_field_error(monkeypatch, tmp_pa
             )
 
     usecases = SimpleNamespace(search_market_instruments=InvalidSearchUsecase())
-    monkeypatch.setattr("moex_sentinel.api.app.build_application_usecases", lambda _factory: usecases)
+    monkeypatch.setattr("moex_sentinel.api.app.build_application_usecases", lambda _factory, *, settings: usecases)
 
-    with TestClient(create_app(database_url=f"sqlite:///{tmp_path / 'invalid-market.db'}")) as client:
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'invalid-market.db'}")
+    ) as client:
         response = client.get("/api/brokers/broker-1/market/instruments", params={"query": "S", "limit": 20})
 
     assert response.status_code == 422

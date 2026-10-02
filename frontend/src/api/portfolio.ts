@@ -1,3 +1,5 @@
+import { apiFetch } from "./request"
+
 export interface Money { amount: string; currency: string }
 export interface ReadError { broker_id: string; broker_name: string; account_id: string | null; code: string; message: string }
 export interface Account { broker_id: string; broker_name: string; account_id: string; name: string; status: string; account_type: string; total_amount: Money | null; free_cash: Money | null; realized_pnl: Money | null; unrealized_pnl: Money | null }
@@ -11,7 +13,7 @@ export interface CurrencyTradingSummary { currency: string; portfolio_value: str
 export interface TradingSummaryResponse { captured_at: string | null; currencies: CurrencyTradingSummary[]; errors: ReadError[] }
 
 async function load<T>(url: string): Promise<T> {
-  const response = await fetch(url)
+  const response = await apiFetch(url)
   if (!response.ok) throw new Error("Не удалось загрузить данные площадки.")
   return (await response.json()) as T
 }

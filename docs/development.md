@@ -21,6 +21,15 @@ Python-дистрибутива. Рабочие модули приложени�
 cp .env.example .env
 uv sync --all-extras
 npm --prefix frontend install
+uv run python -m moex_sentinel.api.auth hash-password
+```
+
+Перед запуском сохраните выведенный verifier в `AUTH_PASSWORD_HASH` файла
+`.env` и задайте `AUTH_USERNAME`. Локальный HTTP-вход на `127.0.0.1` требует
+явного `AUTH_INSECURE_LOOPBACK=true`; оставьте `false` для HTTPS. Команда Vite
+для разработки также слушает только `127.0.0.1`.
+
+```bash
 docker volume create moex-sentinel-postgres-data
 docker volume create moex-sentinel_automaton-data
 docker compose -f compose.yml --profile build build python-base

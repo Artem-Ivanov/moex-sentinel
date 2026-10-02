@@ -70,7 +70,7 @@ def test_strategy_settings_use_approved_defaults(monkeypatch: pytest.MonkeyPatch
     assert settings.order_ttl_seconds == 10
     assert settings.order_retry_limit == 3
     assert settings.core_retry_limit == 5
-    assert settings.enabled is True
+    assert settings.enabled is False
 
 
 def test_strategy_settings_read_complete_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:

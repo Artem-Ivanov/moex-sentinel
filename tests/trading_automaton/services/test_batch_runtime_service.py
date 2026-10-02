@@ -116,7 +116,7 @@ def test_commits_once_then_waits_only_for_sdk_dispatch_start() -> None:
         repository = Repository()
         dispatcher = Dispatcher()
         tracking = Tracking()
-        service = BatchTradingRuntimeService(repository, dispatcher, tracking, now=lambda: NOW)
+        service = BatchTradingRuntimeService(repository, dispatcher, tracking, now=lambda: NOW, access_mode="TRADE")
         item, request = batch_pair()
         result = await service.run_batch((item,), (request,), snapshot_at=NOW)
         assert len(dispatcher.calls) == 1
@@ -136,10 +136,7 @@ def test_batch_rollback_prevents_every_sdk_dispatch() -> None:
     async def scenario():
         dispatcher = Dispatcher()
         service = BatchTradingRuntimeService(
-            Repository(error=ValueError("rollback")),
-            dispatcher,
-            Tracking(),
-            now=lambda: NOW,
+            Repository(error=ValueError("rollback")), dispatcher, Tracking(), now=lambda: NOW, access_mode="TRADE"
         )
         item, request = batch_pair()
         with pytest.raises(DurableDecisionPersistenceError) as captured:
@@ -161,6 +158,7 @@ def test_batch_rollback_leaves_cash_reservations_unchanged() -> None:
             Tracking(),
             now=lambda: NOW,
             cash=cash,
+            access_mode="TRADE",
         )
         item, request = batch_pair()
         with suppress(DurableDecisionPersistenceError):
@@ -188,11 +186,7 @@ def test_committed_cash_reservation_is_published_before_sdk_dispatch() -> None:
         cash = Cash()
         dispatcher = ObservingDispatcher(cash)
         service = BatchTradingRuntimeService(
-            Repository(),
-            dispatcher,
-            Tracking(),
-            now=lambda: NOW,
-            cash=cash,
+            Repository(), dispatcher, Tracking(), now=lambda: NOW, cash=cash, access_mode="TRADE"
         )
         item, request = batch_pair()
         result = await service.run_batch((item,), (request,), snapshot_at=NOW)
@@ -211,7 +205,9 @@ def test_dispatch_failure_before_started_is_propagated_without_hanging() -> None
 
     async def scenario():
         item, request = batch_pair()
-        service = BatchTradingRuntimeService(Repository(), FailingDispatcher(), Tracking(), now=lambda: NOW)
+        service = BatchTradingRuntimeService(
+            Repository(), FailingDispatcher(), Tracking(), now=lambda: NOW, access_mode="TRADE"
+        )
         with pytest.raises(PostCommitBatchError, match="SUBMITTING persistence failed") as captured:
             await asyncio.wait_for(service.run_batch((item,), (request,), snapshot_at=NOW), timeout=0.1)
         assert isinstance(captured.value.cause, ValueError)
@@ -232,7 +228,7 @@ def test_rejects_invalid_intent_request_mapping_before_commit(case: str) -> None
     else:
         requests = (DispatchRequest(**{**request.model_dump(), "quantity_lots": 2}),)
     repository = Repository()
-    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
+    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW, access_mode="TRADE")
 
     with pytest.raises(ValueError, match="intent.*request"):
         asyncio.run(service.run_batch((item,), requests, snapshot_at=NOW))
@@ -252,7 +248,7 @@ def test_rejects_mismatched_dispatch_fields_before_commit(field: str, value: obj
     item, request = batch_pair()
     item = DecisionBatchItem(**{**item.model_dump(), "strategy_snapshot": {"currency": "RUB"}})
     repository = Repository()
-    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
+    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW, access_mode="TRADE")
 
     with pytest.raises(ValueError, match="intent request mapping fields"):
         asyncio.run(
@@ -278,6 +274,7 @@ def test_gate_protects_committed_intent_when_cash_publication_fails() -> None:
             now=lambda: NOW,
             cash=FailingCash(),
             active_intents=gate,
+            access_mode="TRADE",
         )
         with pytest.raises(PostCommitBatchError, match="cash cache unavailable") as captured:
             await service.run_batch((item,), (request,), snapshot_at=NOW)
@@ -309,11 +306,7 @@ def test_committed_cash_reservations_are_published_sequentially() -> None:
         cash = SequentialCash()
         dispatcher = Dispatcher()
         service = BatchTradingRuntimeService(
-            Repository(),
-            dispatcher,
-            Tracking(),
-            now=lambda: NOW,
-            cash=cash,
+            Repository(), dispatcher, Tracking(), now=lambda: NOW, cash=cash, access_mode="TRADE"
         )
         task = asyncio.create_task(
             service.run_batch(
@@ -337,7 +330,7 @@ def test_committed_cash_reservations_are_published_sequentially() -> None:
 def test_rejects_wrong_request_identity_before_commit(field: str, value: str) -> None:
     item, request = batch_pair()
     repository = Repository()
-    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW)
+    service = BatchTradingRuntimeService(repository, Dispatcher(), Tracking(), now=lambda: NOW, access_mode="TRADE")
 
     with pytest.raises(ValueError, match="intent request mapping fields"):
         asyncio.run(

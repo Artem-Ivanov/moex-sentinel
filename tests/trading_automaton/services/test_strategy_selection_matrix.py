@@ -62,7 +62,7 @@ def _base_context(**changes: object) -> DecisionContext:
         "averaging_step_percent": Decimal("0.5"),
         "minimum_net_profit_percent": Decimal("0.5"),
         "completed_partial_sell_steps": 0,
-        "settings": StrategySettings(),
+        "settings": StrategySettings(enabled=True),
         "currency": "RUB",
         "min_price_increment": Decimal("0.01"),
         "lots": (),
@@ -176,7 +176,7 @@ def _buy_more_context(**changes: object) -> DecisionContext:
             "S-10",
             lambda: _base_context(
                 cycle=_base_cycle(),
-                settings=StrategySettings(STRATEGY_BUY_ORDER_LOTS=2),
+                settings=StrategySettings(STRATEGY_BUY_ORDER_LOTS=2, enabled=True),
                 indicators=_base_indicators(),
             ),
             DecisionKind.BUY_MORE,

@@ -8,6 +8,7 @@ const props = defineProps<{
   draft: BrokerDraft
   adapters: BrokerAdapterDefinition[]
   fieldErrors: Record<string, string>
+  accountLocked?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +28,7 @@ function checkedFrom(event: Event): boolean {
 }
 
 function updateScalar<Key extends keyof BrokerDraft>(key: Key, value: BrokerDraft[Key]): void {
+  if (key === "account_id" && props.accountLocked) return
   emit("update:draft", { ...props.draft, [key]: value })
   emit("clear-field", String(key))
 }
@@ -85,7 +87,7 @@ function selectAdapter(event: Event): void {
     <label class="checkbox">
       <input
         :checked="draft.is_test"
-        :disabled="mode === 'edit'"
+        :disabled="true"
         type="checkbox"
         @change="updateScalar('is_test', checkedFrom($event))"
       > Тестовое подключение
@@ -93,16 +95,22 @@ function selectAdapter(event: Event): void {
     <small v-if="fieldErrors.is_test" class="field-error">{{ fieldErrors.is_test }}</small>
     <label>Идентификатор брокерского счёта
       <input
+        aria-label="Идентификатор брокерского счёта"
         :value="draft.account_id ?? ''"
+        :readonly="accountLocked"
         :aria-invalid="!!fieldErrors.account_id"
         @input="updateScalar('account_id', valueFrom($event) || null)"
       >
+      <small v-if="accountLocked">Счёт закреплён за подключением. Для другого счёта создайте новое подключение.</small>
       <small v-if="fieldErrors.account_id" class="field-error">{{ fieldErrors.account_id }}</small>
     </label>
     <label v-for="(field, index) in draft.fields" :key="field.name">{{ field.name }}
       <input
         :value="field.value"
         :aria-label="field.name"
+        :readonly="field.name === 'fqdn'"
+        :type="field.name === 'token' ? 'password' : 'text'"
+        autocomplete="off"
         :aria-invalid="!!fieldErrors[`fields.${field.name}`]"
         @input="updateConnectionField(index, valueFrom($event))"
       >

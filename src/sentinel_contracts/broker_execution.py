@@ -4,9 +4,10 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 
 from sentinel_contracts.base import PositionalModel
+from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
 
 
 class OrderSide(str, Enum):
@@ -58,6 +59,15 @@ class BrokerOrderState(PositionalModel):
     executed_at: datetime | None = None
 
 
+class BrokerScope(PositionalModel):
+    """Immutable broker identity without credentials or execution capability."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    broker_id: str
+    environment: BrokerEnvironment
+    account_id: str
+
+
 class BrokerConnection(PositionalModel):
     model_config = ConfigDict(frozen=True)
     broker_id: str
@@ -65,6 +75,19 @@ class BrokerConnection(PositionalModel):
     target: str
     token: str
     is_test: bool
+    environment: BrokerEnvironment | None = None
+    access_mode: BrokerAccessMode = "READ_ONLY"
+    account_id: str = ""
+
+    @model_validator(mode="after")
+    def validate_environment(self):
+        expected = "TEST" if self.is_test else "PROD"
+        if self.environment is not None and self.environment != expected:
+            raise ValueError("Broker environment and is_test disagree.")
+        if expected == "PROD" and not self.account_id.strip():
+            raise ValueError("PROD requires a selected account.")
+        object.__setattr__(self, "environment", expected)
+        return self
 
 
 class BrokerPosition(PositionalModel):
@@ -74,6 +97,7 @@ class BrokerPosition(PositionalModel):
     average_price: Decimal
     current_price: Decimal
     currency: str
+    blocked: bool = False
 
 
 class BrokerTradingStatus(PositionalModel):

@@ -1,4 +1,5 @@
 import { readErrorPayload, type ApiFieldError } from "./errorPayload"
+import { apiFetch } from "./request"
 
 export interface BrokerField {
   name: string
@@ -67,13 +68,13 @@ async function ensureSuccess(response: Response): Promise<Response> {
 }
 
 export async function fetchBrokerSettings(): Promise<BrokerSettings> {
-  const response = await ensureSuccess(await fetch("/api/brokers"))
+  const response = await ensureSuccess(await apiFetch("/api/brokers"))
   return (await response.json()) as BrokerSettings
 }
 
 export async function createBroker(draft: BrokerDraft): Promise<Broker> {
   const response = await ensureSuccess(
-    await fetch("/api/brokers", {
+    await apiFetch("/api/brokers", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(draft),
@@ -84,7 +85,7 @@ export async function createBroker(draft: BrokerDraft): Promise<Broker> {
 
 export async function replaceBroker(brokerId: string, draft: BrokerDraft): Promise<Broker> {
   const response = await ensureSuccess(
-    await fetch(`/api/brokers/${brokerId}`, {
+    await apiFetch(`/api/brokers/${brokerId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(draft),
@@ -94,12 +95,12 @@ export async function replaceBroker(brokerId: string, draft: BrokerDraft): Promi
 }
 
 export async function deleteBroker(brokerId: string): Promise<void> {
-  await ensureSuccess(await fetch(`/api/brokers/${brokerId}`, { method: "DELETE" }))
+  await ensureSuccess(await apiFetch(`/api/brokers/${brokerId}`, { method: "DELETE" }))
 }
 
 export async function checkBroker(brokerId: string): Promise<BrokerConnectionStatus> {
   const response = await ensureSuccess(
-    await fetch(`/api/brokers/${brokerId}/check`, { method: "POST" }),
+    await apiFetch(`/api/brokers/${brokerId}/check`, { method: "POST" }),
   )
   return (await response.json()) as BrokerConnectionStatus
 }

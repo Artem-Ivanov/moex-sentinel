@@ -18,6 +18,8 @@ services:
   backend:
     <<: *runtime
     image: moex-sentinel-backend:${RELEASE_TAG:?Set a unique release tag}
+    environment:
+      AUTH_INSECURE_LOOPBACK: "false"
 
   portfolio-snapshot-worker:
     <<: *runtime
@@ -29,6 +31,7 @@ services:
 
   trading-automaton:
     <<: *runtime
+    stop_grace_period: 120s
     image: moex-sentinel-trading-automaton:${RELEASE_TAG:?Set a unique release tag}
     profiles: [trading]
     # The SQLite intent/outbox owner must remain a singleton.

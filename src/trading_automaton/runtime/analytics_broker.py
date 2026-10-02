@@ -30,7 +30,9 @@ class AnalyticsBrokerRuntime:
         *,
         tick_seconds: float = 1.0,
         retry_limit: int = 5,
+        account_id: str = "",
     ) -> None:
+        self._account_id = account_id
         self._analytics = analytics
         self._iteration = iteration
         self._tick_seconds = tick_seconds
@@ -42,6 +44,8 @@ class AnalyticsBrokerRuntime:
 
     async def replace_commands(self, commands: tuple[AutomationCommand, ...]) -> None:
         """Publish command changes without blocking an iteration waiting on external I/O."""
+        if self._account_id and any(command.account_id != self._account_id for command in commands):
+            raise ValueError("Broker command account mismatch")
         await self._iteration.replace_commands(commands)
 
     async def run(self) -> None:

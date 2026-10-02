@@ -40,6 +40,7 @@ class ExternalPosition(PositionalModel):
     average_price: Money | None
     current_price: Money | None
     expected_yield: Money | None
+    blocked: bool = False
 
 
 class ActiveBrokerOrder(PositionalModel):

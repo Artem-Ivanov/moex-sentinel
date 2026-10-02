@@ -21,6 +21,7 @@ from moex_sentinel.domain.user_brokers import (
 )
 from moex_sentinel.services.environment import EnvironmentStatePort
 from moex_sentinel.services.ports import BrokerRegistryPort
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 
 SANDBOX_FQDN = "sandbox-invest-public-api.tbank.ru:443"
 
@@ -75,7 +76,9 @@ class BrokerConfigurationService:
     def view_settings(self) -> BrokerSettings:
         is_test = self._active_environment() == "TEST"
         return BrokerSettings(
-            adapters=self._registry.list() if is_test else (),
+            adapters=tuple(
+                adapter for adapter in self._registry.list() if (adapter.environment_code == "SANDBOX") == is_test
+            ),
             brokers=tuple(self._broker(item) for item in self._repository.list() if item.is_test is is_test),
         )
 
@@ -115,7 +118,7 @@ class BrokerConfigurationService:
         return UserBrokerDraft(
             api_slug=draft.adapter_code,
             display_name=draft.display_name.strip(),
-            environment="TEST",
+            environment="TEST" if draft.is_test else "PROD",
             fqdn=fqdn,
             settings=values,
             external_account_id=account_id,
@@ -130,7 +133,7 @@ class BrokerConfigurationService:
             id=value.id,
             display_name=value.display_name,
             provider_code="TINVEST",
-            environment_code="SANDBOX",
+            environment_code="SANDBOX" if value.is_test else "PROD",
             adapter_code=value.api_slug,
             enabled=value.enabled,
             fields=fields,
@@ -142,7 +145,7 @@ class BrokerConfigurationService:
 
     def _validate(self, draft: BrokerDraft) -> None:
         errors: list[FieldError] = []
-        if self._active_environment() != "TEST" or not draft.is_test:
+        if (self._active_environment() == "TEST") != draft.is_test:
             errors.append(FieldError("is_test", "TEST_REQUIRED", "Доступен только тестовый контур."))
         if not draft.display_name.strip():
             errors.append(FieldError("display_name", "REQUIRED", "Укажите название брокера."))
@@ -179,7 +182,9 @@ class BrokerConfigurationService:
             raise InvalidBrokerConfigurationError(invalid)
 
         values = {field.name: field.value for field in draft.fields}
-        if values["fqdn"] != SANDBOX_FQDN:
+        try:
+            resolve_tinvest_endpoint("TEST" if draft.is_test else "PROD", draft.adapter_code, values["fqdn"])
+        except ValueError:
             raise InvalidBrokerConfigurationError((FieldError("fields.fqdn", "NOT_ALLOWED", "Адрес API не разрешён."),))
 
     def _active_environment(self) -> str:

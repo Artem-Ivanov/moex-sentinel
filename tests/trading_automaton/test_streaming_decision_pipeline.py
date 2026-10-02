@@ -124,13 +124,13 @@ def test_one_order_book_event_evaluates_each_position_once_before_sdk_dispatch()
                 StreamingPositionDecisionService(
                     Schedules(),
                     decisions=TradeDecisionService(strategy),
-                    contexts=DecisionContextService(StrategySettings()),
+                    contexts=DecisionContextService(StrategySettings(enabled=True)),
                 )
             ),
             states,
             batch,
             now=lambda: NOW,
-            materializer=DecisionMaterializerService(settings=StrategySettings(), id_factory=lambda: "id"),
+            materializer=DecisionMaterializerService(settings=StrategySettings(enabled=True), id_factory=lambda: "id"),
             order_books=OrderBookValidationService(),
         )
         preparation = Preparation()
