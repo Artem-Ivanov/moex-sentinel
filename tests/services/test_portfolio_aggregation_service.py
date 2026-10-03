@@ -439,3 +439,86 @@ def test_operation_ticker_lookup_is_scoped_to_broker_and_one_request(initially_p
     assert sorted(catalog.calls) == [("b1", "shared-external")] * 2 + [("b2", "shared-external")] * 2
     for item in second.items:
         assert item.operation.ticker == f"{item.broker_id}-generation-2"
+
+
+class ScopedPortfolioAdapter(PortfolioAdapter):
+    def __init__(self, account_ids):
+        super().__init__("unused")
+        self.account_ids = account_ids
+        self.reads = []
+
+    async def list_accounts(self):
+        return tuple(BrokerAccount(account_id, "Main", "OPEN", "BROKER") for account_id in self.account_ids)
+
+    async def get_portfolio(self, account_id):
+        self.reads.append(("portfolio", account_id))
+        return await super().get_portfolio(account_id)
+
+    async def get_positions(self, account_id):
+        self.reads.append(("positions", account_id))
+        return await super().get_positions(account_id)
+
+    async def get_operations(self, account_id, cursor, limit, instrument_id=None):
+        self.reads.append(("operations", account_id))
+        return await super().get_operations(account_id, cursor, limit, instrument_id)
+
+
+def read_scope(service, kind):
+    if kind == "accounts":
+        return asyncio.run(service.view_broker_accounts("b1"))
+    if kind == "positions":
+        return asyncio.run(service.view_positions())
+    return asyncio.run(service.view_operations(20))
+
+
+@pytest.mark.parametrize("kind", ["accounts", "positions", "operations"])
+@pytest.mark.parametrize("account_ids", [(), ("foreign",)])
+def test_missing_selected_account_reports_error_without_reading_other_accounts(kind, account_ids):
+    record = broker("b1", "First").model_copy(update={"account_id": "selected"})
+    adapter = ScopedPortfolioAdapter(account_ids)
+    service = PortfolioAggregationService(BrokerRepository([record]), lambda _: adapter)
+
+    result = read_scope(service, kind)
+
+    assert len(result.errors) == 1
+    assert result.errors[0].code == "BROKER_ACCOUNT_NOT_FOUND"
+    assert result.errors[0].message == "Выбранный счёт не найден на площадке."
+    assert result.errors[0].account_id == "selected"
+    assert adapter.reads == []
+
+
+@pytest.mark.parametrize("kind", ["accounts", "positions", "operations"])
+def test_selected_account_present_reads_only_its_scope(kind):
+    record = broker("b1", "First").model_copy(update={"account_id": "selected"})
+    adapter = ScopedPortfolioAdapter(("foreign", "selected"))
+    service = PortfolioAggregationService(BrokerRepository([record]), lambda _: adapter)
+
+    result = read_scope(service, kind)
+
+    assert result.errors == ()
+    assert len(adapter.reads) == 1
+    assert adapter.reads[0][1] == "selected"
+
+
+def test_unbound_account_discovery_retains_all_available_accounts():
+    record = broker("b1", "First")
+    adapter = ScopedPortfolioAdapter(("first", "second"))
+    service = PortfolioAggregationService(BrokerRepository([record]), lambda _: adapter)
+
+    result = asyncio.run(service.view_broker_accounts(record.id))
+
+    assert result.errors == ()
+    assert [item.account.account_id for item in result.accounts] == ["first", "second"]
+
+
+def test_missing_scope_does_not_hide_another_brokers_accounts():
+    missing = broker("b1", "First").model_copy(update={"account_id": "selected"})
+    good = broker("b2", "Second").model_copy(update={"account_id": "good"})
+    adapters = {"b1": ScopedPortfolioAdapter(("foreign",)), "b2": ScopedPortfolioAdapter(("good",))}
+    service = PortfolioAggregationService(BrokerRepository([missing, good]), lambda record: adapters[record.id])
+
+    result = asyncio.run(service.view_all_accounts())
+
+    assert [item.broker_id for item in result.accounts] == ["b2"]
+    assert [error.code for error in result.errors] == ["BROKER_ACCOUNT_NOT_FOUND"]
+    assert adapters["b1"].reads == []

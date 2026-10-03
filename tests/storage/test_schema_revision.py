@@ -33,4 +33,4 @@ def test_schema_is_compatible_only_for_expected_revision() -> None:
 
 
 def test_expected_revision_is_current_alembic_head() -> None:
-    assert expected_schema_revision() == "0002_portfolio_snapshot_runs"
+    assert expected_schema_revision() == "0003_user_broker_archive"

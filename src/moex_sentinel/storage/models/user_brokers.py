@@ -1,9 +1,12 @@
 """Persistence model for configured broker API/account scopes."""
 
+from datetime import datetime
+
 from sqlalchemy import JSON, CheckConstraint, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from moex_sentinel.storage.models.base import Base, TimestampMixin, UuidPrimaryKeyMixin
+from moex_sentinel.storage.types import UTCDateTime
 
 
 class UserBrokerModel(UuidPrimaryKeyMixin, TimestampMixin, Base):
@@ -37,3 +40,4 @@ class UserBrokerModel(UuidPrimaryKeyMixin, TimestampMixin, Base):
     settings: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     external_account_id: Mapped[str | None] = mapped_column(String(128))
     state: Mapped[str] = mapped_column(String(16), nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime())

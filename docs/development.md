@@ -1,5 +1,59 @@
 # Разработка
 
+## Версии сервисов
+
+Текущая версия исходного кода backend и frontend — `0.2.0`. Она описывает
+подготовленный выпуск; версия установленного на VPS экземпляра проверяется отдельно.
+V1 локально DONE / NOT_DEPLOYED; итоговая независимая приёмка PASS. [Постановка и задачи](superpowers/plans/v1-service-versions.md).
+
+Python-сервисы Core, Worker, Analytics и сборщик портфеля выпускаются с общей
+версией backend. Согласованно обновляются `project.version` в `pyproject.toml`,
+версия локального пакета `moex-sentinel` в `uv.lock` и literal `SERVICE_VERSION`
+в `src/sentinel_contracts/version.py`. Совместимый `moex_sentinel.__version__`
+импортирует эту константу. Shared version module содержит только docstring и
+один literal assignment; Core initializer — shared alias и optional `__all__`.
+Повторные вычисляемые присваивания и переопределение alias блокируют выпуск.
+Analytics импортирует только shared contracts, без Core/Worker/credentials.
+
+Frontend имеет собственную версию в `frontend/package.json`; обновляются также
+корневая версия и `packages[""].version` в `frontend/package-lock.json`.
+Версии Python и npm могут различаться; формат каждого пакета — `MAJOR.MINOR.PATCH`.
+Схема БД, версии зависимостей и runtime-протокол изменяются отдельно.
+
+На странице «Диагностика» версия интерфейса берётся из собранного пакета и видна
+даже при ошибке API. Core сообщает свою версию в health и diagnostics. Worker
+передаёт version/instance/контур/режим через существующий heartbeat: Core хранит
+один volatile observation, без таблиц и истории; при возрасте >=30 секунд или
+после restart Core версия UNKNOWN. Legacy heartbeat без metadata получает прежний
+ACK. Scope mismatch, старые/повторные и недопустимые будущие наблюдения не продлевают TTL.
+Это информация о версии; она не подтверждает работу стратегии или торговую готовность.
+
+Analytics сообщает версию через private `/health` и OpenAPI. Core использует
+captured `ANALYTICS_URL`: TEST Compose задаёт внутренний адрес, initial PROD
+явно пустой URL и UNKNOWN. Проверка ограничена одной секундой и телом4KiB,
+без broker RPC, credentials, proxy environment и redirects. Ошибки дают UNKNOWN.
+В UI Core/Worker/Analytics показаны отдельно; отсутствующие или устаревшие версии
+не заменяются версией Core. Торговые observations O1 остаются неизвестными.
+
+Проверка перед выпуском:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sentinel_contracts.release .
+npm --prefix frontend run build
+```
+
+Guard читает metadata через stdlib, не импортируя приложение. Python base Docker
+build блокируется своим `--python-only` gate до установки зависимостей; временный
+metadata tree и Core alias удаляются до runtime Analytics. Frontend Docker build
+выполняет Vite npm gate. Remote preflight проверяет оба пакета до чтения secret env.
+Каждый gate блокирует mismatch/missing/malformed metadata; пакеты не принуждаются
+к общей версии. При rollout сначала обновляется Core (новый optional heartbeat),
+затем Worker; новые Worker metadata требуют поддерживающего Core.
+
+Перед выпуском также выполняются регрессия и независимое кросс-ревью по
+[правилам оркестрации](agent-orchestration.md). Владелец делает commit; VPS
+обновляется после его отдельной отмашки. [Очередь](phase-1-implementation-plan.md#v1-service-versions).
+
 ## Кросс-ревью
 
 Для каждого завершённого изменения обязательно независимое кросс-ревью

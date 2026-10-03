@@ -88,6 +88,7 @@ class UserBroker(UserBrokerDraft):
     id: str
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
 
     @property
     def adapter_code(self) -> str:
@@ -103,7 +104,7 @@ class UserBroker(UserBrokerDraft):
 
     @property
     def enabled(self) -> bool:
-        return self.state is UserBrokerState.ACTIVE
+        return self.state is UserBrokerState.ACTIVE and self.archived_at is None
 
     @property
     def account_id(self) -> str | None:

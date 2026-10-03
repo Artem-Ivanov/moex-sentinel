@@ -152,6 +152,7 @@ async function remove(id: string) {
   try {
     await deleteBroker(id)
     await load()
+    if (editingBrokerId.value === id) closeForm()
   } catch (cause) {
     error.value = cause instanceof BrokerApiError ? cause.message : "Не удалось удалить брокера."
   }
@@ -188,7 +189,7 @@ async function remove(id: string) {
         <div class="actions" @dblclick.stop>
           <button @click.stop="check(broker.id)">Проверить</button>
           <button @click.stop="router.push({ name: 'broker-accounts', params: { brokerId: broker.id } })">Счета</button>
-          <button @click.stop="remove(broker.id)">Удалить</button>
+          <button title="Удалить подключение из списка. История сохраняется." @click.stop="remove(broker.id)">Удалить</button>
         </div>
       </article>
     </template>

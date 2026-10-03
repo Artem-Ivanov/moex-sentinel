@@ -73,8 +73,10 @@ class FakeBrokerRepository:
         self.records[broker_id] = record
         return record
 
-    def disable(self, broker_id: str, *, expected_environment: str | None = None) -> UserBroker:
-        record = self.records[broker_id].model_copy(update={"state": UserBrokerState.DISABLED})
+    def archive(self, broker_id: str, *, expected_environment: str | None = None) -> UserBroker:
+        record = self.records[broker_id].model_copy(
+            update={"state": UserBrokerState.DISABLED, "archived_at": datetime(2026, 10, 2, tzinfo=UTC)}
+        )
         self.records[broker_id] = record
         return record
 
@@ -198,3 +200,25 @@ def test_prod_environment_hides_test_adapters_and_brokers() -> None:
 
     assert settings.adapters == ()
     assert settings.brokers == ()
+
+
+def test_settings_hide_only_archived_records_in_current_contour() -> None:
+    repository = FakeBrokerRepository()
+    service = BrokerConfigurationService(repository, FakeBrokerRegistry())
+    record = repository.create(
+        UserBrokerDraft(
+            api_slug="TINVEST_SANDBOX",
+            display_name="Scope",
+            environment="TEST",
+            fqdn=SANDBOX_FQDN,
+            settings={"token": "synthetic"},
+            external_account_id="account",
+            state=UserBrokerState.ACTIVE,
+        )
+    )
+    for state in UserBrokerState:
+        repository.records[state.value] = record.model_copy(update={"id": state.value, "state": state})
+    repository.records["prod"] = record.model_copy(update={"id": "prod", "environment": "PROD"})
+    service.delete_settings(record.id)
+
+    assert {item.id for item in service.view_settings().brokers} == {state.value for state in UserBrokerState}

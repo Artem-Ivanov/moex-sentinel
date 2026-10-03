@@ -18,7 +18,7 @@ def test_health_reports_available_database(tmp_path: Path) -> None:
     assert response.json() == {
         "status": "ok",
         "service": "backend",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "database": "ok",
         "schema": "compatible",
     }
@@ -41,7 +41,7 @@ def test_health_reports_database_failure_without_exposing_error() -> None:
     assert response.json() == {
         "status": "error",
         "service": "backend",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "database": "error",
         "schema": "incompatible",
     }
@@ -65,7 +65,7 @@ def test_health_reports_schema_incompatibility_separately_without_exposing_revis
     assert response.json() == {
         "status": "error",
         "service": "backend",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "database": "ok",
         "schema": "incompatible",
     }

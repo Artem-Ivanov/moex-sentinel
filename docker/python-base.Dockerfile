@@ -14,6 +14,11 @@ RUN groupadd --gid 10001 sentinel \
 WORKDIR /app
 
 COPY pyproject.toml ./
+COPY pyproject.toml uv.lock /tmp/release/
+COPY src/sentinel_contracts/version.py src/sentinel_contracts/release.py /tmp/release/src/sentinel_contracts/
+COPY src/moex_sentinel/__init__.py /tmp/release/src/moex_sentinel/
+RUN python /tmp/release/src/sentinel_contracts/release.py /tmp/release --python-only \
+    && rm -rf /tmp/release
 COPY docker/certs/tbank-root.pem docker/certs/tbank-sub.pem /tmp/tbank-certs/
 
 RUN cat /etc/ssl/certs/ca-certificates.crt /tmp/tbank-certs/tbank-root.pem /tmp/tbank-certs/tbank-sub.pem > /tmp/tbank-ca-bundle.pem \

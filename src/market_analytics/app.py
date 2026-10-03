@@ -16,6 +16,7 @@ from market_analytics.ports import MarketSourcePort
 from market_analytics.service import AnalyticsService
 from market_analytics.usecases import AnalyticsUnavailableError, CalculateAnalyticsSnapshotUsecase
 from sentinel_contracts.analytics import AnalyticsSnapshot, AnalyticsSnapshotRequest
+from sentinel_contracts.version import SERVICE_VERSION
 
 
 def create_app(
@@ -39,7 +40,7 @@ def create_app(
             app.state.analytics = CalculateAnalyticsSnapshotUsecase(HttpMarketSource(client), calculator)
             yield
 
-    app = FastAPI(title="Market Analytics", lifespan=lifespan)
+    app = FastAPI(title="Market Analytics", version=SERVICE_VERSION, lifespan=lifespan)
     if market_source is not None:
         app.state.analytics = CalculateAnalyticsSnapshotUsecase(market_source, calculator)
 
@@ -49,7 +50,7 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "service": "analytics", "version": SERVICE_VERSION}
 
     @app.post("/internal/v1/analytics/snapshots", response_model=AnalyticsSnapshot)
     async def snapshot(payload: AnalyticsSnapshotRequest, request: Request) -> AnalyticsSnapshot:

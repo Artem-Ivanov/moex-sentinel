@@ -51,6 +51,7 @@ services:
       database:
         condition: service_healthy
     environment:
+      ANALYTICS_URL: http://analytics:8001
       APPLICATION_ENVIRONMENT: "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}"
       BROKER_ACCESS_MODE: "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}"
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@${DATABASE_HOST:-database}:5432/${POSTGRES_DB}

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     log_format: str = "json"
     application_environment: BrokerEnvironment = "TEST"
     broker_access_mode: BrokerAccessMode
+    analytics_url: str = ""
     auth_session_cookie_name: str = "__Host-moex-session"
     auth_allowed_origin: str = ""
     auth_username: str = ""

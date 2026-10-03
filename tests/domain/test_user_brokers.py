@@ -44,6 +44,23 @@ def test_draft_user_broker_allows_missing_external_account_id() -> None:
     assert draft.state is UserBrokerState.DRAFT
 
 
+def test_archived_user_broker_is_never_enabled_even_with_inconsistent_state() -> None:
+    value = UserBroker(
+        api_slug="t_invest",
+        display_name="Archived",
+        environment="TEST",
+        fqdn="sandbox-invest-public-api.tbank.ru:443",
+        settings={},
+        external_account_id="account-1",
+        state=UserBrokerState.ACTIVE,
+        id="scope-1",
+        created_at=datetime(2026, 8, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 10, tzinfo=UTC),
+        archived_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+    assert value.enabled is False
+
+
 @pytest.mark.parametrize(
     ("model_type", "values"),
     [

@@ -9,8 +9,12 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from sentinel_contracts.release import ReleaseVersionError, validate_release
 
 PASSWORD_HASH_PATTERN = re.compile(r"scrypt:16384:8:5:[0-9a-fA-F]{32}:[0-9a-fA-F]{64}\Z")
 
@@ -131,6 +135,10 @@ def validate_shared_database_pair(test: dict, prod: dict) -> None:
 
 def main() -> None:
     directory = Path(__file__).resolve().parent
+    try:
+        validate_release(directory.parents[1])
+    except ReleaseVersionError as error:
+        fail(str(error))
     default_env = ".env.production" if os.environ.get("REMOTE_CONTOUR") == "PROD" else ".env"
     env_path = Path(os.environ.get("REMOTE_ENV_FILE", str(directory / default_env))).resolve()
     if not env_path.is_file():

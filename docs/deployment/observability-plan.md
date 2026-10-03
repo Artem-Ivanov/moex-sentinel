@@ -1,18 +1,29 @@
 # Наблюдаемость MOEX Sentinel
 
 Статус: проект для согласования от 02.10.2026, код/stack не развёрнуты.
+03.10 принят отдельный локальный кодовый этап [O1.1](../superpowers/specs/o1-core-diagnostics-design.md):
+готовность Core и режим экземпляра, остальные подсистемы явно UNKNOWN.
+Задачи и результат приёмки записаны в [плане](../superpowers/plans/o1-core-diagnostics.md).
+Этот этап не подтверждает heartbeat, audit query, метрики, alerts или deployment.
+V1 добавляет отдельные version observations в diagnostics и собственную UI версию
+([план](../superpowers/plans/v1-service-versions.md)); локально DONE / NOT_DEPLOYED,
+итоговая независимая приёмка PASS. Version heartbeat имеет volatile TTL и scope, но не измеряет прогресс
+итераций, broker/market/outbox или готовность стратегии. Private Analytics health
+сообщает версию, не свежесть рынка. Полные O1/O2/S1/M1 остаются OPEN.
 Цель — видеть состояние решения и разбирать инциденты через интерфейс,
 получать уведомления об отказах без ручного подключения по SSH.
 
 ## Что уже есть
 
-На текущем VPS используются Docker Compose контейнеры. В коде есть
+Последняя проверка VPS 02.10 подтверждала Docker Compose контейнеры. В коде есть
 JSON-логи с UTC/process_id/stage, durable business audit Worker/Core,
 описания решений/позиций и периодические portfolio snapshots.
 `/api/health` показывает готовность Core DB/schema; Analytics health
-не проверяет свежесть рынка. Worker heartbeat принимается каждые 3 секунды,
-но Core сейчас не сохраняет последнее время и не предоставляет его оператору.
-Полноценного HTTP query журнала аудита, `/metrics`, dashboards и alerting нет.
+не проверяет свежесть рынка. На VPS baseline02.10 heartbeat каждые3секунды
+оставался stateless. Локальный V1 сохраняет только version observation, время
+приёма Core и TTL/age и возвращает их в diagnostics; прогресс итераций и
+broker/outbox/market состояние этим не измеряются. Полноценного HTTP query
+журнала аудита, `/metrics`, dashboards и alerting нет.
 
 Зелёный HTTP health поэтому может сосуществовать с остановленным Worker,
 недоступным брокером или stale рынком. Это пробел видимости, который нужно

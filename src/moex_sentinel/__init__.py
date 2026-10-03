@@ -1,3 +1,5 @@
 """MOEX Sentinel application package."""
 
-__version__ = "0.1.0"
+from sentinel_contracts.version import SERVICE_VERSION as __version__
+
+__all__ = ["__version__"]

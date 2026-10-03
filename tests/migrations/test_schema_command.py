@@ -120,7 +120,7 @@ def test_schema_command_migrates_with_database_configuration_only(
     assert json.loads(capsys.readouterr().out) == {"status": "SCHEMA_UPGRADED"}
     engine = create_engine(database_url)
     try:
-        assert current_schema_revision(engine) == "0002_portfolio_snapshot_runs"
+        assert current_schema_revision(engine) == "0003_user_broker_archive"
         assert set(inspect(engine).get_table_names()) == {*Base.metadata.tables, "alembic_version"}
     finally:
         engine.dispose()

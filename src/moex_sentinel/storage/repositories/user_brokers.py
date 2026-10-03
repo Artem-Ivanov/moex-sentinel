@@ -16,6 +16,7 @@ from moex_sentinel.domain.user_brokers import (
 )
 from moex_sentinel.storage.database import session_scope
 from moex_sentinel.storage.models.user_brokers import UserBrokerModel
+from sentinel_contracts.time import utc_now_ms
 
 
 def _record(model: UserBrokerModel) -> UserBroker:
@@ -30,6 +31,7 @@ def _record(model: UserBrokerModel) -> UserBroker:
         state=UserBrokerState(model.state),
         created_at=model.created_at,
         updated_at=model.updated_at,
+        archived_at=model.archived_at,
     )
 
 
@@ -76,7 +78,11 @@ class UserBrokerRepository:
         try:
             with session_scope(self._factory) as session:
                 model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
-                if model is None or (expected_environment is not None and model.environment != expected_environment):
+                if (
+                    model is None
+                    or model.archived_at is not None
+                    or (expected_environment is not None and model.environment != expected_environment)
+                ):
                     raise UserBrokerNotFoundError(user_broker_id)
                 scope_changed = any(
                     getattr(model, name) != getattr(draft, name)
@@ -101,6 +107,18 @@ class UserBrokerRepository:
             model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
             if model is None or (expected_environment is not None and model.environment != expected_environment):
                 raise UserBrokerNotFoundError(user_broker_id)
+            model.state = UserBrokerState.DISABLED.value
+            session.flush()
+            return _record(model)
+
+    def archive(self, user_broker_id: str, *, expected_environment: str | None = None) -> UserBroker:
+        """Hide settings durably while retaining the immutable scope and all its history."""
+        with session_scope(self._factory) as session:
+            model = session.get(UserBrokerModel, user_broker_id, with_for_update=True)
+            if model is None or (expected_environment is not None and model.environment != expected_environment):
+                raise UserBrokerNotFoundError(user_broker_id)
+            if model.archived_at is None:
+                model.archived_at = utc_now_ms()
             model.state = UserBrokerState.DISABLED.value
             session.flush()
             return _record(model)

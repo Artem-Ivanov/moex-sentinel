@@ -4,6 +4,7 @@ import { currentSession, restoreSession, safeInternalRedirect, sessionChecked, s
 import BrokerAccountsView from "./views/BrokerAccountsView.vue"
 import BrokersView from "./views/BrokersView.vue"
 import LoginView from "./views/LoginView.vue"
+import DiagnosticsView from "./views/DiagnosticsView.vue"
 import PositionDetailsView from "./views/PositionDetailsView.vue"
 import PositionsListView from "./views/PositionsListView.vue"
 import InstrumentItemView from "./views/InstrumentItemView.vue"
@@ -25,6 +26,7 @@ export const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/login", name: "login", component: LoginView },
+    { path: "/diagnostics", name: "diagnostics", component: DiagnosticsView },
     { path: "/", redirect: { name: "positions" } },
     { path: "/brokers", name: "brokers", component: BrokersView },
     { path: "/brokers/:brokerId/accounts", name: "broker-accounts", component: BrokerAccountsView },

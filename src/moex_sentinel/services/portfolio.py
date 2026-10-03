@@ -9,6 +9,7 @@ from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
 from moex_sentinel.domain.portfolio import (
+    BrokerAccount,
     BrokerAccountSnapshot,
     BrokerAccountsView,
     BrokerOperation,
@@ -155,6 +156,18 @@ class PortfolioAggregationService:
     def _active_test(self) -> bool:
         return self._environment is None or self._environment.view().active_environment == "TEST"
 
+    @staticmethod
+    def _missing_selected_account_error(broker: Broker, accounts: tuple[BrokerAccount, ...]) -> BrokerReadError | None:
+        if not broker.account_id or any(account.account_id == broker.account_id for account in accounts):
+            return None
+        return BrokerReadError(
+            broker_id=broker.id,
+            broker_name=broker.display_name,
+            account_id=broker.account_id,
+            code="BROKER_ACCOUNT_NOT_FOUND",
+            message="Выбранный счёт не найден на площадке.",
+        )
+
     async def _read_accounts(
         self, broker: Broker
     ) -> tuple[tuple[BrokerAccountSnapshot, ...], tuple[BrokerReadError, ...]]:
@@ -163,6 +176,9 @@ class PortfolioAggregationService:
             accounts = await adapter.list_accounts()
         except (TInvestAdapterError, ValueError) as error:
             return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
 
         snapshots: list[BrokerAccountSnapshot] = []
         errors: list[BrokerReadError] = []
@@ -182,6 +198,9 @@ class PortfolioAggregationService:
             accounts = await adapter.list_accounts()
         except (TInvestAdapterError, ValueError) as error:
             return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
 
         items: list[BrokerPosition] = []
         errors: list[BrokerReadError] = []
@@ -207,6 +226,9 @@ class PortfolioAggregationService:
             accounts = await adapter.list_accounts()
         except (TInvestAdapterError, ValueError) as error:
             return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
 
         items: list[BrokerOperation] = []
         errors: list[BrokerReadError] = []

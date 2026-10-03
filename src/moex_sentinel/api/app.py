@@ -8,6 +8,7 @@ from hmac import compare_digest
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
+import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -16,15 +17,19 @@ from sqlalchemy import Engine, text
 from sqlalchemy.engine import URL
 
 from moex_sentinel import __version__
+from moex_sentinel.adapters.analytics_version import AnalyticsVersionClient
 from moex_sentinel.api.auth import OperatorAuth
 from moex_sentinel.config import Settings
+from moex_sentinel.services.runtime_versions import WorkerVersionStore
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
+from moex_sentinel.usecases.diagnostics import GetDiagnosticsStatusUsecase
 from moex_sentinel.usecases.errors import UseCaseError
 from moex_sentinel.usecases.health import CheckReadinessUsecase
 from moex_sentinel.usecases.market_snapshot import GetMarketSnapshotUsecase
 from moex_sentinel.views.automations import router as automation_router
 from moex_sentinel.views.brokers import router as broker_router
+from moex_sentinel.views.diagnostics import router as diagnostics_router
 from moex_sentinel.views.errors import render_usecase_error, render_validation_error
 from moex_sentinel.views.health import router as health_router
 from moex_sentinel.views.instruments import router as instrument_router
@@ -110,13 +115,27 @@ def create_app(
         application.state.readiness_usecase = CheckReadinessUsecase(
             partial(database_checker, engine), partial(schema_checker, engine)
         )
+        application.state.worker_versions = WorkerVersionStore(
+            settings.application_environment, settings.broker_access_mode
+        )
+        analytics_http = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+        application.state.analytics_versions = AnalyticsVersionClient(settings.analytics_url, analytics_http)
+        application.state.diagnostics_usecase = GetDiagnosticsStatusUsecase(
+            application.state.readiness_usecase,
+            settings.application_environment,
+            settings.broker_access_mode,
+            worker_versions=application.state.worker_versions.snapshot,
+        )
         with business_process():
             audit_event(LOGGER, "APPLICATION_STARTED", "Backend application started")
         try:
             yield
         finally:
             try:
-                await market_gateway.close()
+                try:
+                    await analytics_http.aclose()
+                finally:
+                    await market_gateway.close()
             finally:
                 with business_process():
                     audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")
@@ -264,6 +283,7 @@ def create_app(
     application.add_exception_handler(UseCaseError, render_usecase_error)
     application.add_exception_handler(RequestValidationError, render_validation_error)
     application.include_router(health_router, prefix="/api")
+    application.include_router(diagnostics_router, prefix="/api")
     application.include_router(broker_router, prefix="/api")
     application.include_router(portfolio_router, prefix="/api")
     application.include_router(trading_summary_router, prefix="/api")

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/vue"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/vue"
 import { createMemoryHistory, createRouter } from "vue-router"
 import { afterEach, expect, it, vi } from "vitest"
 
@@ -102,7 +102,51 @@ it("cancels a failed edit without losing the selected broker or keeping its erro
   expect(screen.getByLabelText("Название").getAttribute("aria-invalid")).toBe("false")
 })
 
-it.each(["backend", "network"])("shows a %s deletion failure and allows retry with the selection preserved", async (failure) => {
+it("closes the deleted broker's editor and keeps it absent after remount", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [broker] }))
+    .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    .mockImplementation(() => Promise.resolve(Response.json({ adapters: [], brokers: [] })))
+  vi.stubGlobal("fetch", fetchMock)
+  const view = await renderView()
+
+  await fireEvent.dblClick((await screen.findByText("Sandbox")).closest("article") as HTMLElement)
+  await fireEvent.click(screen.getByRole("button", { name: "Удалить" }))
+
+  expect(await screen.findByText("Подключённые брокеры отсутствуют")).toBeTruthy()
+  expect(screen.queryByRole("heading", { name: "Редактирование интеграции" })).toBeNull()
+  expect(screen.queryByText("Sandbox")).toBeNull()
+  expect(document.querySelector(".data-table__row--selected")).toBeNull()
+  expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/brokers/broker-1", expect.objectContaining({ method: "DELETE" }))
+  view.unmount()
+  await renderView()
+  expect(await screen.findByText("Подключённые брокеры отсутствуют")).toBeTruthy()
+  expect(screen.queryByText("Sandbox")).toBeNull()
+})
+
+it("keeps an unrelated disabled broker's editor open after deletion", async () => {
+  const disabledBroker = { ...broker, id: "broker-2", display_name: "Disabled", enabled: false }
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [broker, disabledBroker] }))
+    .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [disabledBroker] }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderView()
+
+  await fireEvent.dblClick((await screen.findByText("Disabled")).closest("article") as HTMLElement)
+  const deletedRow = screen.getByText("Sandbox").closest("article") as HTMLElement
+  await fireEvent.click(within(deletedRow).getByRole("button", { name: "Удалить" }))
+
+  await waitFor(() => expect(screen.queryByText("Sandbox")).toBeNull())
+  expect(screen.getByText("Disabled")).toBeTruthy()
+  expect(screen.getByRole("heading", { name: "Редактирование интеграции" })).toBeTruthy()
+  expect((screen.getByLabelText("Включено") as HTMLInputElement).checked).toBe(false)
+  expect((screen.getByLabelText("Идентификатор брокерского счёта") as HTMLInputElement).readOnly).toBe(true)
+  await fireEvent.update(screen.getByLabelText("Название"), "Updated disabled")
+  expect((screen.getByLabelText("Название") as HTMLInputElement).value).toBe("Updated disabled")
+})
+
+it.each(["backend", "network"])("shows a %s deletion failure and allows retry with the editor and selection preserved", async (failure) => {
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(Response.json({ adapters: [], brokers: [broker] }))
   if (failure === "backend") {
@@ -121,7 +165,7 @@ it.each(["backend", "network"])("shows a %s deletion failure and allows retry wi
   await renderView()
 
   const row = (await screen.findByText("Sandbox")).closest("article") as HTMLElement
-  await fireEvent.click(row)
+  await fireEvent.dblClick(row)
   await fireEvent.click(screen.getByRole("button", { name: "Удалить" }))
 
   const message = failure === "backend"
@@ -129,11 +173,14 @@ it.each(["backend", "network"])("shows a %s deletion failure and allows retry wi
     : "Не удалось удалить брокера."
   expect(await screen.findByText(message)).toBeTruthy()
   expect(screen.getByText("Sandbox").closest("article")?.className).toContain("data-table__row--selected")
+  expect(screen.getByRole("heading", { name: "Редактирование интеграции" })).toBeTruthy()
+  expect((screen.getByLabelText("Идентификатор брокерского счёта") as HTMLInputElement).readOnly).toBe(true)
   await fireEvent.click(screen.getByRole("button", { name: "Удалить" }))
 
   expect(await screen.findByText("Подключённые брокеры отсутствуют")).toBeTruthy()
   expect(screen.queryByText(message)).toBeNull()
   expect(screen.queryByText("Sandbox")).toBeNull()
+  expect(screen.queryByRole("heading", { name: "Редактирование интеграции" })).toBeNull()
   expect(document.querySelector(".data-table__row--selected")).toBeNull()
 })
 

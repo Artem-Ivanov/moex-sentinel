@@ -31,6 +31,10 @@ class BrokerConnectionService:
         for attempt in range(2):
             try:
                 accounts = await adapter.list_accounts()
+                if broker.account_id and not any(account.account_id == broker.account_id for account in accounts):
+                    raise TInvestAdapterError(  # noqa: TRY301 - admission belongs before the successful result.
+                        "BROKER_ACCOUNT_NOT_FOUND", "Выбранный счёт не найден на площадке.", retryable=False
+                    )
                 return BrokerConnectionStatus(broker.id, True, len(accounts))
             except TInvestAdapterError as error:
                 if not error.retryable or attempt == 1:

@@ -205,3 +205,13 @@ def test_candle_readiness_is_stable_for_one_generation_at_age_boundary():
     assert first["instruments"][0]["freshness"] == second["instruments"][0]["freshness"] == "FRESH"
     assert first["instruments"][0]["metrics"]["mean_20"] == "110.5"
     assert first["instruments"][0]["metrics"] == second["instruments"][0]["metrics"]
+
+
+def test_health_exposes_analytics_version_without_core_dependency():
+    with TestClient(create_app(Source([]), now=lambda: NOW)) as client:
+        assert client.get("/health").json() == {"status": "ok", "service": "analytics", "version": "0.2.0"}
+
+
+def test_analytics_openapi_and_health_report_same_service_version():
+    with TestClient(create_app(Source([]), now=lambda: NOW)) as client:
+        assert client.get("/openapi.json").json()["info"]["version"] == client.get("/health").json()["version"]

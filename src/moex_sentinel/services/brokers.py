@@ -61,7 +61,7 @@ class UserBrokerRepositoryPort:
         self, user_broker_id: str, draft: UserBrokerDraft, *, expected_environment: str | None = None
     ) -> UserBroker: ...
 
-    def disable(self, user_broker_id: str, *, expected_environment: str | None = None) -> UserBroker: ...
+    def archive(self, user_broker_id: str, *, expected_environment: str | None = None) -> UserBroker: ...
 
 
 class BrokerConfigurationService:
@@ -81,7 +81,11 @@ class BrokerConfigurationService:
             adapters=tuple(
                 adapter for adapter in self._registry.list() if (adapter.environment_code == "SANDBOX") == is_test
             ),
-            brokers=tuple(self._broker(item) for item in self._repository.list() if item.is_test is is_test),
+            brokers=tuple(
+                self._broker(item)
+                for item in self._repository.list()
+                if item.is_test is is_test and item.archived_at is None
+            ),
         )
 
     def save_settings(self, broker_id: str | None, draft: BrokerDraft) -> Broker:
@@ -105,7 +109,7 @@ class BrokerConfigurationService:
 
     def delete_settings(self, broker_id: str) -> None:
         try:
-            self._repository.disable(broker_id, expected_environment=self._active_environment())
+            self._repository.archive(broker_id, expected_environment=self._active_environment())
         except UserBrokerNotFoundError:
             raise BrokerNotFoundError("Broker was not found.")
 

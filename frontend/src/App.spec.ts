@@ -20,6 +20,7 @@ async function renderAt(routeName: string, authenticated = true) {
       { path: "/login", name: "login", component: EmptyPage },
       { path: "/instruments", name: "instruments", component: EmptyPage },
       { path: "/positions", name: "positions", component: EmptyPage },
+      { path: "/diagnostics", name: "diagnostics", component: EmptyPage },
     ],
   })
   await router.push({ name: routeName })
@@ -32,6 +33,7 @@ describe("sidebar navigation", () => {
   it("uses page routes without the backend API prefix", async () => {
     await renderAt("positions")
 
+    expect(screen.getByRole("link", { name: "Диагностика" }).getAttribute("href")).toBe("/diagnostics")
     expect(screen.queryByRole("link", { name: "Аналитика" })).toBeNull()
     expect(screen.getByRole("link", { name: "Брокеры" }).getAttribute("href")).toBe("/brokers")
     expect(screen.getByRole("link", { name: "Инструменты" }).getAttribute("href")).toBe(

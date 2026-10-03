@@ -25,6 +25,7 @@ services:
     networks: [default, data]
     image: moex-sentinel-backend:${RELEASE_TAG:?Set a unique release tag}
     environment:
+      ANALYTICS_URL: http://analytics:8001
       AUTH_INSECURE_LOOPBACK: "false"
 
   portfolio-snapshot-worker:

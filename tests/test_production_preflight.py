@@ -1,6 +1,7 @@
 """Offline safety gates do not contact a daemon or broker."""
 
 import importlib.util
+import shutil
 from copy import deepcopy
 from pathlib import Path
 
@@ -87,3 +88,22 @@ def test_prod_rejects_unreviewed_database_target():
     ] = "postgresql+psycopg://sentinel:fixture@database:5432/separate_prod"
     with pytest.raises(SystemExit, match="FAIL"):
         preflight.validate_contour_config(config)
+
+
+def test_remote_main_runs_release_gate_before_accessing_deployment_environment(tmp_path, monkeypatch):
+    root = Path(__file__).parents[1]
+    for relative in (
+        "pyproject.toml",
+        "uv.lock",
+        "src/sentinel_contracts/version.py",
+        "src/moex_sentinel/__init__.py",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+    ):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / relative, target)
+    (tmp_path / "src/sentinel_contracts/version.py").write_text('SERVICE_VERSION = "9.9.9"\n')
+    monkeypatch.setattr(preflight, "__file__", str(tmp_path / "deploy/remote/preflight.py"))
+    with pytest.raises(SystemExit, match="Python release versions disagree"):
+        preflight.main()

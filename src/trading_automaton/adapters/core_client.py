@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -16,6 +16,7 @@ from sentinel_contracts.trading_facts import (
     FactBatchResult,
     FactEnvelope,
 )
+from sentinel_contracts.version import SERVICE_VERSION
 
 
 class CoreClient:
@@ -25,6 +26,7 @@ class CoreClient:
         self._http = http
         self._application_environment = application_environment
         self._access_mode = access_mode
+        self._instance_id = uuid4()
 
     def validate_runtime(self) -> None:
         if self._application_environment is None and self._access_mode is None:
@@ -72,7 +74,22 @@ class CoreClient:
         self.validate_runtime()
         response = self._http.post(
             "/internal/automaton/heartbeats",
-            json={"worker_id": worker_id, "occurred_at": _json_value(occurred_at)},
+            json={
+                "worker_id": worker_id,
+                "occurred_at": _json_value(occurred_at),
+                **(
+                    {
+                        "runtime_version": {
+                            "version": SERVICE_VERSION,
+                            "instance_id": str(self._instance_id),
+                            "environment": self._application_environment,
+                            "access_mode": self._access_mode,
+                        }
+                    }
+                    if self._application_environment is not None and self._access_mode is not None
+                    else {}
+                ),
+            },
             headers=self._headers(),
         )
         response.raise_for_status()

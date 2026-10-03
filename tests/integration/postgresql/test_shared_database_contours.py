@@ -100,7 +100,7 @@ def test_foreign_mutation_rejected_without_change(shared_database, state, operat
         model.external_account_id = None if state == "DRAFT" else model.external_account_id
     repository = UserBrokerRepository(factory)
     before = repository.get(broker_id)
-    draft = UserBrokerDraft.model_validate(before.model_dump(exclude={"id", "created_at", "updated_at"}))
+    draft = UserBrokerDraft.model_validate(before.model_dump(exclude={"id", "created_at", "updated_at", "archived_at"}))
     draft = draft.model_copy(update={"display_name": "changed by foreign backend"})
     if operation == "replace":
         with pytest.raises(UserBrokerNotFoundError):

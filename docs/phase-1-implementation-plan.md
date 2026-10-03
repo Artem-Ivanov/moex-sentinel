@@ -1,6 +1,6 @@
 # Актуальный план развития
 
-Актуализировано 2026-09-28 по текущему checkout и сохранённым материалам.
+Актуализировано 2026-10-03 по текущему checkout и сохранённым материалам.
 Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
 содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
 объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
@@ -8,23 +8,97 @@
 
 ## Дополнение 02.10.2026: VPS, эксплуатация и реальный API
 
-Уточнение владельца: одна PostgreSQL/одна database для TEST и PROD, без отдельной
-PROD БД. Первоначальный prototype остановлен, volumes сохранены. Перед
-объединением Core завершена code/integration приёмка contour guards/summary/collector
-и shared-DB конфигурации. Изолированный полный прогон: **1456 passed, 0 skipped**;
-frontend **119 passed**, typecheck/build exit0. Paired restore fixtures на PG16:
-**2 passed, 0 skipped**, включая сохранение journals, lost ACK replay и отсутствие
-повторной отправки. Восстановление рабочей пары и проверка repair на её данных
-остаются открытыми.
-Независимые code reviews A/B/C и итоговая source integration — **PASS**.
-Пользователь сам коммитит после проверок; обновление Sandbox/PROD только после
-его явной отмашки. Capacity, backup рабочей пары, live restart/restore и
-авторизованные PROD чтения с реальным токеном остаются открытыми.
+<a id="v1-service-versions"></a>
+<a id="v1--версионирование-сервисов-open"></a>
+### V1 — версионирование сервисов
+
+Статус 03.10: локально DONE / NOT_DEPLOYED, приёмка завершена.
+Проверка актуальности до реализации: metadata0.2/Core и O1.1 уже существуют;
+собственная UI версия, Worker/Analytics observations и build gate отсутствовали.
+Root и `milestone_relevance_architect` подтвердили актуальность полного V1,
+зависимости/DoD уточнены в [плане](superpowers/plans/v1-service-versions.md).
+V1 выбран как самостоятельная локальная кодовая веха; O1/S1/M1 не закрываются.
+
+Реализовано: общая Python версия0.2 с совместимым Core alias; собственная frontend
+версия0.2 видна при API error; Worker heartbeat metadata и Core volatile TTL30s;
+Analytics private health/OpenAPI и bounded probe; additive diagnostics service_versions;
+сборочные Python/npm gates и полный remote preflight guard. Неизвестные/устаревшие
+версии — UNKNOWN, готовы ли торговые сервисы этим не подтверждается. Python/npm
+версии могут различаться. Правила выпуска — [development](development.md#версии-сервисов).
+
+Авторы: `hierarchy_profile_senior` (senior backend) и `relevance_rules_junior`
+(junior frontend); root декомпозировал/ACK/принял фактические пакеты. Независимый
+`milestone_relevance_architect`: frontend CODE PASS; backend после исправления
+Important (AST override/rebinding bypass) CODE PASS, C/I/M0. Root final nonPG1460PASS/0skip/17warnings и frontend142/type/build PASS,
+Ruff/Black/releaseguard/diff PASS; итоговый CODE/DOC/INTEGRATION review PASS, C/I/M0.
+Первые1450/143 receipts до guardfix сохранены отдельно. Доказательства:
+develop/reports/v1-service-versions-20261003/. Native Docker build/PG/live не
+проверялись. VPS после commit владельца и отдельной отмашки; TRADE не разрешён.
+
+### O1.1 — диагностика Core (локально DONE / NOT_DEPLOYED, 03.10)
+
+По поручению владельца основной агент координирует четыре роли из `.agents/`.
+Выбран первый самостоятельный этап O1: authenticated
+`GET /api/diagnostics/status` и ручная страница `/diagnostics`. Core readiness
+и текущий TEST/PROD/access mode отображаются отдельно; пока не измеряемые
+Worker/broker/Analytics/market/outbox/portfolio/strategy имеют UNKNOWN.
+Готовый Core не выдаёт общий OK. Это кодовая веха с локальной приёмкой;
+полные O1/O2/S1/M1 и допуск PROD TRADE сохраняются открытыми.
+
+Контракт и задачи: [design](superpowers/specs/o1-core-diagnostics-design.md),
+[план](superpowers/plans/o1-core-diagnostics.md). Контроль ролей и контекста:
+[договорённости оркестрации](agent-orchestration.md). Изменение локальное,
+VPS не обновляется до commit владельца и отдельной отмашки. Root66API/usecase
+и139frontend tests PASS, typecheck/build/Ruff/Black/diff0; независимый
+`/root/o1_reviewer` CODE/DOC PASS, существенных замечаний нет.
+Доказательства: develop/reports/o1-status-20261003/.
+
+Релиз `1b410a9` на VPS выполнен и принят 02.10: TEST и initial PROD READ_ONLY.
+Токен введён владельцем через UI; PROD счета/сводка читаются, TRADE отключён.
+
+По commit владельца и явной отмашке 02.10 развёрнут неизменяемый master
+`1b410a9`: TEST443 — шесть сервисов, initial PROD8443 — backend/frontend.
+Оба Core используют одну фактическую PostgreSQL/одну database; единственный
+collector работает в TEST и настроен на оба контура. READ_ONLY и strategy=false;
+PROD Worker/TRADE не запущены. Старый отдельный PROD PostgreSQL остановлен,
+его volumes сохранены.
+
+Code/integration A/B/C — PASS; изолированный backend **1456 passed, 0 skipped**,
+frontend **119 passed**, typecheck/build exit0; PG16 paired fixtures **2 passed,
+0 skipped**. Рабочая парная backup/restore приёмка принята составным доказательством:
+точные schema/данные/sequences и 13 эквивалентных CHECK, проверенных PostgreSQL
+parser roundtrip. Исходный literal FAILED receipt сохранён, не заменён PASS.
+Бизнес-сверка PASS: старые 32308 decisions сохранены, новые только WAIT при
+отключённой стратегии; identity/execution поля шести cycles и шести lots сохранены;
+valuation поля обновлялись.
+HTTP **41 checks PASS**, публичная browser TLS/отрисовка PASS. TEST SDK:
+2460 RUB инструментов, selected=0, один счёт, семь брокерских позиций;
+шесть контролируемых Core-позиций подтверждены отдельно.
+
+Повторная графовая проверка 16:55 UTC: SQLite integrity OK, FK violations=0, frontier behind=0,
+Core prefix продвинулся, pending=48 без изменения; STARTED/RECONCILED=160104
+стабильны в Worker и Core, collector свежий, ошибок нет. Три RAM замера:
+cgroup 735–787 MiB, working set 518–609 MiB; swap вырос после промежуточных
+restore репетиций. Это ограниченные замеры, не 24-часовая приёмка.
+Независимое initial READ_ONLY operational acceptance — **PASS** (C), по final
+inventory/deployed receipt 16:57 UTC: TEST6+PROD2, одна Core PG/БД, короткие
+observations. Длительная приёмка остаётся открытой.
+02.10 в21:05 MSK принято исправление настроек: токен введён владельцем через UI,
+создано новое отдельное immutable подключение TINVEST PROD. Scoped accounts и
+общая summary: HTTP200, счёт1/errors0, выбранный API ID совпал, portfolio/free cash
+конечны в RUB; runtime READ_ONLY. Старое уже отключённое подключение, его identity,
+полный каталог4335 и sync1 сохранены. PROD приёмка частичная: сверка positions/orders,
+persistent collector/portfolio, bootstrap/capacity/admission, PROD Worker/TRADE,
+repair и 24ч/7сут остаются открытыми.
+Диагностический bugfix (шесть файлов): CODE PASS C/root, backend80 и frontend3,
+typecheck/Ruff/Black. Он не закоммичен и не развёрнут; на VPS остаётся `1b410a9`.
+Новый rollout — после commit владельца в master и отдельной отмашки. Проверки
+релиза1456 не заменяют проверку этого delta.
 Завершён [анализ оркестрации и Worker storage](audits/orchestration-and-worker-storage.md):
 Worker оркестрирует исполнение, его durable состояние не заменяется чтением
 брокерского портфеля; перенос Worker/Redis/RabbitMQ ещё не выбраны.
 Отдельный dedup audit реализован и интегрирован, независимое ревью81 PASS,
-root44 PASS; deployment и измерение уменьшения роста ещё открыты.
+root44 PASS; deployment выполнен, измерение уменьшения роста ещё открыто.
 
 Пользователь добавил новую очередь; прежний performance backlog ниже сохранён.
 Каталог и шесть позиций Sandbox получены из API, Worker завершил bootstrap.
@@ -32,18 +106,35 @@ root44 PASS; deployment и измерение уменьшения роста е
 broker/Core/Worker qty/avg и scope сверены, intent/order/execution отсутствуют,
 12 событий доставлены с ACK, frontend r2/каталог/позиции видны в браузере.
 Финальный browser прогон exit0: logout204, session401, ошибок нет.
-Полная runtime приёмка остаётся открытой в части restart без дублей.
+Эта browser/runtime проверка относилась к прежнему выпуску. Начальная приёмка
+нового выпуска завершена; длительное наблюдение роста остаётся открытым.
 Storage baseline измерен и независимо
 перепроверен; S1 ещё требует24ч/7суток. Доказательства:
 `develop/reports/vps-audit-20261002/`. Предыдущая auto-review ошибка403 не повторилась.
 
 | Порядок | Веха | Условие готовности |
 |---|---|---|
-| 1 | Завершить текущую Sandbox приёмку | Свежая сверка и независимый runtime review; состояние из CURRENT не заменяет проверку |
-| 2 | O1/S1: диагностика и ёмкость | Статус/audit доступны оператору; замеры24ч и подтверждение7дней дают диапазон хранения30/180дней |
-| 3 | PROD P1/P2/shared-DB/dedup: code/integration PASS | Одна Core PG/БД, scope guards/collector/Compose проверены; backend 1456/0skip, frontend 119/type/build, isolated paired fixtures 2/0skip. Token/live API, capacity, рабочая backup/restart и deployment остаются открытыми |
+| 1 | Sandbox: initial приёмка PASS | Длительное наблюдение далее O1/S1 |
+| 2 | O1/S1: диагностика, ёмкость и M1 оптимизация ОЗУ — OPEN | Статус/audit доступны оператору; замеры24ч и подтверждение7дней дают диапазон хранения30/180дней; M1 требует измеримого before/after и независимого review |
+| 3 | PROD P1/P2/shared-DB/dedup: code/integration PASS | Одна Core PG/БД, scope guards/collector/Compose проверены; backend 1456/0skip, frontend 119/type/build, isolated paired fixtures 2/0skip. Deployment, рабочая парная backup/restore и ограниченные capacity/runtime проверки выполнены; initial operational acceptance PASS; PROD accounts/summary приняты; остальная PROD приёмка и длительное наблюдение открыты |
 | 4 | O2/PROD P3/P4: готовность | Уведомления, лимиты/controlled takeover, восстановление и сверка реального счёта приняты |
 | 5 | PROD P5: canary | Отдельный допуск владельца, численные лимиты и один разрешённый UID; расширение отдельно |
+
+### M1 — оптимизация ОЗУ в O1/S1 (OPEN)
+
+Исследовать ограничение объёма каталога и истории в памяти, размеры PostgreSQL
+pools по фактической concurrency, профиль SDK и отложенную загрузку его компонентов.
+Отдельно исследовать более компактный базовый/runtime Docker-образ и состав
+зависимостей: Python уже использует `python:3.12-slim`
+(`docker/python-base.Dockerfile`), frontend — Alpine и multistage
+(`docker/frontend.Dockerfile`). Меньший образ не гарантирует меньшую ОЗУ;
+готовая замена и экономия не заявлены. Реализация пока не начата.
+
+Критерий готовности: на одинаковых workload, данных и Compose конфигурации
+сравнить before/after cgroup memory.current, working set, PSS, peak, swap и OOM;
+compressed/unpacked размер образов измерить отдельно. Финансовые инварианты,
+auth и TLS сохраняются; регрессия latency API и доставки outbox не допускается.
+Изменения и результаты измерений проходят независимое review.
 
 Документы перехода: [PROD design](superpowers/specs/production-api-design.md),
 [план перехода](superpowers/plans/production-api.md),
@@ -52,13 +143,14 @@ Storage baseline измерен и независимо
 Идентификаторы P1–P5 здесь относятся к PROD плану, а не оценкам приоритета
 P1/P2 прежнего performance backlog. Код PROD P1/P2 реализован; независимый
 `/root/prod_integration_review_retry` — code PASS (150 Python,29 UI).
-Наблюдаемость, retention и P3/P4/P5 остаются открытыми. PROD не развёрнут;
-capacity gate требуемой общей БД ещё не пройден, реальные авторизованные чтения не проверены.
+Наблюдаемость, retention и P3/P4/P5 остаются открытыми. Initial PROD развёрнут
+на общей БД; авторизованные PROD accounts/summary приняты, остальные чтения и
+сверки остаются открытыми.
 SDK1.49.3 AsyncClient с синтетическим неверным токеном дал UNAUTHENTICATED:
 подтверждены TLS/gRPC, без авторизации RPC; evidence
 `develop/reports/prod-api-20261002/prod-sdk-network.json`.
-Владелец вводит реальный read-only PROD токен через UI; Sandbox token/account/
-ledger не копируются. Текущее развёртывание Sandbox не изменено.
+Владелец ввёл PROD токен через UI; Sandbox token/account/
+ledger не копируются. Sandbox обновлён с сохранением env и persistent volumes.
 Пользователь разрешил поэтапную реализацию чтение→торговля; реальные
 заявки и очистка рабочих фактов требуют отдельного допуска.
 

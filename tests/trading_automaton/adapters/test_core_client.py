@@ -16,6 +16,7 @@ from sentinel_contracts.trading_facts import (
     FactBatchRequest,
     FactBatchResult,
 )
+from sentinel_contracts.version import SERVICE_VERSION
 from tests.contracts.trading_facts_helpers import all_envelopes
 from trading_automaton.adapters.core_client import CoreClient
 
@@ -133,3 +134,27 @@ def test_keeps_required_heartbeat_and_broker_connection_routes() -> None:
         "/internal/automaton/heartbeats",
         "/internal/automaton/brokers/broker-1/connection",
     ]
+
+
+def test_heartbeat_uses_stable_instance_and_actual_shared_version():
+
+    bodies = []
+
+    def handle(request):
+        if request.url.path == "/internal/runtime":
+            return httpx.Response(200, json={"environment": "TEST", "access_mode": "READ_ONLY"})
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url="http://core", transport=httpx.MockTransport(handle)) as http:
+        first = CoreClient(http, application_environment="TEST", access_mode="READ_ONLY")
+        first.heartbeat("worker", datetime.now(UTC))
+        first.heartbeat("worker", datetime.now(UTC))
+        second = CoreClient(http, application_environment="TEST", access_mode="READ_ONLY")
+        second.heartbeat("worker", datetime.now(UTC))
+    one, two, three = [body["runtime_version"] for body in bodies]
+    assert one == two
+    assert one["version"] == SERVICE_VERSION
+    assert one["environment"] == "TEST"
+    assert one["access_mode"] == "READ_ONLY"
+    assert UUID(one["instance_id"]) != UUID(three["instance_id"])

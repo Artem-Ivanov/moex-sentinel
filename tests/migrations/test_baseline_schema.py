@@ -22,7 +22,7 @@ def test_empty_database_upgrades_to_head_and_is_idempotent(tmp_path: Path) -> No
 
     engine = create_engine(database_url)
     try:
-        assert current_schema_revision(engine) == "0002_portfolio_snapshot_runs"
+        assert current_schema_revision(engine) == "0003_user_broker_archive"
         assert set(inspect(engine).get_table_names()) == {*Base.metadata.tables, "alembic_version"}
     finally:
         engine.dispose()

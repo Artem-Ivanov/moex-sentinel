@@ -19,6 +19,7 @@ from sentinel_contracts.business_audit import (
     BusinessAuditStage,
     PublishAuditResult,
 )
+from sentinel_contracts.runtime_versions import RuntimeVersion
 from sentinel_contracts.trading import AutomationState
 
 if TYPE_CHECKING:
@@ -155,6 +156,7 @@ class BusinessAuditListSchema(StrictSchema):
 class HeartbeatRequestSchema(StrictSchema):
     worker_id: str
     occurred_at: datetime
+    runtime_version: RuntimeVersion | None = None
 
 
 class HeartbeatResponseSchema(StrictSchema):

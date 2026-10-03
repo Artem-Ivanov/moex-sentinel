@@ -97,7 +97,7 @@ def test_upgrade_replaces_deployed_empty_snapshot_schema(
             "created_at",
         }
 
-        command.upgrade(config, "head")
+        command.upgrade(config, "0002_portfolio_snapshot_runs")
         head_inspector = inspect(engine)
 
         assert current_schema_revision(engine) == "0002_portfolio_snapshot_runs"
@@ -199,7 +199,7 @@ def test_upgrade_rejects_non_empty_deployed_snapshot_schema(
             )
 
         with pytest.raises(RuntimeError, match="contains 1 row"):
-            command.upgrade(config, "head")
+            command.upgrade(config, "0002_portfolio_snapshot_runs")
 
         assert current_schema_revision(engine) == "0001_baseline"
         assert inspect(engine).has_table("portfolio_snapshot_runs") is False
@@ -213,9 +213,9 @@ def test_empty_snapshot_schema_survives_downgrade_upgrade_round_trip(
 ) -> None:
     config = _migration_config(unmigrated_postgresql_database_url)
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0002_portfolio_snapshot_runs")
     command.downgrade(config, "0001_baseline")
-    command.upgrade(config, "head")
+    command.upgrade(config, "0002_portfolio_snapshot_runs")
 
     engine = create_database_engine(unmigrated_postgresql_database_url)
     try:
@@ -242,7 +242,7 @@ def test_upgrade_locks_snapshot_table_before_checking_that_it_is_empty(
         blocker = engine.connect()
         transaction = blocker.begin()
         blocker.execute(text("LOCK TABLE portfolio_snapshots IN ACCESS SHARE MODE"))
-        thread, errors = _run_migration_in_thread(unmigrated_postgresql_database_url, "head")
+        thread, errors = _run_migration_in_thread(unmigrated_postgresql_database_url, "0002_portfolio_snapshot_runs")
         _wait_for_access_exclusive_lock(engine, "portfolio_snapshots")
         blocker.execute(
             user_brokers.insert().values(
@@ -290,7 +290,7 @@ def test_downgrade_rejects_non_empty_run_schema(
     unmigrated_postgresql_database_url: URL,
 ) -> None:
     config = _migration_config(unmigrated_postgresql_database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0002_portfolio_snapshot_runs")
     engine = create_database_engine(unmigrated_postgresql_database_url)
     metadata = MetaData()
     runs = Table("portfolio_snapshot_runs", metadata, autoload_with=engine)
@@ -321,7 +321,7 @@ def test_downgrade_locks_both_snapshot_tables_before_empty_checks(
     unmigrated_postgresql_database_url: URL,
 ) -> None:
     config = _migration_config(unmigrated_postgresql_database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0002_portfolio_snapshot_runs")
     engine = create_database_engine(unmigrated_postgresql_database_url)
     metadata = MetaData()
     runs = Table("portfolio_snapshot_runs", metadata, autoload_with=engine)

@@ -2,7 +2,9 @@
 
 Код P1/P2 реализован и прошёл независимое code review и изолированные проверки.
 Первоначальный PROD prototype остановлен по требованию общей БД.
-Объединение Core, новый capacity gate и live приёмка ещё открыты. Пользователь
+Объединение Core и initial READ_ONLY deployment выполнены 02.10; независимое
+initial READ_ONLY operational acceptance — **PASS** (C) по final inventory/deployed
+receipt16:57 UTC: TEST6+PROD2, одна Core PG/БД, короткие observations. Пользователь
 разрешил поэтапный переход READ_ONLY; реальные торговые действия требуют
 отдельного допуска.
 `APPLICATION_ENVIRONMENT=PROD`, `BROKER_ACCESS_MODE=READ_ONLY` и
@@ -12,18 +14,46 @@
 ## Статус объединения БД — 02.10
 
 Владелец требует одну PostgreSQL/одну database. Первоначальный отдельный PROD
-prototype остановлен, listener8443 отключён, данные/volumes сохранены.
+prototype PostgreSQL остановлен, его данные/volumes сохранены. Новый listener8443
+обслуживает initial PROD на общей Core БД. Неизменяемый master `1b410a9` развёрнут
+по commit и явной отмашке владельца: TEST443 — шесть сервисов, PROD8443 — два.
 В текущем пакете добавлены shared-DB Compose/env/preflight и contour guards;
 код и конфигурация прошли независимые reviews A/B/C и итоговую source integration.
 Полный изолированный backend прогон: **1456 passed, 0 skipped**; frontend
 **119 passed**, typecheck/build exit0. Shared-DB scope guards/collector/Compose
 и dedup проверены. Paired restore fixtures на PG16 — **2 passed, 0 skipped**:
 сохранение journals, lost ACK replay и отсутствие повторной отправки проверены
-на тестовой паре. Восстановление рабочей пары и проверка repair на её данных
-остаются открытыми.
-Это **не operational PASS и не разрешение запуска**. Перед первой PROD записью
-нужно обновить TEST backend с contour guards и единственный collector,
-принять capacity/backup/restore gates и получить явную отмашку владельца.
+на тестовой паре. Рабочая парная backup/restore приёмка принята составным
+доказательством: schema/данные/sequences совпали точно, 13 CHECK доказаны
+эквивалентными через PostgreSQL parser roundtrip. Исходный literal FAILED receipt
+сохранён. Старые 32308 decisions и identity/execution поля шести cycles/lots сохранены;
+valuation поля обновлялись. Новые decisions
+только WAIT при strategy=false. HTTP 41 checks PASS; публичный browser TLS/render
+PASS. TEST SDK: каталог2460 RUB, selected=0, счёт1, брокерских позиций7;
+Core контролирует6 отдельно. Повторная проверка16:55 UTC: SQLite integrity OK, FK violations=0,
+frontier behind=0, Core prefix продвинулся, pending48 стабилен,
+STARTED/RECONCILED160104 стабильны в Core/Worker; collector свежий, ошибок нет; настроен на оба контура; на момент этой проверки PROD RPC без токена
+ещё не выполнялись.
+Три RAM замера: cgroup735–787 MiB/working set518–609 MiB; swap вырос после
+промежуточных restore репетиций. Длительная capacity/24ч приёмка не заявляется.
+**Независимое initial READ_ONLY operational acceptance — PASS** (C), по final
+inventory/deployed receipt16:57 UTC. Длительная и авторизованная PROD приёмка
+остаются открытыми. В21:05 MSK02.10 принято исправление настроек: владелец ввёл
+токен через UI, создано новое отдельное immutable подключение TINVEST PROD.
+Scoped accounts/global summary: HTTP200, счёт1/errors0, точный selected API ID,
+конечные RUB portfolio/free cash, runtime READ_ONLY. Старое уже отключённое
+подключение и identity/каталог4335/sync1 сохранены. Positions/orders verification,
+persistent portfolio/collector, bootstrap/capacity/admission ещё открыты;
+PROD Worker/TRADE и repair не выполнялись. Диагностический bugfix шести файлов —
+CODE PASS C/root (backend80/frontend3/typecheck/Ruff/Black), но не закоммичен и
+не развёрнут. Active release остаётся `1b410a9`; новый rollout требует commit
+владельца в master и отмашки. Исторические1456 тестов не подтверждают новый delta.
+Локально также исправляется удаление broker settings: DELETE архивирует запись
+и скрывает её из списка, сохраняя account scope и историю. Пакет требует
+`0003_user_broker_archive` на общей БД; рабочая ревизия остаётся `0002`, новый
+код пока не развёрнут. Перед rollout нужны обычная согласованная backup и
+остановка writers; откат `0003` с архивными записями запрещён без явного
+переноса archive metadata.
 Worker storage отдельно проанализирован в
 [аудите](../audits/orchestration-and-worker-storage.md); миграция не выбрана.
 
@@ -33,7 +63,8 @@ Worker storage отдельно проанализирован в
 задать PROD значения из таблицы ниже, READ_ONLY и strategy=false;
 не копировать токен Sandbox. Установить отдельный пароль оператора. Заполненный
 файл хранить с правами0600; credentials не выводить в отчёты. PROD token
-владелец вводит через HTTPS UI. Наличие и права реального токена пока неизвестны;
+владелец уже ввёл через HTTPS UI; accounts/summary доступны, полный допуск
+остальной PROD приёмки ещё не завершён;
 Sandbox token/account/ledger в PROD не копируются.
 
 | Ресурс | Sandbox | PROD |
@@ -115,7 +146,8 @@ SKIP из-за несовпадения версии не подтверждае
 Шаблон `deploy/remote/nginx-production-ip.conf` добавляется рядом с Sandbox
 конфигурацией:8443 использует тот же действующий TLS certificate path, upstream
 только127.0.0.1:8081. Общая login rate zone определяется Sandbox template.
-Перед запуском проверить `nginx -t`, срок/renewal сертификата и firewall. Сейчас конфигурация не установлена.
+Конфигурация установлена 02.10; `nginx -t`/reload и публичный TLS/render прошли.
+Перед последующими изменениями повторить проверку срока/renewal сертификата и firewall.
 
 Backend доверяет configured Origin, включая порт, перед login/logout и всеми
 изменяющими browser API. X-Forwarded-* не выбирает trusted origin. Cookie
@@ -132,7 +164,8 @@ roots. SDK1.49.3 включает официальный российский ro
 с синтетическим неверным токеном получил UNAUTHENTICATED. Это подтверждает
 TLS/gRPC, но не авторизованные RPC; evidence:
 `develop/reports/prod-api-20261002/prod-sdk-network.json`.
-До ввода владельцем реального read-only токена live чтения не проверены.
+Авторизованные accounts/summary проверены02.10; positions/orders и полный
+portfolio/bootstrap допуск ещё не приняты.
 Опциональный `PYTHONPATH=src python3 develop/scripts/prod_readonly_probe.py`
 читает фиксированный root-only `/etc/moex-sentinel/prod-readonly-token`0600,
 использует pinned PROD endpoint и выводит безопасные счётчики. Создание файла

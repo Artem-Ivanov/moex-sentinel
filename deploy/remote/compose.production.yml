@@ -4,6 +4,8 @@ services:
   migrations: !reset null
   portfolio-snapshot-worker: !reset null
   backend:
+    environment:
+      ANALYTICS_URL: ""
     depends_on: !reset {}
 volumes:
   postgres-data: !reset null

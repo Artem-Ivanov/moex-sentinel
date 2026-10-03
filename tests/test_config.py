@@ -23,3 +23,8 @@ def test_snapshot_worker_settings_have_safe_defaults() -> None:
 def test_snapshot_worker_settings_reject_unsafe_values(field: str, value: object) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+def test_core_analytics_url_has_no_cross_contour_default(monkeypatch):
+    monkeypatch.delenv("ANALYTICS_URL", raising=False)
+    assert Settings(_env_file=None, broker_access_mode="READ_ONLY").analytics_url == ""

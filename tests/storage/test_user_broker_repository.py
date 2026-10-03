@@ -1,5 +1,7 @@
 """Behavior tests for user-broker persistence."""
 
+from datetime import UTC
+
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -101,6 +103,45 @@ def test_missing_user_broker_maps_to_not_found(
         repository.disable("missing")
 
 
+def test_archive_is_durable_idempotent_and_cannot_be_reactivated(database) -> None:
+    _, factory = database
+    repository = UserBrokerRepository(factory)
+    original = repository.create(draft(), record_id="scope-1")
+
+    archived = repository.archive(original.id, expected_environment="TEST")
+
+    assert archived.archived_at is not None
+    assert archived.archived_at.tzinfo is UTC
+    assert archived.state is UserBrokerState.DISABLED
+    assert archived.enabled is False
+    assert archived.model_dump(exclude={"state", "updated_at", "archived_at"}) == original.model_dump(
+        exclude={"state", "updated_at", "archived_at"}
+    )
+    reopened = UserBrokerRepository(create_session_factory(factory.kw["bind"]))
+    assert reopened.list() == [archived]
+    assert reopened.archive(original.id, expected_environment="TEST") == archived
+    assert reopened.disable(original.id, expected_environment="TEST") == archived
+    with pytest.raises(UserBrokerNotFoundError):
+        reopened.replace(original.id, draft(), expected_environment="TEST")
+    with pytest.raises(UserBrokerDuplicateError):
+        reopened.create(draft("Same account"), record_id="different-scope")
+    assert reopened.get(original.id) == archived
+
+
+@pytest.mark.parametrize("state", list(UserBrokerState))
+def test_archive_rejects_foreign_environment_without_mutation(database, state) -> None:
+    _, factory = database
+    repository = UserBrokerRepository(factory)
+    original = repository.create(draft(state=state), record_id="scope-1")
+
+    with pytest.raises(UserBrokerNotFoundError):
+        repository.archive(original.id, expected_environment="PROD")
+
+    assert repository.get(original.id) == original
+    with pytest.raises(UserBrokerNotFoundError):
+        repository.archive("missing", expected_environment="TEST")
+
+
 @pytest.mark.parametrize(
     "changes",
     [{"environment": "PROD"}, {"fqdn": "foreign"}, {"external_account_id": "foreign"}, {"api_slug": "foreign"}],
@@ -111,7 +152,7 @@ def test_scope_cannot_change_after_position_bootstrap(changes):
         adoption.adopt(candidate())
         repo = UserBrokerRepository(factory)
         current = repo.get(SCOPE_ID)
-        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at"}))
+        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at", "archived_at"}))
         with pytest.raises(UserBrokerConstraintError, match="immutable"):
             repo.replace(SCOPE_ID, value.model_copy(update=changes))
         assert repo.get(SCOPE_ID) == current
@@ -126,7 +167,7 @@ def test_selected_scope_change_is_rejected_before_delayed_old_snapshot_adoption(
         repo = UserBrokerRepository(factory)
         old_snapshot = candidate()
         current = repo.disable(SCOPE_ID) if disabled else repo.get(SCOPE_ID)
-        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at"}))
+        value = UserBrokerDraft(**current.model_dump(exclude={"id", "created_at", "updated_at", "archived_at"}))
         with pytest.raises(UserBrokerConstraintError, match="immutable"):
             repo.replace(SCOPE_ID, value.model_copy(update={"external_account_id": "account-B"}))
         adoption.adopt(old_snapshot)

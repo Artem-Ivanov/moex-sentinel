@@ -307,3 +307,24 @@ def test_production_wrapper_defaults_to_separate_environment_file():
     example = (PROJECT_ROOT / "deploy/remote/.env.production.example").read_text()
     assert ".env.production" in wrapper
     assert "Copy to deploy/remote/.env.production," in example
+
+
+def test_core_analytics_target_is_explicit_test_and_empty_in_prod_override():
+    compose = load_compose()
+    assert compose["services"]["backend"]["environment"]["ANALYTICS_URL"] == "http://analytics:8001"
+
+    class ProductionLoader(yaml.SafeLoader):
+        pass
+
+    ProductionLoader.add_constructor("!reset", lambda loader, node: None)
+    ProductionLoader.add_constructor("!override", lambda loader, node: loader.construct_sequence(node))
+    remote = yaml.load(
+        (PROJECT_ROOT / "deploy/remote/compose.remote.yml").read_text(),
+        Loader=ProductionLoader,  # noqa: S506 - SafeLoader subclass only handles Compose tags.
+    )
+    assert remote["services"]["backend"]["environment"]["ANALYTICS_URL"] == "http://analytics:8001"
+    production = yaml.load(
+        (PROJECT_ROOT / "deploy/remote/compose.production.yml").read_text(),
+        Loader=ProductionLoader,  # noqa: S506 - SafeLoader subclass only handles Compose tags.
+    )
+    assert production["services"]["backend"]["environment"]["ANALYTICS_URL"] == ""
