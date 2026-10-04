@@ -2,6 +2,7 @@
 
 import socket
 import threading
+from contextlib import asynccontextmanager
 from time import monotonic, sleep
 from types import SimpleNamespace
 
@@ -10,6 +11,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from develop.benchmarks.runtime import require
+from moex_sentinel.api.sync_execution import SyncExecutor
+from moex_sentinel.services.sync_execution import bind_sync_runner, inline_runner
 from moex_sentinel.usecases.trading_fact_ingress import PublishTradingFactsUsecase
 from moex_sentinel.views.internal_trading_facts import router
 from trading_automaton.adapters.core_client import CoreClient
@@ -22,12 +25,8 @@ class TimedIngress:
         self.require_all = require_all
 
     def publish(self, facts):
-        self.profile.active_ingress = True
-        sql_before = len(self.profile.samples.get("sql_execution_ms", []))
-        commits_before = len(self.profile.samples.get("dbapi_commit_ms", []))
-        try:
-            with self.profile.timing("core_ingress_ms"):
-                result = self.ingress.publish(facts)
+        with self.profile.request(len(facts)), self.profile.timing("core_ingress_ms"):
+            result = self.ingress.publish(facts)
             if self.require_all:
                 require(not result.failures, "Production Core ingress rejected synthetic facts")
                 require(
@@ -36,15 +35,6 @@ class TimedIngress:
                     "Core did not acknowledge every requested event",
                 )
             return result
-        finally:
-            self.profile.add(
-                "sql_statements_per_request", len(self.profile.samples.get("sql_execution_ms", [])) - sql_before
-            )
-            self.profile.add(
-                "dbapi_commits_per_request", len(self.profile.samples.get("dbapi_commit_ms", [])) - commits_before
-            )
-            self.profile.add("facts_per_request", len(facts))
-            self.profile.active_ingress = False
 
 
 class LoseAcknowledgement:
@@ -71,8 +61,27 @@ class LoseAcknowledgement:
 
 
 class CoreServer:
-    def __init__(self, ingress, profile, *, require_all=True, statuses=None):
-        app = FastAPI()
+    def __init__(self, ingress, profile, *, require_all=True, statuses=None, execution_mode="bounded"):
+        if execution_mode not in {"inline", "bounded"}:
+            raise ValueError("Unknown benchmark execution mode")
+
+        @asynccontextmanager
+        async def lifespan(app):
+            executor = SyncExecutor(capacity=4)
+            app.state.sync_executor = executor
+            try:
+                yield
+            finally:
+                await executor.aclose()
+
+        app = FastAPI(lifespan=lifespan)
+
+        @app.middleware("http")
+        async def execution_context(request, call_next):
+            runner = request.app.state.sync_executor.run if execution_mode == "bounded" else inline_runner
+            with bind_sync_runner(runner):
+                return await call_next(request)
+
         app.state.usecases = SimpleNamespace(
             publish_trading_facts=PublishTradingFactsUsecase(TimedIngress(ingress, profile, require_all=require_all)),
             view_automation_statuses=statuses,
@@ -83,7 +92,7 @@ class CoreServer:
         self.socket.bind(("127.0.0.1", 0))
         self.url = f"http://127.0.0.1:{self.socket.getsockname()[1]}"
         self.server = uvicorn.Server(
-            uvicorn.Config(self.app, lifespan="off", access_log=False, log_level="critical", loop="asyncio")
+            uvicorn.Config(self.app, lifespan="on", access_log=False, log_level="critical", loop="asyncio")
         )
         self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [self.socket]}, daemon=True)
 
@@ -99,7 +108,7 @@ class CoreServer:
     def close(self):
         self.server.should_exit = True
         if self.thread.ident is not None:
-            self.thread.join(timeout=10)
+            self.thread.join()
         self.socket.close()
         require(not self.thread.is_alive(), "Disposable Core HTTP server did not stop")
 

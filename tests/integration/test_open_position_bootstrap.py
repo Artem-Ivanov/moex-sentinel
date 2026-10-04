@@ -20,13 +20,14 @@ from moex_sentinel.storage.models import (
     PositionLotModel,
     TradeExecutionModel,
     TradingAutomationModel,
+    UserBrokerModel,
 )
 from moex_sentinel.storage.models import (
     Base as CoreBase,
 )
 from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
-from sentinel_contracts.broker_execution import BrokerPosition
+from sentinel_contracts.broker_execution import BrokerConnection, BrokerPosition
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     BrokerPositionBootstrap,
@@ -34,12 +35,13 @@ from sentinel_contracts.trading_facts import (
     FactIngressErrorCode,
     PositionLotSource,
 )
-from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.command_factory import command
 from tests.trading_automaton.services.test_broker_tick_preparation_service import Hydration, Portfolio
 from tests.trading_automaton.test_analytics_runtime import FALLBACK, Source, Tick, frame
 from tests.trading_automaton.test_analytics_runtime import NOW as MARKET_NOW
+from trading_automaton.composition import build_broker_runtime, build_worker_recovery
 from trading_automaton.config import StrategySettings
 from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
@@ -235,6 +237,176 @@ def test_unavailable_market_allows_position_adoption_but_no_tick_or_order(tmp_pa
         assert session.scalar(select(func.count()).select_from(PositionLotModel)) == 1
         assert session.scalar(select(func.count()).select_from(BrokerOrderModel)) == 0
         assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 0
+
+
+def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ack_restart(tmp_path) -> None:
+    core_engine = create_engine(f"sqlite:///{tmp_path / 'core.db'}")
+    CoreBase.metadata.create_all(core_engine)
+    worker_path = tmp_path / "worker.db"
+    core_factory, worker, _ingress, _facts = bootstrap_context(
+        prepare_worker=False, worker_db_path=worker_path, core_engine=core_engine
+    )
+    test_scope = "00000000-0000-4000-8000-000000000611"
+    test_instrument = "00000000-0000-4000-8000-000000000612"
+    test_automation = "00000000-0000-4000-8000-000000000613"
+    prod_target = "invest-public-api.tbank.ru:443"
+    with core_factory.begin() as session:
+        broker = session.get_one(UserBrokerModel, str(SCOPE_ID))
+        broker.environment = "PROD"
+        broker.fqdn = prod_target
+        session.add(user_broker_model(test_scope, "test-account"))
+        session.flush()
+        session.add(instrument_model(test_instrument, test_scope))
+        session.flush()
+        session.add(
+            automation_model(
+                test_automation, user_broker_id=test_scope, instrument_id=test_instrument, state="IN_QUEUE"
+            )
+        )
+    commands = AutomationCommandRepository(core_factory, environment="PROD").claim(10)
+    assert len(commands) == 1
+    value = commands[0]
+    assert value.user_broker_id == SCOPE_ID
+    assert value.state is AutomationState.HOLD
+    assert worker.cache_command(value)
+    ingress = TradingFactIngressService(
+        lambda: TradingFactsUnitOfWork(core_factory), TradingFactMapper(), now=lambda: NOW, environment="PROD"
+    )
+
+    class Broker:
+        mutations = 0
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def get_positions(self, account_id):
+            assert account_id == "account-1"
+            return (BrokerPosition(value.external_instrument_id, Decimal(2), Decimal(100), Decimal(101), "RUB"),)
+
+        async def get_free_cash(self, account_id, currency):
+            return Decimal(5000)
+
+        async def forbidden_mutation(self, *args, **kwargs):
+            self.mutations += 1
+            raise AssertionError("READ_ONLY bootstrap must not mutate broker orders")
+
+        dispatch_limit_order = post_order = cancel_order = replace_order = forbidden_mutation
+
+    broker = Broker()
+
+    async def prepare(repository, current=value):
+        bundle = await build_broker_runtime(
+            BrokerConnection(
+                str(SCOPE_ID),
+                "TINVEST_PROD",
+                prod_target,
+                "synthetic",
+                False,
+                environment="PROD",
+                access_mode="READ_ONLY",
+                account_id="account-1",
+            ),
+            repository,
+            strategy_settings=StrategySettings(enabled=False),
+            application_environment="PROD",
+            worker_access_mode="READ_ONLY",
+            session_factory=lambda _connection: broker,
+            analytics_client=Source(httpx.ReadTimeout("offline analytics")),
+            now=lambda: NOW,
+        )
+        try:
+            await bundle.runtime.replace_commands((current,))
+            await bundle.runtime.run_once()
+        finally:
+            await bundle.close()
+
+    restarted_engine = None
+    try:
+        build_worker_recovery(worker, "prod-worker").execute()
+        asyncio.run(prepare(worker))
+        facts = [
+            FactSynchronizationService._envelope(row) for row in worker.ready_fact_outbox(10, now=NOW, deadline_ms=0)
+        ]
+        assert len(facts) == 4
+        first = ingress.publish(facts)
+        assert first.failures == ()
+        assert first.results[0].accepted_through_sequence == 4
+        assert worker.get_active_intent(str(AUTOMATION_ID)) is None
+        # Simulate process loss before ACK: reopen the same persistent Worker ledger.
+        worker._factory.kw["bind"].dispose()
+        restarted_engine = create_engine(f"sqlite:///{worker_path}")
+        reopened = LocalAutomationRepository(
+            sessionmaker(restarted_engine, expire_on_commit=False), fact_writer=FactOutboxWriter(clock=lambda: NOW)
+        )
+        build_worker_recovery(reopened, "prod-worker").execute()
+        asyncio.run(prepare(reopened))
+        replay = [
+            FactSynchronizationService._envelope(row) for row in reopened.ready_fact_outbox(10, now=NOW, deadline_ms=0)
+        ]
+        assert replay == facts
+        retried = ingress.publish(replay)
+        assert retried.failures == ()
+        assert retried.results[0].accepted_through_sequence == 4
+        reopened.acknowledge_fact_outbox(str(AUTOMATION_ID), accepted_through_sequence=4, current_revision=2)
+        assert reopened.ready_fact_outbox(10, now=NOW, deadline_ms=0) == []
+        assert not reopened.has_active_intents()
+        assert len(reopened.list_open_lots(str(AUTOMATION_ID))) == 1
+        for accepted_sequence in (6, 8):
+            status = (
+                AutomationCommandRepository(core_factory, environment="PROD").statuses([AUTOMATION_ID]).automations[0]
+            )
+            current = value.model_copy(
+                update={
+                    "state": status.state,
+                    "revision": status.revision,
+                    "last_sequence_number": status.last_sequence_number,
+                    "bootstrap": None,
+                }
+            )
+            assert reopened.cache_command(current)
+            # Each fresh broker bundle records one consistent reconciliation pair, even without Analytics.
+            asyncio.run(prepare(reopened, current))
+            audits = [
+                FactSynchronizationService._envelope(row)
+                for row in reopened.ready_fact_outbox(10, now=NOW, deadline_ms=0)
+            ]
+            assert [event.sequence_number for event in audits] == [accepted_sequence - 1, accepted_sequence]
+            assert [event.payload.stage for event in audits] == [
+                "POSITION_RECONCILIATION_STARTED",
+                "POSITION_RECONCILED",
+            ]
+            assert audits[0].payload.process_id == audits[1].payload.process_id
+            for event in audits:
+                assert event.fact_kind.value == "TRADE_AUDIT_RECORDED"
+                assert event.payload.level.value == "INFO"
+                assert event.payload.critical is False
+                assert event.payload.data["broker_quantity_lots"] == event.payload.data["worker_quantity_lots"] == 2
+                assert event.payload.broker_order_id is event.payload.execution_id is event.payload.decision_id is None
+            assert ingress.publish(audits).failures == ()
+            reopened.acknowledge_fact_outbox(
+                str(AUTOMATION_ID), accepted_through_sequence=accepted_sequence, current_revision=2
+            )
+        assert not reopened.has_active_intents()
+        assert reopened.ready_fact_outbox(10, now=NOW, deadline_ms=0) == []
+        assert broker.mutations == 0
+        with core_factory() as session:
+            assert session.get_one(TradingAutomationModel, str(AUTOMATION_ID)).state == "IN_WORK"
+            assert session.get_one(PositionCycleModel, str(CYCLE_ID)).quantity_lots == 2
+            assert session.scalar(select(func.count()).select_from(PositionCycleModel)) == 1
+            assert session.scalar(select(func.count()).select_from(PositionLotModel)) == 1
+            assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 8
+            assert session.scalar(select(func.count()).select_from(BrokerOrderModel)) == 0
+            assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 0
+            control = session.get_one(TradingAutomationModel, test_automation)
+            assert (control.state, control.revision, control.last_sequence_number) == ("IN_QUEUE", 1, 0)
+    finally:
+        worker._factory.kw["bind"].dispose()
+        if restarted_engine is not None:
+            restarted_engine.dispose()
+        core_engine.dispose()
 
 
 def test_resumed_unfinished_bootstrap_recovers_speculative_activation_and_reconciled_lot() -> None:

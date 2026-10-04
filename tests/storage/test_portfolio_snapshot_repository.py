@@ -1,17 +1,18 @@
 from collections.abc import Iterator
 from contextlib import nullcontext
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from moex_sentinel.domain.portfolio import BrokerReadError
 from moex_sentinel.domain.trading_summary import PortfolioSnapshotRunValue, PortfolioSnapshotValue
+from moex_sentinel.services.trading_summary import TradingSummaryService
 from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import Base, PortfolioSnapshotModel, PortfolioSnapshotRunModel
+from moex_sentinel.storage.models import Base, PortfolioSnapshotModel, PortfolioSnapshotRunModel, UserBrokerModel
 from moex_sentinel.storage.repositories.portfolio_snapshots import (
     PortfolioSnapshotRepository,
     portfolio_snapshot_run_lock,
@@ -155,3 +156,169 @@ def test_concurrent_insert_does_not_hide_an_unrelated_constraint_error() -> None
 
     with pytest.raises(IntegrityError):
         repository.append_run_with_snapshots(run_value("run-racing", NOW), ())
+
+
+@pytest.fixture
+def summary_engine() -> Iterator[Engine]:
+    engine = create_database_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def summary_session(summary_engine: Engine) -> Iterator[Session]:
+    with Session(summary_engine) as session:
+        session.add_all((user_broker_model("broker-1", "account-1"), user_broker_model("broker-2", "account-2")))
+        session.flush()
+        yield session
+        session.rollback()
+
+
+def window_history(
+    session: Session, *, missing: bool = False, currency: str = "RUB"
+) -> tuple[PortfolioSnapshotValue, ...]:
+    repository = PortfolioSnapshotRepository(session)
+    latest = ()
+    for index, days in enumerate((40, 30, 8, 7, 2, 1, 0)):
+        captured = NOW - timedelta(days=days)
+        run = run_value(f"window-run-{index}", captured, with_error=days == 0)
+        snapshots = tuple(
+            snapshot_value(f"snapshot-{index * 2 + account}", run.id, captured).model_copy(
+                update={"user_broker_id": f"broker-{account}", "account_id": f"account-{account}", "currency": currency}
+            )
+            for account in (1, 2)
+            if not (missing and days in (30, 7, 1) and account == 2)
+        )
+        repository.append_run_with_snapshots(run, snapshots)
+        if days == 0:
+            latest = snapshots
+    return latest
+
+
+class TestSummaryBaselineWindows:
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_three_windows_match_singleton_and_preserve_snapshot_order(
+        self, summary_session: Session, missing: bool
+    ) -> None:
+        latest = window_history(summary_session, missing=missing)
+        repository = PortfolioSnapshotRepository(summary_session)
+        boundaries = tuple(NOW - timedelta(days=days) for days in (1, 7, 30))
+        expected = tuple(repository.common_baselines(latest, boundary) for boundary in boundaries)
+
+        actual = repository.common_baselines_many(tuple(reversed(latest)), boundaries)
+
+        assert actual == expected
+        assert len({value.run_id for values in actual for value in values}) <= 3
+        assert sum(map(len, actual)) <= 3 * len(latest)
+        assert tuple(values[0].captured_at for values in actual) == tuple(
+            NOW - timedelta(days=days) for days in ((2, 8, 40) if missing else (1, 7, 30))
+        )
+
+    def test_fallback_utc_normalization_duplicate_and_unsorted_boundaries(self, summary_session: Session) -> None:
+        latest = window_history(summary_session)
+        repository = PortfolioSnapshotRepository(summary_session)
+        boundary = NOW - timedelta(days=1)
+        boundaries = (
+            NOW - timedelta(days=90),
+            (boundary + timedelta(hours=3)).replace(tzinfo=timezone(timedelta(hours=3)), microsecond=999),
+            boundary,
+        )
+        expected = tuple(repository.common_baselines(latest, value) for value in boundaries)
+
+        assert repository.common_baselines_many(latest, boundaries) == expected
+        assert expected[0][0].captured_at == NOW - timedelta(days=40)
+        assert expected[1] == expected[2]
+        with pytest.raises(ValueError, match="timezone-aware"):
+            repository.common_baselines(latest, boundary.replace(tzinfo=None))
+        with pytest.raises(ValueError, match="timezone-aware"):
+            repository.common_baselines_many(latest, (boundary.replace(tzinfo=None),))
+        for size in (1, 2):
+            assert repository.common_baselines_many(latest, boundaries[:size]) == expected[:size]
+
+    @pytest.mark.parametrize("environment", [None, "TEST", "PROD"])
+    def test_environment_scope_matches_singleton_including_archived_accounts(
+        self, summary_session: Session, environment: str | None
+    ) -> None:
+        latest = window_history(summary_session)
+        broker = summary_session.get(UserBrokerModel, "broker-2")
+        assert broker is not None
+        broker.environment = "PROD"
+        broker.archived_at = NOW
+        broker.state = "DISABLED"
+        summary_session.flush()
+        repository = PortfolioSnapshotRepository(summary_session, environment=environment)
+        boundaries = tuple(NOW - timedelta(days=days) for days in (1, 7, 30))
+        scoped = repository.latest_snapshots(latest[0].run_id)
+        expected = tuple(repository.common_baselines(scoped, value) for value in boundaries)
+
+        assert repository.common_baselines_many(scoped, boundaries) == expected
+        assert repository.common_baselines_many(latest, boundaries) == tuple(
+            repository.common_baselines(latest, value) for value in boundaries
+        )
+
+    def test_new_account_composition_uses_first_complete_current_run(self, summary_session: Session) -> None:
+        previous = window_history(summary_session)
+        repository = PortfolioSnapshotRepository(summary_session)
+        captured = NOW + timedelta(hours=1)
+        current_run = run_value("composition-current", captured)
+        latest = tuple(
+            value.model_copy(
+                update={
+                    "id": f"composition-{index}",
+                    "run_id": current_run.id,
+                    "account_id": "account-new" if index == 1 else value.account_id,
+                    "captured_at": captured,
+                    "bucket_start": captured,
+                    "created_at": captured,
+                }
+            )
+            for index, value in enumerate(previous)
+        )
+        repository.append_run_with_snapshots(current_run, latest)
+        boundaries = tuple(captured - timedelta(days=days) for days in (1, 7, 30))
+        expected = tuple(repository.common_baselines(latest, value) for value in boundaries)
+
+        assert repository.common_baselines_many(latest, boundaries) == expected
+        assert expected == (latest, latest, latest)
+        view = TradingSummaryService(repository).view()
+        summary = view.currencies[0]
+        assert not summary.pnl_24h.complete
+        assert not summary.pnl_7d.complete
+        assert not summary.pnl_30d.complete
+
+    def test_empty_inputs_and_validation_error_priority(self, summary_session: Session) -> None:
+        latest = window_history(summary_session)
+        repository = PortfolioSnapshotRepository(summary_session)
+        assert repository.common_baselines_many(latest, ()) == ()
+        assert repository.common_baselines_many((), (NOW, NOW)) == ((), ())
+        with pytest.raises(ValueError, match="one currency"):
+            repository.common_baselines_many((latest[0], latest[0].model_copy(update={"currency": "USD"})), (NOW,))
+        with pytest.raises(ValueError, match="unique broker accounts"):
+            repository.common_baselines_many((latest[0], latest[0]), (NOW,))
+        with pytest.raises(ValueError, match="three"):
+            repository.common_baselines_many(latest, (NOW,) * 4)
+
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_public_view_uses_four_reads_for_three_windows(self, summary_session: Session, missing: bool) -> None:
+        window_history(summary_session, missing=missing)
+        repository = PortfolioSnapshotRepository(summary_session)
+        statements: list[str] = []
+
+        def capture(_connection, _cursor, statement, _parameters, _context, _many):
+            statements.append(statement)
+
+        engine = summary_session.get_bind()
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            view = TradingSummaryService(repository).view()
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+
+        assert view.captured_at == NOW
+        assert len(view.currencies) == 1
+        assert view.errors == run_value("latest", NOW, with_error=True).errors
+        assert all(statement.lstrip().upper().startswith(("SELECT", "WITH")) for statement in statements)
+        assert len(statements) == 4

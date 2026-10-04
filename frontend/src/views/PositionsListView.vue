@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { tradingAllowed, tradingDisabledReason } from "../runtime"
-import { computed, onMounted, ref } from "vue"
+import { runtime, tradingAllowed, tradingDisabledReason } from "../runtime"
+import { computed, onBeforeUnmount, onMounted, ref } from "vue"
 import { useRouter } from "vue-router"
 
 import {
@@ -30,8 +30,20 @@ const operationsError = ref("")
 const summary = ref<TradingSummaryResponse>()
 const summaryError = ref("")
 const limit = ref(20)
+let operationsGeneration = 0
 const refreshing = ref(false)
 const actionPending = ref(false)
+const resumeDisabledReason = computed(() => {
+  if (!tradingAllowed.value) return runtime.value?.access_mode === "READ_ONLY"
+    ? "Возобновление — торговая команда, недоступная в режиме только чтения."
+    : tradingDisabledReason.value
+  if (actionPending.value) return "Выполняется команда. Дождитесь завершения."
+  if (refreshing.value) return "Обновляются данные автомата. Дождитесь завершения."
+  if (!selected.value) return "Выберите автомат для возобновления."
+  if (selected.value.state !== "HOLD") return "Возобновление доступно только для автомата в HOLD."
+  if (selected.value.resume_requested) return "Запрос на возобновление уже принят."
+  return ""
+})
 const money = (value: Money | null) => value ? `${value.amount} ${value.currency}` : "—"
 
 async function loadPositions(): Promise<void> {
@@ -44,10 +56,19 @@ async function loadPositions(): Promise<void> {
 }
 
 async function loadOperations(): Promise<void> {
+  const generation = ++operationsGeneration
+  const requestedLimit = limit.value
   operationsError.value = ""
-  try { operations.value = await fetchOperations(limit.value) }
-  catch { operationsError.value = "Не удалось загрузить операции." }
+  try {
+    const result = await fetchOperations(requestedLimit)
+    if (generation === operationsGeneration) operations.value = result
+  }
+  catch {
+    if (generation === operationsGeneration) operationsError.value = "Не удалось загрузить операции."
+  }
 }
+
+onBeforeUnmount(() => { operationsGeneration += 1 })
 
 async function loadSummary(): Promise<void> {
   summaryError.value = ""
@@ -100,10 +121,11 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
       <div class="toolbar">
         <button :disabled="!selected || actionPending || refreshing" @click="details">Подробнее</button>
         <button :disabled="!selected || actionPending || refreshing || !['IN_QUEUE', 'IN_WORK'].includes(selected.state)" @click="action(holdAutomation)">Hold</button>
-        <button :disabled="!tradingAllowed || !selected || actionPending || refreshing || selected.state !== 'HOLD' || selected.resume_requested" @click="action(resumeAutomation)">Resume</button>
+        <button :disabled="!tradingAllowed || !selected || actionPending || refreshing || selected.state !== 'HOLD' || selected.resume_requested" :aria-describedby="resumeDisabledReason ? 'resume-disabled-reason' : undefined" @click="action(resumeAutomation)">Resume</button>
         <button :disabled="!tradingAllowed || !selected || actionPending || refreshing || selected.state === 'CLOSED'" @click="action(closeAutomation)">Закрыть автомат</button>
       </div>
     </div>
+    <p v-if="resumeDisabledReason" id="resume-disabled-reason" class="hint" role="status">{{ resumeDisabledReason }}</p>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="!data">Загрузка…</p>
     <div v-else-if="data.items.length === 0" class="empty">Активных автоматов нет</div>
@@ -123,12 +145,12 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
             <td>{{ item.ticker || item.instrument_id }}</td>
             <td>{{ item.broker_name || item.broker_id }}</td>
             <td>{{ item.account_id }}</td>
-            <td><span class="status-pill">{{ item.state }}</span></td>
-            <td>{{ item.quantity_lots }}</td>
-            <td>{{ item.average_price }} {{ item.currency }}</td>
-            <td>{{ item.invested_amount }} {{ item.currency }}</td>
-            <td>{{ item.net_pnl }} {{ item.currency }}</td>
-            <td>{{ item.actual_commissions }} {{ item.currency }}</td>
+            <td><span class="status-pill">{{ item.state }}</span><p v-if="item.bootstrap_pending" class="hint">Ожидает первоначальной сверки позиции</p></td>
+            <td>{{ item.bootstrap_pending ? '—' : item.quantity_lots }}</td>
+            <td>{{ item.bootstrap_pending ? '—' : `${item.average_price} ${item.currency}` }}</td>
+            <td>{{ item.bootstrap_pending ? '—' : `${item.invested_amount} ${item.currency}` }}</td>
+            <td>{{ item.bootstrap_pending ? '—' : `${item.net_pnl} ${item.currency}` }}</td>
+            <td>{{ item.bootstrap_pending ? '—' : `${item.actual_commissions} ${item.currency}` }}</td>
           </tr>
         </tbody>
       </table>

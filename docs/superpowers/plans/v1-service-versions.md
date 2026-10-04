@@ -130,3 +130,22 @@ TEST/PROD проверены offline suites с реальным config resolutio
 build, live API, SSH и deployment не выполнялись. Source версия0.2 не подтверждает
 версию VPS; обновление после commit владельца и отдельной отмашки.
 Полные O1/O2/S1/M1 и PROD торговые gates остаются OPEN.
+
+## Deployment receipt — 03.10.2026
+
+Deployment commit `be84ed4f047734ccacfba9b6ccb531af51ba4b94` принят под release
+`vps-20261003-be84ed4` по
+`develop/reports/vps-release-20261003/root-native-receipts.json` (17:14 UTC).
+Оба current links указывают на `/opt/moex-sentinel/releases/vps-20261003-be84ed4`;
+schema `0003_user_broker_archive`. Native stage/build/permission/frontend-config/migration/
+Core/Worker/finalize gates прошли; отдельная post-deploy HTTPS verification PASS.
+Frozen diagnostics HTTP: Core TEST/PROD `0.2.0`, TEST Worker/Analytics OBSERVED `0.2.0`,
+PROD Worker UNKNOWN и Analytics NOT_CONFIGURED. Frontend build metadata — `0.2.0`.
+HTTP проверки покрывали index/assets, auth и status/API GET; browser acceptance не
+проводилась. Отдельная архивная запись отражена только агрегатным read receipt с неизвестным
+actor и не относится к HTTP verification. Dump был DUMP_ONLY (116246851 bytes, SHA и structural list; без paired
+Worker backup/restore). TEST оставлен READ_ONLY и strategy=false; PROD Worker не запущен,
+TRADE не разрешён. Версии и UNKNOWN состояния не подтверждают торговую готовность.
+
+V1 source acceptance остаётся DONE; deployment принят в указанных границах. Полные O1/O2,
+S1/M1, LIVE observation, 24h/7d, PROD Worker и TRADE остаются OPEN.

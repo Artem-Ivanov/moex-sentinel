@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Protocol
 
 from moex_sentinel.domain.automations import (
@@ -14,6 +15,7 @@ from moex_sentinel.domain.portfolio import BrokerOperation, BrokerOperationsView
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.automations import AutomationStateConflictError
 from moex_sentinel.services.environment import EnvironmentMismatchError
+from moex_sentinel.services.sync_execution import run_sync
 from moex_sentinel.storage.repositories import DuplicateRecordError, RecordNotFoundError
 from moex_sentinel.storage.repositories.automations import RevisionConflictError
 from moex_sentinel.usecases.errors import UseCaseError
@@ -65,10 +67,13 @@ class CreateTradingAutomationUsecase:
     async def execute(self, broker_id: str, account_id: str, instrument_id: str) -> AutomationRecord:
         """Return the created automation; translate known lifecycle failures to UseCaseError."""
         try:
-            return self._service.create(
-                broker_id=broker_id,
-                account_id=account_id,
-                instrument_id=instrument_id,
+            return await run_sync(
+                partial(
+                    self._service.create,
+                    broker_id=broker_id,
+                    account_id=account_id,
+                    instrument_id=instrument_id,
+                )
             )
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
@@ -144,7 +149,7 @@ class ViewTradingAutomationDetailsUsecase:
     async def execute(self, automation_id: str) -> TradingAutomationDetails:
         """Return details with independent source errors; fail if the automation cannot be read."""
         try:
-            automation = self._automations.get(automation_id)
+            automation = await run_sync(partial(self._automations.get, automation_id))
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
         except RecordNotFoundError as error:

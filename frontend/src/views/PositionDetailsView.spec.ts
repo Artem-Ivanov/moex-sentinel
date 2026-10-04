@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/vue"
-import { createMemoryHistory, createRouter } from "vue-router"
+import { createMemoryHistory, createRouter, RouterView } from "vue-router"
 import { flushPromises } from "@vue/test-utils"
 import { afterEach, expect, it, vi } from "vitest"
 
@@ -64,6 +64,19 @@ it("does not show an average marker for an empty position average price", async 
   await screen.findByRole("img", { name: "Минутные свечи за последние два часа" })
 
   expect(document.querySelector(".candlestick-chart__average-price-line")).toBeNull()
+})
+
+it("shows pending bootstrap and hides unconfirmed cycle values and average marker", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...details, automation: { ...automation, state: "HOLD", bootstrap_pending: true },
+  })))
+  await renderDetailsView()
+  expect(await screen.findByText("Ожидает первоначальной сверки позиции")).toBeTruthy()
+  for (const label of ["Лоты", "Средняя цена", "Вложено", "Realized", "Unrealized", "Net P&L", "Комиссии"]) {
+    expect(screen.getByText(`${label}: —`)).toBeTruthy()
+  }
+  expect(document.querySelector(".candlestick-chart__average-price-line")).toBeNull()
+  expect(screen.queryByRole("button", { name: "Resume" })).toBeNull()
 })
 
 it("refreshes once per minute and clears the timer on unmount", async () => {
@@ -139,4 +152,96 @@ it("reports operation failures and restores exact trade rows on manual refresh",
   expect(screen.queryByText(operationError.message)).toBeNull()
   expect(screen.getAllByRole("row")).toHaveLength(3)
   expect(fetchMock.mock.calls).toEqual(Array.from({ length: 3 }, () => ["/api/trading-automations/auto-1/details", undefined]))
+})
+
+
+function deferredDetails() {
+  let resolve!: (response: Response) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<Response>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+async function renderRoutedPosition() {
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: "/positions", name: "positions", component: { template: "<div>positions</div>" } },
+    { path: "/positions/:id", name: "position-details", component: PositionDetailsView },
+  ] })
+  await router.push("/positions/auto-1")
+  await router.isReady()
+  const view = render(RouterView, { global: { plugins: [router] } })
+  await flushPromises()
+  return { router, ...view }
+}
+
+const detailsB = { ...details, automation: { ...automation, id: "auto-B", ticker: "GAZP", account_id: "account-B" } }
+
+it.each(["success", "error"])("starts the new position while the old request is pending and ignores its late %s", async (outcome) => {
+  const old = deferredDetails()
+  const next = deferredDetails()
+  const fetchMock = vi.fn((url: string) => url.includes("auto-B") ? next.promise : old.promise)
+  vi.stubGlobal("fetch", fetchMock)
+  const { router } = await renderRoutedPosition()
+  await router.push("/positions/auto-B")
+  await flushPromises()
+  expect(fetchMock).toHaveBeenCalledWith("/api/trading-automations/auto-B/details", undefined)
+  if (outcome === "success") old.resolve(Response.json(details))
+  else old.reject(new Error("Old position unavailable"))
+  await flushPromises()
+  expect(screen.queryByRole("heading", { name: "SBER — торговый автомат" })).toBeNull()
+  expect(screen.queryByText("Old position unavailable")).toBeNull()
+  expect(screen.getByText("Загрузка…")).toBeTruthy()
+  next.resolve(Response.json(detailsB))
+  await flushPromises()
+  expect(screen.getByRole("heading", { name: "GAZP — торговый автомат" })).toBeTruthy()
+  expect(screen.getByText("Sandbox / account-B")).toBeTruthy()
+})
+
+it.each(["success", "error"])("ignores old position %s during a manual refresh of the loaded new position", async (outcome) => {
+  const old = deferredDetails()
+  const refreshB = deferredDetails()
+  let bRequests = 0
+  vi.stubGlobal("fetch", vi.fn((url: string) => {
+    if (url.includes("auto-1")) return old.promise
+    bRequests++
+    return bRequests === 1 ? Promise.resolve(Response.json(detailsB)) : refreshB.promise
+  }))
+  const { router } = await renderRoutedPosition()
+  await router.push("/positions/auto-B")
+  await flushPromises()
+  expect(screen.getByRole("heading", { name: "GAZP — торговый автомат" })).toBeTruthy()
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  if (outcome === "success") old.resolve(Response.json(details))
+  else old.reject(new Error("Old position unavailable"))
+  await flushPromises()
+  expect(screen.getByRole("heading", { name: "GAZP — торговый автомат" })).toBeTruthy()
+  expect(screen.queryByText("Old position unavailable")).toBeNull()
+  expect(screen.getByRole("status", { name: "Обновление данных" })).toBeTruthy()
+  expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(true)
+  refreshB.resolve(Response.json({ ...detailsB, errors: [{ source: "operations", code: "BROKER_UNAVAILABLE", message: "New operations unavailable" }] }))
+  await flushPromises()
+  expect(screen.getByText("New operations unavailable")).toBeTruthy()
+  expect(screen.queryByRole("status", { name: "Обновление данных" })).toBeNull()
+})
+
+it("clears loaded position values on route change and keeps a single current poller", async () => {
+  vi.useFakeTimers()
+  const next = deferredDetails()
+  const fetchMock = vi.fn((url: string) => url.includes("auto-B") ? next.promise : Promise.resolve(Response.json(details)))
+  vi.stubGlobal("fetch", fetchMock)
+  const { router, unmount } = await renderRoutedPosition()
+  await router.push("/positions/auto-B")
+  await flushPromises()
+  expect(screen.queryByRole("heading", { name: "SBER — торговый автомат" })).toBeNull()
+  expect(screen.queryByText("Средняя цена: 100 RUB")).toBeNull()
+  next.resolve(Response.json(detailsB))
+  await flushPromises()
+  fetchMock.mockClear()
+  await vi.advanceTimersByTimeAsync(60_000)
+  await flushPromises()
+  expect(fetchMock.mock.calls).toEqual([["/api/trading-automations/auto-B/details", undefined]])
+  unmount()
+  await vi.advanceTimersByTimeAsync(60_000)
+  expect(fetchMock.mock.calls).toHaveLength(1)
+  expect(vi.getTimerCount()).toBe(0)
 })

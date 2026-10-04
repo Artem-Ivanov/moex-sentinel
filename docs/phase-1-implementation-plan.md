@@ -1,6 +1,6 @@
 # Актуальный план развития
 
-Актуализировано 2026-10-03 по текущему checkout и сохранённым материалам.
+Актуализировано 2026-10-04 по текущему checkout и сохранённым материалам.
 Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
 содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
 объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
@@ -12,7 +12,7 @@
 <a id="v1--версионирование-сервисов-open"></a>
 ### V1 — версионирование сервисов
 
-Статус 03.10: локально DONE / NOT_DEPLOYED, приёмка завершена.
+Статус 03.10: код DONE, релиз DEPLOYED; отдельная проверка после выкладки HTTP/API PASS.
 Проверка актуальности до реализации: metadata0.2/Core и O1.1 уже существуют;
 собственная UI версия, Worker/Analytics observations и build gate отсутствовали.
 Root и `milestone_relevance_architect` подтвердили актуальность полного V1,
@@ -32,10 +32,11 @@ Analytics private health/OpenAPI и bounded probe; additive diagnostics service_
 Important (AST override/rebinding bypass) CODE PASS, C/I/M0. Root final nonPG1460PASS/0skip/17warnings и frontend142/type/build PASS,
 Ruff/Black/releaseguard/diff PASS; итоговый CODE/DOC/INTEGRATION review PASS, C/I/M0.
 Первые1450/143 receipts до guardfix сохранены отдельно. Доказательства:
-develop/reports/v1-service-versions-20261003/. Native Docker build/PG/live не
-проверялись. VPS после commit владельца и отдельной отмашки; TRADE не разрешён.
+develop/reports/v1-service-versions-20261003/. Это результаты локальной приёмки.
+Native build, working migration и live HTTP/API приняты отдельными доказательствами
+выкладки 03.10 ниже; TRADE не разрешён.
 
-### O1.1 — диагностика Core (локально DONE / NOT_DEPLOYED, 03.10)
+### O1.1 — диагностика Core (код DONE, DEPLOYED 03.10)
 
 По поручению владельца основной агент координирует четыре роли из `.agents/`.
 Выбран первый самостоятельный этап O1: authenticated
@@ -47,11 +48,121 @@ Worker/broker/Analytics/market/outbox/portfolio/strategy имеют UNKNOWN.
 
 Контракт и задачи: [design](superpowers/specs/o1-core-diagnostics-design.md),
 [план](superpowers/plans/o1-core-diagnostics.md). Контроль ролей и контекста:
-[договорённости оркестрации](agent-orchestration.md). Изменение локальное,
-VPS не обновляется до commit владельца и отдельной отмашки. Root66API/usecase
+[договорённости оркестрации](agent-orchestration.md). Локальная приёмка до
+разрешённой выкладки 03.10: Root66API/usecase
 и139frontend tests PASS, typecheck/build/Ruff/Black/diff0; независимый
 `/root/o1_reviewer` CODE/DOC PASS, существенных замечаний нет.
 Доказательства: develop/reports/o1-status-20261003/.
+
+### O1.2 — цикл управления Worker и доставка событий (LOCAL DONE / NOT DEPLOYED)
+
+04.10 пользователь выбрал совместно O1.2 и M1.1 для первого patch. Проверка
+актуальности root/`o12_relevance_architect`: `/diagnostics` и navigation уже
+существуют, heartbeat версии не измеряет control progress/outbox. Additive
+наблюдения через existing heartbeat, Core atomic volatile TTL и UI расширение
+реализовали `o12_backend_senior` (sol/medium) и `o12_frontend_junior` (luna/low).
+Независимый `o12_relevance_architect` проверил source/контракты и перепроверил
+два исправленных сбоя общей регрессии; открытых C/I/M нет. Root лично проверил
+diff и сохранность прежнего PROD fix: полный backend без PG1512 PASS,
+frontend158 PASS/typecheck/build, Ruff/Black22files/release guard/diff PASS.
+Worker control и outbox отдельно от версии; отсутствующие/устаревшие данные
+UNKNOWN, ошибки/остановившийся прогресс DEGRADED. Общая торговая готовность
+не подтверждается. Доказательства `develop/reports/o12-worker-diagnostics-20261003/`
+и `develop/reports/patch-o12-m1-20261003/`. Frontend сначала реализован до
+исполнимого RED; отдельное baseline9FAIL→GREEN27 доказательство не выдаётся
+за строгую исходную TDD хронологию.
+[Контракт/задачи/DoD](superpowers/plans/o1-core-diagnostics.md#o12-control-loop-и-outbox).
+Код NOT DEPLOYED; полная O1 и текущий PROD bootstrap не закрываются.
+
+### PROD: незавершённый импорт позиции и недоступный Resume
+
+03.10: исправление отображения подготовлено локально, завершение импорта в PROD
+остаётся OPEN. Fresh GET 18:00 UTC подтвердил READ_ONLY и один HOLD/sequence0;
+отдельный READ ONLY aggregate подтвердил BOOTSTRAPPING, полный исходный snapshot
+и отсутствие position cycle. Worker в диагностике UNKNOWN/NOT_OBSERVED.
+Брокерские позиции и подтверждённые автоматы Core — разные источники состояния.
+
+Backend передаёт additive `bootstrap_pending`, frontend показывает ожидание
+первичной сверки и «—» вместо неподтверждённых финансовых значений в списке и
+карточке. Объяснение блокировки Resume доступно рядом с кнопкой. READ_ONLY guards
+сохранены; первоначальный bootstrap завершается Worker без команды Resume.
+TEST TRADE возобновление обычного HOLD и незавершённого bootstrap сохранено.
+
+Авторы `prod_resume_backend`/`prod_resume_frontend`, независимый
+`prod_resume_architect`: FINAL CODE/DOC/INTEGRATION PASS C/I/M0. Root лично прочёл diff; 12 backend
+интеграционных и 18 frontend проверок, typecheck/diff PASS. Приёмка документов
+завершена; итоговый receipt — `root-final-acceptance.json`. Доказательства:
+`develop/reports/prod-resume-20261003/`.
+
+Пользователь повторил требование функционально завершить импорт. Изолированная
+composed PROD проверка подтвердила штатный bootstrap без Analytics, scoped claim,
+lost ACK/restart/replay и отсутствие заявок; root fresh 1 PASS, независимое review
+C0/I0/M0. Metadata 18:41 UTC подтвердили approved installed Worker be84ed4,
+Core/PG healthy, существующий PROD volume и около 776MiB доступной RAM.
+
+Адресное восстановление проверенным **уже установленным** Worker
+READ_ONLY/strategy=false выполнено до запуска: native preflight и start PASS.
+Отдельная ограниченная verify не подтвердила bootstrap и остановила только новый
+PROD Worker, сохранив volume. Fresh HTTPS 19:46 UTC: один HOLD/sequence0,
+TEST6 IN_WORK, broker reads работают. Функциональный результат остаётся OPEN.
+Read-only metadata 20:01 UTC: OOM=false/restart0/exit0, ошибки рабочего цикла.
+Structured counters 20:08 UTC подтвердили 40 `ValidationError` при успешных
+connection/commands HTTP200. В установленном Core внутренний DTO теряет
+`account_id`, `environment`, `access_mode`; Worker отклоняет PROD-подключение
+до heartbeat. Минимальный локальный fix передаёт все три поля; real HTTP
+roundtrip проверен для PROD READ_ONLY и TEST READ_ONLY/TRADE. Root fresh29 PASS,
+Ruff/diff PASS; независимый source/contract review C/I/M0. Код LOCAL DONE,
+NOT DEPLOYED; повторного запуска нет. Независимый архитектор принял scope
+операции по повторному functional request; это не включение торговли.
+Read-only токен запрещает торговые поручения; режим приложения и PROD TRADE
+hardguard отдельно сохраняют запрет. Замена токена не является допуском торговли.
+План и доказательства: `develop/reports/prod-bootstrap-20261003/`.
+Новая кодовая версия и локальные UI изменения не развёрнуты: commit делает
+владелец, новый deploy после отдельной отмашки. P3/P4/P5 торговый допуск открыт.
+
+### Выкладка 03.10: 0.2.0 и отдельная проверка после неё
+
+По commit владельца и явному разрешению развёрнут неизменяемый
+`be84ed4f047734ccacfba9b6ccb531af51ba4b94`:
+`/opt/moex-sentinel/{current,production-current}` →
+`/opt/moex-sentinel/releases/vps-20261003-be84ed4`.
+Выкладка завершена 17:10 UTC: Core готов до запуска TEST Worker, TEST6 + PROD2,
+общая PostgreSQL с `0003_user_broker_archive`, READ_ONLY/strategy=false.
+В env изменён только RELEASE_TAG; прежние persistent volumes сохранены.
+
+По уточнению владельца перед миграцией снят только custom PG16 dump
+116246851 bytes с SHA и `pg_restore --list`. Полный paired backup, Worker archive,
+restore/rehearsal — NOT_PERFORMED. Перед запуском writers миграция сохранила
+cardinality всех 17 таблиц и добавила nullable archive metadata; это не проверка
+полного восстановления или byte equality финансовых строк.
+
+Проверка после выкладки завершена отдельным шагом 17:12 UTC: HTTPS/assets/auth/
+изоляция сессий, scoped accounts (по одному счёту/errors0), portfolio и trading
+summary PASS. GET каталога вернул 2460/2462 элементов TEST/PROD; это размер ответа.
+Core обеих сред0.2.0, TEST Worker/Analytics OBSERVED0.2.0; PROD WorkerUNKNOWN,
+AnalyticsNOT_CONFIGURED. Общий UNKNOWN не означает готовность торговли.
+Подтверждение running/images/caps/mounts/networks/env — свежий снимок17:14 UTC.
+Независимые post-deploy READ_ONLY приёмка и итоговая проверка документов
+`milestone_relevance_architect` — PASS, C/I/M0; итоговый статус DEPLOYED + VERIFIED
+в указанной области. Root принял фактические изменения и доказательства.
+Доказательства: `develop/reports/vps-release-20261003/root-native-receipts.json`,
+`root-archive-timing.json`, `root-final-acceptance.json`, `postdeploy-review.md` и
+`final-doc-review.md`. Снимки этапов относятся
+к разным моментам: после HTTP, в17:13, архивирована одна отключённая запись;
+root не выполнял DELETE/PUT, actor не исследован. Её строка и история сохранены.
+Browser click/полная positions/orders/recovery/capacity и24ч/7сут не заявляются.
+
+Процесс выпуска по указанию владельца: сборка до остановки приложения;
+выкладка с обязательными migration/readiness/dependency/fail-stop gates;
+расширенные проверки HTTP/API/auth/статусов и итоговое review — отдельным шагом
+после переключения. Полные тесты исходников во время downtime не повторять.
+Исправлены две ошибки упаковки публичных файлов (каталоги0700 и nginx.conf0600)
+с сохранением file bytes, original USER и runtime configuration образов.
+В следующие доработки входит сокращение ручной выкладки: корректные права
+артефактов и отдельная команда post-deploy verification. Полные O1/O2/S1/M1,
+длительное наблюдение, PROD Worker и TRADE остаются OPEN/NOT_AUTHORIZED.
+
+### История приёмки 02.10 (не текущий runtime)
 
 Релиз `1b410a9` на VPS выполнен и принят 02.10: TEST и initial PROD READ_ONLY.
 Токен введён владельцем через UI; PROD счета/сводка читаются, TRADE отключён.
@@ -91,9 +202,9 @@ observations. Длительная приёмка остаётся открыт�
 persistent collector/portfolio, bootstrap/capacity/admission, PROD Worker/TRADE,
 repair и 24ч/7сут остаются открытыми.
 Диагностический bugfix (шесть файлов): CODE PASS C/root, backend80 и frontend3,
-typecheck/Ruff/Black. Он не закоммичен и не развёрнут; на VPS остаётся `1b410a9`.
-Новый rollout — после commit владельца в master и отдельной отмашки. Проверки
-релиза1456 не заменяют проверку этого delta.
+typecheck/Ruff/Black. На момент приёмки02.10 он ещё не был закоммичен/развёрнут.
+03.10 delta и archive/schema0003 вошли в be84ed4 и выложены по разрешению
+владельца. Проверки релиза1456 не заменяют приёмку этого delta.
 Завершён [анализ оркестрации и Worker storage](audits/orchestration-and-worker-storage.md):
 Worker оркестрирует исполнение, его durable состояние не заменяется чтением
 брокерского портфеля; перенос Worker/Redis/RabbitMQ ещё не выбраны.
@@ -128,7 +239,19 @@ pools по фактической concurrency, профиль SDK и отлож�
 зависимостей: Python уже использует `python:3.12-slim`
 (`docker/python-base.Dockerfile`), frontend — Alpine и multistage
 (`docker/frontend.Dockerfile`). Меньший образ не гарантирует меньшую ОЗУ;
-готовая замена и экономия не заявлены. Реализация пока не начата.
+готовая замена и экономия не заявлены. M1.1 код/ORM resource tests проверены локально:
+`ReferenceCatalogRepository.list` загружает ORM партиями, сохраняя полный DTO
+tuple/scope/order/selection. Автор `m1_memory_senior` (sol/medium); независимый
+`o12_relevance_architect` CODE/METHOD C/I/M0. Resource/семантика/возврат соединения
+проверены и в полном root backend1512 PASS. Три fresh paired samples каждого
+варианта на1000/20000 строк с одинаковыми seed/result SHA, macOS/SQLite.
+Первый root20k peak−20.93%, latency+19.99%; author latency−5.75%.
+Один заранее назначенный повтор после остальных проверок:20k peak135.21→106.92MiB
+(−20.93%), чтение1.073→0.953s (−11.17%);1000строк75.80→81.28ms (+7.23%).
+Оба root receipts сохранены. Из-за разброса и малого числа samples отсутствие
+регрессии latency ещё не принято; дальнейший gate — одинаковая PG/API нагрузка.
+Linux/Compose/PG/container/image metrics не подтверждены; fullM1 остаётсяOPEN,
+экономия VPS не заявляется. Доказательства develop/reports/m1-catalog-20261003/.
 
 Критерий готовности: на одинаковых workload, данных и Compose конфигурации
 сравнить before/after cgroup memory.current, working set, PSS, peak, swap и OOM;
@@ -206,23 +329,135 @@ healthy на 19.09, но не новые решения и устойчивос�
 
 ## Текущая очередь после 0.9.8
 
-Это кандидаты с конкретной областью проверки; отдельные реализации ещё не начаты.
+Это кандидаты с конкретной областью проверки; приёмка отдельных пакетов указана ниже.
 ID, доказательства, риски и тесты приведены в оценке выше. Порядок строк задаёт
 ближайшую очередь; условные оптимизации выбираются только после профиля.
-F1 уже реализована в HEAD и ждёт повторной проверки frontend тестов при
-доступном npm; в очередь реализации её повторно не включаем.
+F1 уже реализована в HEAD; 04.10 полный frontend повторно проверен с доступным
+npm (204 PASS). В очередь реализации F1 повторно не включаем.
 
 | Очередь | Объём | Условие и ожидаемый результат |
 | --- | --- | --- |
-| 1 — A1, P1 | Неблокирующий HTTP-контур Core | Целый sync usecase/UoW вне event loop, ограничение потоков, конкурентные CAS/replay/rollback и корректная атрибуция метрик. |
+| A1, P1 — LOCAL DONE | Неблокирующий HTTP-контур Core | Целый sync usecase/UoW вне event loop, ограничение потоков, конкурентные CAS/replay/rollback и корректная атрибуция метрик. |
 | 2 — F2/F3, P2 | Актуальность UI-запросов и route-контекста | Поздние ответы не меняют текущие данные/формы; отображение и действия используют один актуальный инструмент/счёт. |
 | 3 — W3/C5, P2 | Независимые задачи устойчивости | Отдельно tracking SQLite offload; отдельно ограничение cursor pagination/shutdown collector. Не объединять транзакционные границы сервисов. |
-| 4 — C1/C2/C3, P2 | Точечные Core SQL/read-model изменения | Сначала контракт и SQL budget каждого пути; lineage reads, N+1 и order/cycle RETURNING принимаются независимо. |
-| 5 — C4/W4, P2/P3 | Summary и сопровождение ledger | Summary — после профиля истории; общие session-bound LIFO helpers — с эквивалентностью двух входов и атомарностью. |
+| C1/C2/C3, P2 — LOCAL DONE | Точечные Core SQL/read-model изменения | Сначала контракт и SQL budget каждого пути; lineage reads, N+1 и order/cycle RETURNING принимаются независимо. |
+| C4/W4, P2/P3 — LOCAL DONE | Summary и сопровождение ledger | Summary — после профиля истории; общие session-bound LIFO helpers — с эквивалентностью двух входов и атомарностью. |
 | Условно — W5/F4, P3 | Analytics metrics / детали API | CPU-профиль до кэша; профиль независимых I/O-веток до параллельной загрузки. Сохранить TTL и partial errors. |
 
+04.10 пользователь выбрал совместный пакет **A1 + C1–C4 + W4**. До реализации
+root, `a1_c14_w4_architect`, `c14_core_senior` и backend senior `next_ui_senior`
+перепроверили текущие потоки и зависимые контракты. 04.10 short design явно подтверждён
+пользователем; пакет реализуется с sole writers в отдельном worktree. Ledger и доказательства:
+`develop/reports/core-performance-20261004/`. Прежний принятый patch сохраняется.
+
+Уточнения актуальности: A1 охватывает sync-only HTTP и DB preflight внутри
+mixed async flows; whole operation/UoW остаётся в одном worker, SDK/async lock —
+в loop. Для строгого cancellation/drain нужен app-owned bounded executor, а
+не перенос Session между потоками. C2 N+1 есть также в service environment
+filter: нужен существующий broker batch read вместе с repository JOIN.
+C1 error priority сохранить внутри назначенных validation targets, не менять
+соседние typed error ветви. C3 использует существующий RETURNING pattern.
+C4 требует профиля длинной истории до product batching трёх окон summary.
+W4 unused `_ledger` уже удалён из order tracking; остаётся только duplication
+session-bound opening/LIFO, без изменения финансовых формул/transaction/outbox.
+
+Для новых gates поднята отдельная локальная PostgreSQL16 (loopback/tmpfs, без
+рабочих volumes). Fresh исходный nonPG backend1512PASS; первый PG baseline
+100PASS/1FAIL/2SKIP: stale health test ожидал0.1.0 вместо принятой0.2.0,
+dump/restore tools host major не совпал с16. Первые логи сохранены.
+Отдельный maintenance принят: health spec использует canonical version без
+ослабления503/schema/no-leak; реальные pg_dump/pg_restore16.15 через локальные
+изолированные wrappers. Автор next_ui_senior (backend senior sol/medium),
+независимый a1_c14_w4_architect (sol/high) CODE/CONTRACT/METHOD PASS C0/I0/M0.
+После root интеграции fresh полный PG baseline103PASS/0FAIL/0SKIP,65.92s;
+nonPG1512PASS/101.15s. Это исходное состояние, не приёмка новых A1/C/W4.
+A1/C1–C4/W4 локально интегрированы после независимого CODE/CONTRACT/SOLID/
+TEST/METHOD review (C0/I0/M0). C1 сокращает existence/lineage reads с прежним
+порядком ошибок; C3 использует full UPDATE RETURNING и обновляет stale identity
+при rejected cycle update. C2 normal repository list — 1 SELECT, normal service
+scope — 2 SELECT при 1 и 50 автоматах; неполный/чужой instrument scope явно
+отклоняется. W4 сохраняет численные результаты, атомарность и outbox/replay двух
+entrypoints. A1 переносит whole sync Session/UoW в bounded app-owned pool cap4;
+отмена HTTP не освобождает слот незавершённого задания, shutdown ждёт drain до
+engine.dispose. Async SDK/locks/cache остаются в loop; вне HTTP прежний режим
+сохранён. Граница исполнения записана в AGENT_BRIEF.md.
+
+C4 сначала измерен на SQLite/PG: 5 synthetic history profiles, ALL/TEST/PROD,
+max86405 history rows одновременно. Первая paired версия показала регрессию PG
+long ALL/TEST; raw receipts и неудачный NOT MATERIALIZED diagnostic сохранены.
+Actual EXPLAIN обосновал исправление: PG GROUP/ORDER/LIMIT в одном SELECT вновь
+останавливается по индексу; SQLite CTE и старый singleton сохранены. Второй paired
+прогон: все30 SQL/median/p95/output gates PASS. Whole-view single-currency reads
+8/9/10→4, mixed6/7 вместо14/15; empty scope2 остаётся2. PG long ALL median91.170→
+47.128ms, p95100.564→50.283ms. Это ограниченный локальный synthetic профиль;
+производственная нагрузка не измерена. Фактически32 seed операции после первого
+прогона и диагностики; owned schemas/files очищены, рабочие volumes не затронуты.
+
+A1 первый HTTP synthetic replay замер отрицательный и сохранён; точные bytes
+первого measured script не были зафиксированы. После исправления одинакового
+concurrent warmup для old/new exact script архивирован до замера; одна fixed pair
+89.38→100.92req/s, p9559.50→50.98ms. Общего production ускорения не заявляем.
+
+**A1 + C1–C4 + W4: LOCAL DONE / NOT DEPLOYED.**
+Независимый a1_c14_w4_architect: итоговое CODE/CONTRACT/SOLID/TEST/INTEGRATION/
+DOC/RECEIPT PASS, C0/I0/M0; все обязательные локальные gates выполнены.
+Fresh root nonPG1674PASS/0FAIL/0SKIP, PostgreSQL187PASS/0FAIL/0SKIP,
+frontend204PASS/26files, typecheck/build, aux11PASS; Ruff/Black72files/diff PASS.
+Первые full nonPG1671PASS/2FAIL и quiet1672PASS/1FAIL сохранены: старые gateway
+тесты предполагали гарантированный wall-time interval меньше10ms. Runtime/
+recovery не менялись. Один original diagnostic trace прошёл, исходный сбой не
+воспроизведён с trace; отдельный synthetic12ms pause подтвердил корректное
+переподключение после10ms и ошибочную предпосылку теста. CPU-причина не доказана.
+Исправлен только spec: контролируемое время отдельного loop, реальные ingest/
+cancel acknowledgements, прежние10ms/5ms/10ms пороги, equality check и прежний
+cancellation-resistant negative. Scoped45PASS и3 negative probes; independent
+review C0/I0/M0. После exact integration свежий полный nonPG1674PASS/99.13s.
+Format-only maintenance bootstrap spec имеет полную AST parity/scoped10PASS.
+Production и PG-suite исходники после PG187PASS не менялись; последние corrections
+касаются только nonPG specs. Все первые неблагоприятные доказательства сохранены.
+
+Root exact50 source paths сверены с reviewed worktree; baseline683 paths:
+648 сохранены,35 согласованных изменений, неожиданных0; HEAD/index неизменны.
+Owned synthetic PG schemas/restore databases очищены, test-контейнер остановлен
+для освобождения ОЗУ; рабочие volumes/VPS не затрагивались. Итоговые evidence/
+review: develop/reports/core-performance-20261004/{final-report.md,
+root-final-acceptance.json,root-integration-independent-review.md}.
+Новых API/dependencies/миграций/Worker storage переносов/PROD TRADE нет.
+Полные M1/O1/O2/PROD P3–P5 остаются открытыми, W3/C5 и условные W5/F4 не входят
+в выбранный пакет. Пользователь коммитит сам; deployment — отдельный GO после
+локальной приёмки.
+
+04.10 актуальность F2/F3 перепроверена root, `next_ui_senior` и независимым
+`o12_relevance_architect` по текущим исходникам. Пользователь выбрал оба
+ограниченных пакета перед тем же patch: F3.1 — карточки инструмента/позиции/счёта
+при смене route; F2.1 — поздние чтения каталога и операций при смене фильтров/лимита.
+Всего пять существующих views и пять specs, без изменения API/финансовых команд,
+auth, БД и зависимостей. **F2.1/F3.1 LOCAL DONE / NOT DEPLOYED.** Senior
+`next_ui_senior` реализовал карточки, `f2_frontend_senior` — каталог и принял
+операции от junior `f2_operations_junior`. До изменения компонентов выполнены
+RED-прогоны; регрессии проверены через настоящий RouterView и deferred ответы.
+Root интегрировал exact frozen файлы после независимого
+`f23_integration_reviewer` CODE/CONTRACT/TEST COVERAGE PASS, C0/I0/M0.
+Свежий полный frontend:204 PASS/26files; typecheck/build/architecture1PASS/diff
+успешны. SHA перенесённых10файлов совпадают с проверенным worktree, прежний patch
+и Git index сохранены. READ_ONLY, прежний bootstrap UI, timer cleanup, partial
+errors/cache и итог отправленных mutations сохранены; старый callback не меняет
+новую форму и не вызывает stale redirect. Query того же инструмента сохраняет
+draft; команды используют ID строки каталога, свечи — внешний UID.
+Broker editor pending save/drafts не входит. Полная строка backlog F2/F3 не
+закрывается частичными пакетами. Relevance/briefs/ledger/proofs:
+`develop/reports/next-patch-20261004/{final-report.md,root-final-acceptance.json,
+independent-review.md}`. Ограничения: API в frontend-тестах подменён; native VPS
+и реальный PROD bootstrap этим пакетом не проверялись. В operations unmount test
+проверяется видимость нового экземпляра; guard старого экземпляра подтверждён
+ревью кода. F3 A→B→A подтверждён монотонным counter review, отдельного теста нет.
+Backend source не менялся: прежний full backend1512 PASS без PostgreSQL остаётся
+доказательством предыдущего этапа, а не новым прогоном04.10. Владелец коммитит;
+выкладка и postverification — отдельные шаги после GO.
+
 Оценка 10.09 описывала эти проблемы как будущую работу. На 26.09 F1 уже есть
-в HEAD; остальные строки остаются кандидатами без новой приёмки.
+в HEAD; остальные строки остаются кандидатами, кроме локально принятых выше
+ограниченных пакетов F2.1/F3.1.
 
 ## Завершённая веха: 0.9.5 — обработка недоступности песочницы
 

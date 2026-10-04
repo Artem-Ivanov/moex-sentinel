@@ -22,11 +22,11 @@ class PortfolioSnapshotReader(Protocol):
 
     def latest_snapshots(self, run_id: str) -> tuple[PortfolioSnapshotValue, ...]: ...
 
-    def common_baselines(
+    def common_baselines_many(
         self,
         latest: tuple[PortfolioSnapshotValue, ...],
-        at_or_before: datetime,
-    ) -> tuple[PortfolioSnapshotValue, ...]: ...
+        boundaries: tuple[datetime, ...],
+    ) -> tuple[tuple[PortfolioSnapshotValue, ...], ...]: ...
 
 
 class TradingSummaryService:
@@ -57,7 +57,12 @@ class TradingSummaryService:
         latest: tuple[PortfolioSnapshotValue, ...],
         latest_run: PortfolioSnapshotRunValue,
     ) -> CurrencyTradingSummary:
-        periods = tuple(self._period(latest, latest_run, window) for window in self._WINDOWS)
+        boundaries = tuple(latest_run.captured_at - window for window in self._WINDOWS)
+        baselines = self._repository.common_baselines_many(latest, boundaries)
+        periods = tuple(
+            self._period(latest, latest_run, window, baseline)
+            for window, baseline in zip(self._WINDOWS, baselines, strict=True)
+        )
         return CurrencyTradingSummary(
             currency=currency,
             portfolio_value=sum((snapshot.total_value for snapshot in latest), Decimal()),
@@ -72,9 +77,9 @@ class TradingSummaryService:
         latest: tuple[PortfolioSnapshotValue, ...],
         latest_run: PortfolioSnapshotRunValue,
         window: timedelta,
+        baselines: tuple[PortfolioSnapshotValue, ...],
     ) -> TradingPnlPeriod:
         requested_from = latest_run.captured_at - window
-        baselines = self._repository.common_baselines(latest, requested_from)
         if len(baselines) != len(latest):
             return TradingPnlPeriod(None, None, latest_run.captured_at, False)
         actual_from = baselines[0].captured_at

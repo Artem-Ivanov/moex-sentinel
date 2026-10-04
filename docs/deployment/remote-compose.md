@@ -2,7 +2,7 @@
 
 ## Границы готовности
 
-На 2026-10-02 приложение развёрнуто на VPS `135.136.178.252` (Ubuntu 24.04, amd64, Docker 29.7.2, Compose v5.4.0). Свежие read-only замеры: RAM1,92GiB, диск55,99GiB/available47,45GiB. Локальная история не переносилась; текущее состояние Sandbox загружено штатным API. Повторный SSH/sudo успешен; running `STRATEGY_ENABLED=false`, broker/Core/Worker ledger и доставка текущей выборки сверены. Каталог/позиции/выход и session401 в живом браузере подтверждены; restart без дублей ещё открыт. Evidence: `develop/reports/vps-audit-20261002/`. Источники скопированы из проверенного рабочего дерева в root-owned релиз; локальный код ещё не закоммичен. Ниже также приведена общая процедура для будущих релизов. Этот документ не обещает SLA.
+Исторический снимок на 2026-10-02: приложение развёрнуто на VPS `135.136.178.252` (Ubuntu 24.04, amd64, Docker 29.7.2, Compose v5.4.0). Замеры того снимка: RAM1,92GiB, диск55,99GiB/available47,45GiB. Локальная история не переносилась; состояние Sandbox было загружено штатным API. Повторный SSH/sudo успешен; running `STRATEGY_ENABLED=false`, broker/Core/Worker ledger и доставка выборки сверены. Каталог/позиции/выход и session401 в живом браузере подтверждены; restart без дублей оставался открыт. Evidence: `develop/reports/vps-audit-20261002/`. Источники скопированы из проверенного рабочего дерева в root-owned релиз; локальный код ещё не был закоммичен. Ниже также приведена общая процедура для будущих релизов. Этот документ не обещает SLA.
 
 База и внутренние API не имеют опубликованных портов. UI слушает только `127.0.0.1:8080`; Nginx публикует его через `https://135.136.178.252/`. Backend требует учётные данные оператора; HTTP cookie для loopback на удалённом Compose выключена. Не открывать Docker API наружу.
 
@@ -16,8 +16,36 @@ Overlay использует [правила merge Docker Compose](https://docs.
 
 ## Развёрнутый VPS
 
+### Текущий снимок после deploy 03.10.2026
+
+По `develop/reports/vps-release-20261003/root-native-receipts.json` (17:14 UTC):
+commit `be84ed4f047734ccacfba9b6ccb531af51ba4b94`, release
+`vps-20261003-be84ed4`; `/opt/moex-sentinel/current` и
+`/opt/moex-sentinel/production-current` указывают на
+`/opt/moex-sentinel/releases/vps-20261003-be84ed4`. Schema `0003_user_broker_archive`;
+8 containers running: TEST — Core, database, frontend, Analytics, portfolio collector,
+Worker; PROD — Core и frontend. TEST Core/Worker/Analytics сообщают `0.2.0`; PROD Core
+сообщает `0.2.0`, PROD Worker — UNKNOWN, PROD Analytics — NOT_CONFIGURED. Наличие версии
+или UNKNOWN не подтверждает торговую готовность. TEST и PROD доступны только в
+`READ_ONLY`, `STRATEGY_ENABLED=false`; PROD Worker не запущен и TRADE не разрешён.
+
+Отдельная post-deploy HTTPS verification прошла: в обоих контурах index/assets, health,
+diagnostics/auth, brokers/accounts/catalog, portfolio и trading GET получили ожидаемые
+статусы; login/logout и изоляция сессий прошли. Accounts: по 1, errors 0; catalog GET
+вернул `items=2460` TEST и `items=2462` PROD (размер ответов, не полный размер каталога);
+portfolio/trading проверки PASS. HTTP receipt не включает browser acceptance или archive
+действия; отдельная post-HTTP проверка `root-archive-timing.json` показывает 3 broker records,
+1 archived и 0 archived active, последний `archived_at` — 17:13:34 UTC. Actor неизвестен;
+эта запись не приписывается rollout/HTTP проверке, root не выполнял DELETE/PUT. Снимки
+получены разными read запросами, не одной транзакцией. Это не browser acceptance или
+длительное наблюдение. TEST/PROD env
+изменялись только по release tag; volumes сохранены. TEST dump перед миграцией: 116246851
+bytes, SHA и structural list проверены, owner-only; paired Worker backup/restore не выполнялся.
+
+### Исторические operational сведения на 02.10.2026
+
 - UI: `https://135.136.178.252/`; оператор: `operator`. Пароль создан случайно на VPS и хранится в `/root/moex-sentinel-operator-password` (root-only, 600). Владелец сервера считывает его через свой административный SSH-доступ командой `sudo cat /root/moex-sentinel-operator-password`, сохраняет в менеджере паролей и удаляет временный файл `sudo rm /root/moex-sentinel-operator-password`. Не пересылать пароль в чат или Git.
-- Исходники: `/opt/moex-sentinel/current` → `/opt/moex-sentinel/releases/vps-20261001-sandbox-ui-r2`; Compose env: `/etc/moex-sentinel/remote.env` (root-only, 600). Старый r1 и env backup сохранены; обновлён только Frontend, остальные сервисные image IDs не изменены. Отключение временного пользователя `codex-deploy` не удаляет эти файлы и Docker volumes.
+- Исторический снимок 02.10: исходники `/opt/moex-sentinel/current` → `/opt/moex-sentinel/releases/vps-20261001-sandbox-ui-r2`; Compose env: `/etc/moex-sentinel/remote.env` (root-only, 600). Старый r1 и env backup сохранены; тогда обновлён только Frontend, остальные сервисные image IDs не изменены. Отключение временного пользователя `codex-deploy` не удаляет эти файлы и Docker volumes.
 - Запущены PostgreSQL, Backend, Analytics, portfolio-snapshot-worker, Frontend и `trading-automaton`. Broker token и единственный активный Sandbox account настроены; синхронизация добавила4332 инструмента, RUB выборка2460. API/браузер показывают6 IN_WORK позиций, qty/avg совпадают с broker и Worker; snapshot свежий. Running strategy=false, Worker intents0, Core orders/executions0, broker active обычных/stop orders0. Доставка 12 конкретных pending событий принята Core и ACK удалил их из Worker; свежие события продолжают поступать. Поддерживается только T-Invest TEST Sandbox; новую торговлю не включать по результату одного health.
 - Nginx: `/etc/nginx/conf.d/moex-sentinel.conf`, исходник `deploy/remote/nginx-ip.conf`. 80/tcp обслуживает ACME и переводит на HTTPS; 443/tcp обслуживает приложение. Let's Encrypt IP-сертификат действует около 160 часов, поэтому нужны работающий `snap.certbot.renew.timer` и hook `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh`. Проверка: `sudo /snap/bin/certbot renew --dry-run --run-deploy-hooks --no-random-sleep-on-renew` и `sudo nginx -t`. Контролировать срок сертификата отдельно: HTTP `/api/health` его не проверяет.
 - Запуск Compose с серверным env: `sudo env REMOTE_ENV_FILE=/etc/moex-sentinel/remote.env sh /opt/moex-sentinel/current/deploy/remote/compose.sh ps --all`. Не выводить обычный `compose config` в терминал или журнал — он содержит пароль БД.
@@ -78,6 +106,15 @@ database/credentials/volume сохранить; не заменять их пр�
 Команды ниже выполнять из корня выбранного checkout. `REMOTE_ENV_FILE` может указать другой абсолютный путь к env. Не использовать текущий локальный `.env` для случайного запуска второго Worker.
 
 ## Подготовка релиза
+
+Подготовить сборку и упаковку до остановки сервисов; результаты разработки повторно
+проверять в cutover не требуется. Во время короткого VPS cutover выполнять необходимые
+dump/migration и минимальные Core readiness gates до последовательного запуска Worker;
+любой gate failure останавливает процедуру. Расширенные HTTPS auth/API/status проверки
+выполнить отдельно после переключения, затем провести независимый review по receipts.
+Для выпуска от 03.10 packaging gates выявили directories mode `0700` и public nginx config
+mode `0600`; включать явную проверку доступности файлов сервисными UID в будущие preflight
+изменения отдельным планом.
 
 ### SSH и клонирование
 

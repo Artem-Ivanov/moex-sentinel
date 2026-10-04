@@ -18,6 +18,7 @@ from sentinel_contracts.trading_facts import (
 )
 from sentinel_contracts.version import SERVICE_VERSION
 from tests.contracts.trading_facts_helpers import all_envelopes
+from tests.services.test_runtime_versions import NOW, progress
 from trading_automaton.adapters.core_client import CoreClient
 
 
@@ -158,3 +159,20 @@ def test_heartbeat_uses_stable_instance_and_actual_shared_version():
     assert one["environment"] == "TEST"
     assert one["access_mode"] == "READ_ONLY"
     assert UUID(one["instance_id"]) != UUID(three["instance_id"])
+
+
+def test_worker_diagnostics_is_additive_to_existing_identity_and_http_heartbeat():
+    bodies = []
+
+    def handle(request):
+        if request.url.path == "/internal/runtime":
+            return httpx.Response(200, json={"environment": "TEST", "access_mode": "READ_ONLY"})
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url="http://core", transport=httpx.MockTransport(handle)) as http:
+        worker = CoreClient(http, application_environment="TEST", access_mode="READ_ONLY")
+        worker.heartbeat("worker", NOW, progress())
+    assert bodies[0]["worker_diagnostics"]["completed_iterations"] == 1
+    assert bodies[0]["worker_diagnostics"]["outbox"]["pending_count"] == 0
+    assert bodies[0]["runtime_version"]["environment"] == "TEST"

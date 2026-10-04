@@ -1,6 +1,7 @@
 """Business service for checking configured broker connectivity."""
 
 from collections.abc import Callable
+from functools import partial
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import Broker
@@ -8,6 +9,7 @@ from moex_sentinel.domain.connections import BrokerConnectionStatus
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
 from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.sync_execution import run_sync
 
 
 class BrokerConnectionService:
@@ -22,11 +24,7 @@ class BrokerConnectionService:
         self._environment = environment
 
     async def check(self, broker_id: str) -> BrokerConnectionStatus:
-        broker = self._brokers.get(broker_id)
-        if self._environment is not None:
-            active_test = self._environment.view().active_environment == "TEST"
-            if broker.is_test is not active_test:
-                raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        broker = await run_sync(partial(self._broker, broker_id))
         adapter = self._adapter_factory(broker)
         for attempt in range(2):
             try:
@@ -40,3 +38,11 @@ class BrokerConnectionService:
                 if not error.retryable or attempt == 1:
                     raise
         raise RuntimeError("Unreachable connection check state.")
+
+    def _broker(self, broker_id: str) -> Broker:
+        broker = self._brokers.get(broker_id)
+        if self._environment is not None:
+            active_test = self._environment.view().active_environment == "TEST"
+            if broker.is_test is not active_test:
+                raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        return broker

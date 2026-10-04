@@ -1,6 +1,8 @@
 """Benchmark-only clocks; SQL/commit scopes deliberately overlap ingress/HTTP."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import Lock
 from time import perf_counter
 
 from sqlalchemy import event
@@ -16,10 +18,24 @@ class Profile:
         self.created = {}
         self.attempted = set()
         self.delivered_facts = 0
-        self.active_ingress = False
+        self._request = ContextVar("profile_request", default=None)
+        self._lock = Lock()
 
     def add(self, name, elapsed):
-        self.samples.setdefault(name, []).append(elapsed)
+        with self._lock:
+            self.samples.setdefault(name, []).append(elapsed)
+
+    @contextmanager
+    def request(self, facts_count):
+        bucket = {"sql": 0, "commits": 0}
+        token = self._request.set(bucket)
+        try:
+            yield
+        finally:
+            self.add("sql_statements_per_request", bucket["sql"])
+            self.add("dbapi_commits_per_request", bucket["commits"])
+            self.add("facts_per_request", facts_count)
+            self._request.reset(token)
 
     @contextmanager
     def timing(self, name):
@@ -71,16 +87,18 @@ def instrument_database(engine, profile):
     original_commit = engine.dialect.do_commit
 
     def do_commit(connection):
-        if not profile.active_ingress:
+        if profile._request.get() is None:
             return original_commit(connection)
         with profile.timing("dbapi_commit_ms"):
+            profile._request.get()["commits"] += 1
             return original_commit(connection)
 
     def before_cursor(_connection, _cursor, _statement, _parameters, context, _many):
-        context.profile_started = perf_counter() if profile.active_ingress else None
+        context.profile_started = perf_counter() if profile._request.get() is not None else None
 
     def after_cursor(_connection, _cursor, _statement, _parameters, context, _many):
         if context.profile_started is not None:
+            profile._request.get()["sql"] += 1
             profile.add("sql_execution_ms", (perf_counter() - context.profile_started) * 1000)
 
     engine.dialect.do_commit = do_commit
@@ -89,7 +107,7 @@ def instrument_database(engine, profile):
 
     class TimedSession(Session):
         def commit(self):
-            if not profile.active_ingress:
+            if profile._request.get() is None:
                 return super().commit()
             with profile.timing("session_commit_including_flush_ms"):
                 return super().commit()

@@ -8,7 +8,9 @@ from time import monotonic as system_monotonic
 from typing import Protocol
 
 from sentinel_contracts.broker_execution import BrokerConnection
+from sentinel_contracts.time import floor_utc_millisecond
 from sentinel_contracts.trading_facts import AutomationCommand
+from sentinel_contracts.worker_diagnostics import IterationResult, OutboxDiagnostics, WorkerDiagnostics
 from trading_automaton.usecases.synchronize_runtime import SynchronizeTradingRuntimeUsecase
 
 LOGGER = logging.getLogger(__name__)
@@ -94,7 +96,9 @@ def _sqlite_constraint_names(error: BaseException) -> tuple[str, ...]:
 
 class CoordinatorCorePort(Protocol):
     def broker_connection(self, broker_id: str) -> BrokerConnection: ...
-    def heartbeat(self, worker_id: str, occurred_at: datetime) -> None: ...
+    def heartbeat(
+        self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None
+    ) -> None: ...
 
 
 class RuntimePort(Protocol):
@@ -125,7 +129,13 @@ class StreamingRuntimeCoordinator:
         now: Callable[[], datetime],
         monotonic: Callable[[], float] = system_monotonic,
         heartbeat_interval_seconds: float = 3.0,
+        outbox_diagnostics: Callable[[], OutboxDiagnostics] | None = None,
     ) -> None:
+        self._outbox_diagnostics = outbox_diagnostics
+        self._completed_iterations = 0
+        self._last_completed_at: datetime | None = None
+        self._last_finished_at: datetime | None = None
+        self._last_result: IterationResult | None = None
         self._iteration = iteration
         self._core = core
         self._builder = builder
@@ -140,10 +150,25 @@ class StreamingRuntimeCoordinator:
 
     async def run_iteration(self) -> None:
         """Run command synchronization with this runtime's publication and heartbeat capabilities."""
-        await self._iteration.execute(
-            replace_broker_commands=self._replace_broker_commands,
-            schedule_heartbeat=self._schedule_heartbeat,
-        )
+        cancelled = False
+        try:
+            outcome = await self._iteration.execute(replace_broker_commands=self._replace_broker_commands)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            self._last_result = "ERROR"
+            self._last_finished_at = floor_utc_millisecond(self._now())
+            raise
+        else:
+            self._last_result = outcome
+            self._last_finished_at = floor_utc_millisecond(self._now())
+            if outcome == "COMPLETED":
+                self._completed_iterations += 1
+                self._last_completed_at = self._last_finished_at
+        finally:
+            if not cancelled:
+                self._schedule_heartbeat()
 
     async def close(self) -> None:
         """Close broker resources, then await broker and heartbeat tasks before clearing ownership."""
@@ -163,10 +188,47 @@ class StreamingRuntimeCoordinator:
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             return
         self._next_heartbeat_at = current + self._heartbeat_interval_seconds
-        occurred_at = self._now()
+        if self._last_finished_at is None or self._last_result is None:
+            return
         self._heartbeat_task = asyncio.create_task(
-            asyncio.to_thread(self._core.heartbeat, self._worker_id, occurred_at)
+            asyncio.to_thread(
+                self._send_heartbeat,
+                self._completed_iterations,
+                self._last_completed_at,
+                self._last_finished_at,
+                self._last_result,
+            )
         )
+
+    def _send_heartbeat(
+        self,
+        completed_iterations: int,
+        last_completed_at: datetime | None,
+        last_finished_at: datetime,
+        last_result: IterationResult,
+    ) -> None:
+        """Sample the local queue only at heartbeat cadence, isolating diagnostics failures."""
+        outbox = OutboxDiagnostics(reason="READ_FAILED")
+        if self._outbox_diagnostics is not None:
+            try:
+                outbox = self._outbox_diagnostics()
+            except Exception as error:
+                LOGGER.warning("Outbox observation failed: %s", type(error).__name__)
+        try:
+            self._core.heartbeat(
+                self._worker_id,
+                self._now(),
+                WorkerDiagnostics(
+                    completed_iterations=completed_iterations,
+                    last_completed_at=last_completed_at,
+                    last_finished_at=last_finished_at,
+                    last_result=last_result,
+                    error_code="ITERATION_FAILED" if last_result == "ERROR" else None,
+                    outbox=outbox,
+                ),
+            )
+        except Exception as error:
+            LOGGER.warning("Heartbeat delivery failed: %s", type(error).__name__)
 
     async def _replace_broker_commands(self, grouped: dict[str, list[AutomationCommand]]) -> None:
         """Retire absent or failed bundles and publish commands to each remaining broker runtime."""

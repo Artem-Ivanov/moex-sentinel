@@ -60,6 +60,15 @@ async def settle():
         await asyncio.sleep(0)
 
 
+async def pump_until(predicate):
+    """Advance cooperative tasks without assuming a wall-clock scheduling budget."""
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("Expected source acknowledgement did not arrive")
+
+
 async def ready(source):
     await source.queue.put(
         StreamOrderBook("AAA", (OrderBookLevel(Decimal("10"), 2),), (OrderBookLevel(Decimal("11"), 2),), NOW, True)
@@ -768,16 +777,31 @@ def test_history_retry_budget_survives_stream_reconnects_with_a_healthy_peer():
 
 @pytest.mark.parametrize("fresh_peer", [True, False])
 def test_only_fresh_source_data_prevents_quiet_reconnect(fresh_peer):
+    class AcknowledgedSource(Source):
+        def __init__(self):
+            super().__init__()
+            self.consumed = asyncio.Queue()
+
+        async def events(self):
+            async for item in super().events():
+                yield item
+                self.consumed.put_nowait(item)
+
     async def run():
-        source = Source()
+        source = AcknowledgedSource()
+        loop = asyncio.get_running_loop()
+        real_time, clock = loop.time, [0.0]
         gateway = MarketSnapshotGateway(
             lambda _: source,
             now=lambda: NOW,
             recovery=MarketRecoveryPolicy(retry_seconds=0.001, quiet_seconds=0.01),
         )
+        loop.time = lambda: clock[0]
         try:
             await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB")))
+            await settle()
             for index in range(12):
+                clock[0] = index * 0.005
                 at = NOW if fresh_peer else NOW - timedelta(minutes=1)
                 await source.queue.put(
                     StreamOrderBook(
@@ -788,9 +812,43 @@ def test_only_fresh_source_data_prevents_quiet_reconnect(fresh_peer):
                         True,
                     )
                 )
-                await asyncio.sleep(0.003)
+                await pump_until(lambda: not source.consumed.empty())
+                source.consumed.get_nowait()
+                await settle()
             assert (source.starts == 1) if fresh_peer else (source.starts >= 2)
         finally:
+            loop.time = real_time
+            await gateway.close()
+
+    asyncio.run(run())
+
+
+def test_fresh_source_reconnects_at_exact_quiet_deadline():
+    async def run():
+        source = Source()
+        loop = asyncio.get_running_loop()
+        real_time, clock = loop.time, [0.0]
+        gateway = MarketSnapshotGateway(
+            lambda _: source,
+            now=lambda: NOW,
+            recovery=MarketRecoveryPolicy(retry_seconds=0.001, quiet_seconds=0.01),
+        )
+        loop.time = lambda: clock[0]
+        try:
+            await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",)))
+            await ready(source)
+            clock[0] = 0.009
+            await settle()
+            assert source.starts == 1
+            clock[0] = 0.01
+            await settle()
+            # The watchdog has detected quietness at equality; retry remains due.
+            assert source.closes == 1
+            assert source.starts == 1
+            clock[0] = 0.012
+            await pump_until(lambda: source.starts == 2)
+        finally:
+            loop.time = real_time
             await gateway.close()
 
     asyncio.run(run())
@@ -890,8 +948,10 @@ def test_hanging_operations_are_cancelled_before_reconnect_or_shutdown(operation
         def __init__(self):
             super().__init__()
             self.cancelled = asyncio.Event()
+            self.entered = asyncio.Event()
 
         async def hang(self):
+            self.entered.set()
             try:
                 await asyncio.Event().wait()
             finally:
@@ -919,6 +979,8 @@ def test_hanging_operations_are_cancelled_before_reconnect_or_shutdown(operation
 
     async def run():
         source = HangingSource()
+        loop = asyncio.get_running_loop()
+        real_time, clock = loop.time, [0.0]
         gateway = MarketSnapshotGateway(
             lambda _: source,
             now=lambda: NOW,
@@ -926,16 +988,26 @@ def test_hanging_operations_are_cancelled_before_reconnect_or_shutdown(operation
                 retry_seconds=0.001, operation_timeout_seconds=0.005, close_timeout_seconds=0.005
             ),
         )
+        close_task = None
+        loop.time = lambda: clock[0]
         try:
             request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
             await gateway.snapshot(request)
             await ready(source)
             if operation == "close":
-                await asyncio.wait_for(gateway.close(), 0.2)
-            else:
-                await asyncio.wait_for(source.cancelled.wait(), 0.2)
+                close_task = asyncio.create_task(gateway.close())
+            await pump_until(source.entered.is_set)
+            # Pass the actual operation deadline, remaining below the owner deadline.
+            clock[0] = 0.006
+            await pump_until(source.cancelled.is_set)
+            if close_task is not None:
+                await pump_until(close_task.done)
+                await close_task
             assert source.cancelled.is_set()
         finally:
+            loop.time = real_time
+            if close_task is not None and not close_task.done():
+                await close_task
             await gateway.close()
 
     asyncio.run(run())

@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Callable, Coroutine
 from decimal import Decimal
+from functools import partial
 from typing import Any, Protocol
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
@@ -24,6 +25,7 @@ from moex_sentinel.domain.portfolio import (
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
 from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.sync_execution import run_sync
 
 AdapterFactory = Callable[[Broker], PortfolioPort]
 
@@ -73,10 +75,14 @@ class PortfolioAggregationService:
         return self._accounts_view(await self._for_enabled_brokers(self._read_accounts))
 
     async def view_broker_accounts(self, broker_id: str) -> BrokerAccountsView:
+        broker = await run_sync(partial(self._account_broker, broker_id))
+        return self._accounts_view((await self._read_accounts(broker),))
+
+    def _account_broker(self, broker_id: str) -> Broker:
         broker = self._brokers.get(broker_id)
         if broker.is_test is not self._active_test():
             raise EnvironmentMismatchError("Broker belongs to inactive environment.")
-        return self._accounts_view((await self._read_accounts(broker),))
+        return broker
 
     def _accounts_view(
         self,
@@ -119,16 +125,7 @@ class PortfolioAggregationService:
         limit: int,
     ) -> BrokerOperationsView:
         """Resolve a broker-scoped internal catalog ID before reading executed position trades."""
-        broker = self._brokers.get(broker_id)
-        if not broker.enabled:
-            raise ValueError("Подключение брокера отключено.")
-        if broker.is_test is not self._active_test():
-            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
-        if self._instruments is None:
-            raise ValueError("Position operations require an instrument catalog.")
-        if broker.account_id and account_id != broker.account_id:
-            raise ValueError("Broker account does not match selected scope.")
-        instrument = self._instruments.get(broker_id, instrument_id)
+        broker, instrument = await run_sync(partial(self._position_scope, broker_id, account_id, instrument_id))
         try:
             page = await self._adapter_factory(broker).get_operations(
                 account_id, None, limit, instrument.external_instrument_id
@@ -145,13 +142,29 @@ class PortfolioAggregationService:
             (),
         )
 
+    def _position_scope(self, broker_id: str, account_id: str, instrument_id: str):
+        broker = self._brokers.get(broker_id)
+        if not broker.enabled:
+            raise ValueError("Подключение брокера отключено.")
+        if broker.is_test is not self._active_test():
+            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        if self._instruments is None:
+            raise ValueError("Position operations require an instrument catalog.")
+        if broker.account_id and account_id != broker.account_id:
+            raise ValueError("Broker account does not match selected scope.")
+        instrument = self._instruments.get(broker_id, instrument_id)
+        return broker, instrument
+
     async def _for_enabled_brokers(
         self,
         reader: Callable[[Broker], Coroutine[Any, Any, tuple[tuple[Any, ...], tuple[BrokerReadError, ...]]]],
     ) -> tuple[tuple[tuple[Any, ...], tuple[BrokerReadError, ...]], ...]:
-        active_test = self._active_test()
-        brokers = tuple(broker for broker in self._brokers.list() if broker.enabled and broker.is_test is active_test)
+        brokers = await run_sync(self._enabled_brokers)
         return tuple(await asyncio.gather(*(reader(broker) for broker in brokers)))
+
+    def _enabled_brokers(self) -> tuple[Broker, ...]:
+        active_test = self._active_test()
+        return tuple(broker for broker in self._brokers.list() if broker.enabled and broker.is_test is active_test)
 
     def _active_test(self) -> bool:
         return self._environment is None or self._environment.view().active_environment == "TEST"
@@ -238,18 +251,17 @@ class PortfolioAggregationService:
                 continue
             try:
                 page = await adapter.get_operations(account.account_id, None, limit)
-                items.extend(
-                    BrokerOperation(
-                        broker.id,
-                        broker.display_name,
-                        self._with_ticker(broker.id, item, instruments),
-                    )
-                    for item in page.items
-                    if item.operation_type not in NON_TRADING_OPERATION_TYPES
-                )
+                items.extend(await run_sync(partial(self._operation_items, broker, page.items, instruments)))
             except TInvestAdapterError as error:
                 errors.append(self._error(broker, account.account_id, error))
         return tuple(items), tuple(errors)
+
+    def _operation_items(self, broker, operations, instruments):
+        return tuple(
+            BrokerOperation(broker.id, broker.display_name, self._with_ticker(broker.id, item, instruments))
+            for item in operations
+            if item.operation_type not in NON_TRADING_OPERATION_TYPES
+        )
 
     def _with_ticker(
         self,

@@ -11,6 +11,7 @@ export interface Automation {
   revision: number
   last_sequence_number: number
   resume_requested: boolean
+  bootstrap_pending?: boolean
   currency: string
   strategy_code: string
   strategy_version: string

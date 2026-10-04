@@ -5,10 +5,12 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Protocol
 from uuid import UUID, uuid4, uuid5
 
 from moex_sentinel.services.market_recovery import MarketRecoveryPolicy, MarketSourceOperations
+from moex_sentinel.services.sync_execution import run_sync
 from sentinel_contracts.analytics import MarketSnapshotRequest, MarketSourceInstrument, MarketSourceSnapshot
 from sentinel_contracts.market_quality import valid_market_structure
 from sentinel_contracts.streaming_market import (
@@ -388,7 +390,9 @@ class MarketSnapshotGateway:
                 configuration = (
                     request.source_id
                     if self._configuration_resolver is None
-                    else await asyncio.to_thread(self._configuration_resolver, request.source_id)
+                    else await run_sync(
+                        partial(self._configuration_resolver, request.source_id), fallback=asyncio.to_thread
+                    )
                 )
             except Exception:
                 if runtime is not None:
@@ -402,7 +406,7 @@ class MarketSnapshotGateway:
                 self._configurations.pop(request.source_id)
                 runtime = None
             if runtime is None:
-                source = await asyncio.to_thread(self._source_factory, configuration)
+                source = await run_sync(partial(self._source_factory, configuration), fallback=asyncio.to_thread)
                 runtime = _SourceRuntime(source, self._now, self._recovery, self._refresh)
                 self._sources[request.source_id] = runtime
                 self._configurations[request.source_id] = configuration

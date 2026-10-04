@@ -10,6 +10,18 @@ const snapshot = {
   awaiting_observations: ["worker", "broker", "analytics", "market", "outbox", "portfolio", "strategy"],
 }
 
+const worker = {
+  observation: "OBSERVED" as const, status: "DEGRADED" as const, reason: "OUTBOX_BLOCKED" as const,
+  instance_id: "123e4567-e89b-12d3-a456-426614174000", received_at: "2026-10-03T09:00:00.000Z", age_ms: 123,
+  completed_iterations: 4, last_completed_at: "2026-10-03T08:58:00.000Z", completion_age_ms: 120123,
+  last_finished_at: "2026-10-03T08:59:00.000Z", last_result: "OUTBOX_BLOCKED" as const, error_code: null,
+  outbox: {
+    observation: "OBSERVED" as const, status: "DEGRADED" as const, reason: "OLD_PENDING" as const,
+    pending_count: 2, failed_count: 1, oldest_pending_at: "2026-10-03T08:30:00.000Z",
+    oldest_pending_age_ms: 1800123, max_retry_count: 5,
+  },
+}
+
 function deferred() {
   let resolve!: (response: Response) => void
   let reject!: (error: unknown) => void
@@ -77,6 +89,94 @@ it("does not display an UNKNOWN observation version as current", async () => {
   await screen.findByText("Версия Worker: UNKNOWN")
   expect(screen.getByText("Версия Analytics: UNKNOWN")).toBeTruthy()
   expect(screen.queryByText("Версия Worker: 9.8.7")).toBeNull()
+})
+
+it("shows Worker control progress and detailed outbox status separately from service version", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...snapshot, service_versions: { worker: { observation: "OBSERVED", version: "1.4.2", received_at: "2026-10-03T09:00:00.000Z", age_ms: 123, reason: "OBSERVED" } }, worker,
+  })))
+  render(DiagnosticsView)
+  await screen.findByText("Общий статус: UNKNOWN")
+  expect(screen.getByRole("article", { name: "Цикл управления Worker" })).toBeTruthy()
+  expect(screen.getByText("Состояние управления: DEGRADED" )).toBeTruthy()
+  expect(screen.getByText("Причина: Очередь событий заблокирована" )).toBeTruthy()
+  expect(screen.getByText("Завершено циклов управления: 4" )).toBeTruthy()
+  expect(screen.getByText("Последний результат: Заблокирован очередью событий" )).toBeTruthy()
+  expect(screen.getByText("Версия Worker: 1.4.2")).toBeTruthy()
+  expect(screen.getByText("Состояние доставки: DEGRADED")).toBeTruthy()
+  expect(screen.getByText("Причина: Есть устаревшие события в очереди")).toBeTruthy()
+  expect(screen.getByText("Ожидают доставки: 2")).toBeTruthy()
+  expect(screen.getByText("Ошибки доставки: 1")).toBeTruthy()
+  expect(screen.getByText("Максимум повторов: 5")).toBeTruthy()
+  expect(screen.getByText("Возраст последнего цикла: 120.1 с")).toBeTruthy()
+  expect(screen.getByText("Возраст старейшего события: 1800.1 с")).toBeTruthy()
+  expect(screen.getByText("2026-10-03T08:30:00.000Z").getAttribute("datetime")).toBe("2026-10-03T08:30:00.000Z")
+  expect(screen.queryByText("Общий статус: OK")).toBeNull()
+})
+
+it("shows unavailable Worker and outbox readings as dashes while preserving observed zero", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...snapshot,
+    worker: {
+      observation: "UNKNOWN", status: "UNKNOWN", reason: "STALE", instance_id: null, received_at: null,
+      age_ms: 3600000, completed_iterations: 8, last_completed_at: "2026-10-03T08:00:00.000Z", completion_age_ms: 3600000,
+      last_finished_at: "2026-10-03T08:00:00.000Z", last_result: "COMPLETED", error_code: null,
+      outbox: { observation: "UNKNOWN", status: "UNKNOWN", reason: "READ_FAILED", pending_count: 9, failed_count: 3, oldest_pending_at: "2026-10-03T08:00:00.000Z", oldest_pending_age_ms: 3600000, max_retry_count: 6 },
+    },
+  })))
+  render(DiagnosticsView)
+  await screen.findByText("Причина: Наблюдение Worker устарело")
+  expect(screen.getByText("Завершено циклов управления: —")).toBeTruthy()
+  expect(screen.getByText("Возраст снимка Worker: —")).toBeTruthy()
+  expect(screen.getByText(/Последнее наблюдение Worker \(UTC\):/).textContent).toContain("—")
+  expect(screen.getByText("Последний результат: —")).toBeTruthy()
+  expect(screen.getByText("Состояние доставки: UNKNOWN")).toBeTruthy()
+  expect(screen.getByText("Причина: Не удалось прочитать очередь событий")).toBeTruthy()
+  expect(screen.getByText("Ожидают доставки: —")).toBeTruthy()
+  expect(screen.getByText("Ошибки доставки: —")).toBeTruthy()
+  expect(screen.getByText("Максимум повторов: —")).toBeTruthy()
+})
+
+it.each([
+  { reason: "ITERATION_FAILED", result: "ERROR", error_code: "ITERATION_FAILED", reasonLabel: "Цикл завершился ошибкой" },
+  { reason: "CONTROL_STALLED", result: "ERROR", error_code: null, reasonLabel: "Цикл управления не завершился" },
+ ])("distinguishes Worker failure state $reason", async ({ reason, result, error_code, reasonLabel }) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...snapshot, worker: { ...worker, reason, status: "DEGRADED", last_result: result, error_code },
+  })))
+  render(DiagnosticsView)
+  await screen.findByText(`Причина: ${reasonLabel}`)
+  expect(screen.getByText("Последний результат: Завершился ошибкой")).toBeTruthy()
+})
+
+it.each(["CLEAR", "PENDING", "FAILED", "OLD_PENDING"] as const)("shows actual zero counts for an observed %s outbox", async (reason) => {
+  const counts = {
+    CLEAR: { pending_count: 0, failed_count: 0, oldest_pending_at: null, oldest_pending_age_ms: null, max_retry_count: null },
+    PENDING: { pending_count: 2, failed_count: 0, oldest_pending_at: "2026-10-03T08:58:00.000Z", oldest_pending_age_ms: 120000, max_retry_count: 1 },
+    FAILED: { pending_count: 0, failed_count: 1, oldest_pending_at: null, oldest_pending_age_ms: null, max_retry_count: null },
+    OLD_PENDING: { pending_count: 3, failed_count: 0, oldest_pending_at: "2026-10-03T08:30:00.000Z", oldest_pending_age_ms: 1800000, max_retry_count: 5 },
+  }[reason]
+  const reasonLabels = { CLEAR: "Очередь пуста", PENDING: "Есть события, ожидающие доставки", FAILED: "Есть события с ошибкой доставки", OLD_PENDING: "Есть устаревшие события в очереди" }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...snapshot, worker: { ...worker, outbox: { ...worker.outbox, reason, status: reason === "CLEAR" ? "OK" : "DEGRADED", ...counts } },
+  })))
+  render(DiagnosticsView)
+  await screen.findByText(`Причина: ${reasonLabels[reason]}`)
+  expect(screen.getByText(`Ожидают доставки: ${counts.pending_count}`)).toBeTruthy()
+  expect(screen.getByText(`Ошибки доставки: ${counts.failed_count}`)).toBeTruthy()
+})
+
+it("supports older payloads without Worker diagnostics and clears them on failed refresh", async () => {
+  const pending = deferred()
+  const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(snapshot)).mockReturnValueOnce(pending.promise)
+  vi.stubGlobal("fetch", fetchMock)
+  render(DiagnosticsView)
+  await screen.findByText("Наблюдение Worker отсутствует в этом ответе")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  pending.reject(new Error("private"))
+  await screen.findByRole("alert")
+  expect(screen.queryByRole("article", { name: "Цикл управления Worker" })).toBeNull()
+  expect(screen.queryByText("Общий статус: UNKNOWN")).toBeNull()
 })
 
 it("shows its own version during a diagnostics API failure", async () => {

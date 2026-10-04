@@ -4,7 +4,16 @@
 
 Текущая версия исходного кода backend и frontend — `0.2.0`. Она описывает
 подготовленный выпуск; версия установленного на VPS экземпляра проверяется отдельно.
-V1 локально DONE / NOT_DEPLOYED; итоговая независимая приёмка PASS. [Постановка и задачи](superpowers/plans/v1-service-versions.md).
+V1 локальная приёмка исходников DONE; итоговая независимая приёмка PASS. Отдельный
+deployment receipt записан ниже. [Постановка и задачи](superpowers/plans/v1-service-versions.md).
+
+Последний подтверждённый deploy: commit `be84ed4f047734ccacfba9b6ccb531af51ba4b94`,
+release `vps-20261003-be84ed4`, 03.10.2026 17:14 UTC; evidence
+`develop/reports/vps-release-20261003/root-native-receipts.json` и отдельный post-deploy
+HTTPS verification PASS. Observed Core versions TEST/PROD `0.2.0`, TEST Worker/Analytics
+`0.2.0`; PROD Worker UNKNOWN, Analytics NOT_CONFIGURED. VPS schema
+`0003_user_broker_archive`; source Alembic head — `0003_user_broker_archive`. UNKNOWN и
+наблюдаемая версия не показывают торговую готовность.
 
 Python-сервисы Core, Worker, Analytics и сборщик портфеля выпускаются с общей
 версией backend. Согласованно обновляются `project.version` в `pyproject.toml`,
@@ -24,7 +33,7 @@ Frontend имеет собственную версию в `frontend/package.jso
 даже при ошибке API. Core сообщает свою версию в health и diagnostics. Worker
 передаёт version/instance/контур/режим через существующий heartbeat: Core хранит
 один volatile observation, без таблиц и истории; при возрасте >=30 секунд или
-после restart Core версия UNKNOWN. Legacy heartbeat без metadata получает прежний
+после restart Core версия UNKNOWN. Heartbeat без metadata получает прежний
 ACK. Scope mismatch, старые/повторные и недопустимые будущие наблюдения не продлевают TTL.
 Это информация о версии; она не подтверждает работу стратегии или торговую готовность.
 
@@ -33,7 +42,12 @@ captured `ANALYTICS_URL`: TEST Compose задаёт внутренний адр�
 явно пустой URL и UNKNOWN. Проверка ограничена одной секундой и телом4KiB,
 без broker RPC, credentials, proxy environment и redirects. Ошибки дают UNKNOWN.
 В UI Core/Worker/Analytics показаны отдельно; отсутствующие или устаревшие версии
-не заменяются версией Core. Торговые observations O1 остаются неизвестными.
+не заменяются версией Core. В локальном O1.2 добавлены цикл управления Worker и
+очередь доставки событий: версия, успешный цикл и торговая готовность различаются.
+Порог устаревания наблюдения30s; ошибка/заблокированная доставка/нет прогресса
+дают DEGRADED, неполученное или устаревшее наблюдение — UNKNOWN. Outbox failed>0
+или oldest pending>=60s дают DEGRADED. Broker/market/portfolio/strategy observations
+остаются неизвестными. O1.2 ещё не развёрнут; новый Core обновляется раньше Worker.
 
 Проверка перед выпуском:
 
@@ -91,7 +105,7 @@ docker compose -f compose.yml --profile migrations run --build --rm migrations
 docker compose -f compose.yml up --build
 ```
 
-Имена persistent volumes задаются явно через `POSTGRES_VOLUME_NAME` и `AUTOMATON_VOLUME_NAME`. Команда `moex-migrate-schema` применяет Alembic `head`, сейчас `0002_portfolio_snapshot_runs`, поверх `0001_baseline`; приложение само схему не меняет. На существующей baseline-БД миграция заменяет старую таблицу снимков только при отсутствии строк. Торговые таблицы и volumes сохраняются.
+Имена persistent volumes задаются явно через `POSTGRES_VOLUME_NAME` и `AUTOMATON_VOLUME_NAME`. Команда `moex-migrate-schema` применяет Alembic `head`, сейчас `0003_user_broker_archive`, поверх `0001_baseline`; приложение само схему не меняет. Миграция `0002_portfolio_snapshot_runs` проверяет, что старая `portfolio_snapshots` пуста, затем удаляет и создаёт таблицы заново; непустые данные требуют явного отдельного переноса. Миграция `0003_user_broker_archive` добавляет nullable archive metadata к broker records; она не удаляет финансовую историю. Существующие правила старта приложения сохраняются; `0003` не заменяет и не повторяет поведение `0002`. Торговые таблицы и volumes сохраняются.
 
 `portfolio-snapshot-worker` запускается отдельным Compose-сервисом вместе с основным стеком. Он использует только Core PostgreSQL, не зависит от backend и не подключается к SQLite торгового Worker. Интервал задаётся `PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS` и по умолчанию равен `60` секундам. Состояние можно проверить без изменения данных:
 

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from moex_sentinel.api.app import create_app
+from tests.services.test_runtime_versions import progress
 from trading_automaton.adapters.core_client import CoreClient
 
 
@@ -90,3 +91,30 @@ def test_actual_worker_client_to_core_diagnostics_preserves_distinct_version(tmp
         assert payload["service_versions"]["worker"]["version"] == "5.6.7"
         assert payload["core"]["version"] == "0.2.0"
         assert payload["status"] == "UNKNOWN"
+
+
+def test_worker_diagnostics_requires_identity_and_roundtrips_in_existing_heartbeat(tmp_path):
+    now = datetime.now(UTC)
+    payload = {
+        "worker_id": "worker",
+        "occurred_at": now.isoformat(),
+        "worker_diagnostics": progress(completed=now, finished=now).model_dump(mode="json"),
+    }
+    with TestClient(
+        create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path/'diagnostics-worker.db'}")
+    ) as client:
+        assert client.post("/internal/automaton/heartbeats", json=payload).status_code == 422
+        payload["runtime_version"] = {
+            "version": "1.2.3",
+            "instance_id": str(uuid4()),
+            "environment": "TEST",
+            "access_mode": "READ_ONLY",
+        }
+        response = client.post("/internal/automaton/heartbeats", json=payload)
+        assert response.status_code == 200
+        assert set(response.json()) == {"worker_id", "occurred_at"}
+        result = client.get("/api/diagnostics/status").json()
+        assert result["worker"]["reason"] == "CONTROL_PROGRESS"
+        assert result["worker"]["outbox"]["reason"] == "CLEAR"
+        assert result["status"] == "UNKNOWN"
+        assert result["awaiting_observations"] == ["broker", "analytics", "market", "portfolio", "strategy"]

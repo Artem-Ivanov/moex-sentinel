@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -75,12 +75,10 @@ class SynchronizeTradingRuntimeUsecase:
         self,
         *,
         replace_broker_commands: Callable[[dict[str, list[AutomationCommand]]], Awaitable[None]],
-        schedule_heartbeat: Callable[[], None],
-    ) -> None:
+    ) -> Literal["COMPLETED", "OUTBOX_BLOCKED"]:
         """Flush, claim and reconcile commands before publishing the current broker groups."""
         if not await self._flush_all():
-            schedule_heartbeat()
-            return
+            return "OUTBOX_BLOCKED"
         claimed = await asyncio.to_thread(
             self._synchronization.claim_commands,
             self._worker_id,
@@ -95,7 +93,7 @@ class SynchronizeTradingRuntimeUsecase:
                     occurred_at=self._now(),
                 )
         if not await self._flush_all():
-            return
+            return "OUTBOX_BLOCKED"
         monitored = await asyncio.to_thread(self._repository.list_monitored)
         core_states = await self._synchronize_all(monitored)
         active = await asyncio.to_thread(self._repository.list_active)
@@ -124,7 +122,7 @@ class SynchronizeTradingRuntimeUsecase:
                     command = command.model_copy(update={"state": AutomationState(core_state)})
             grouped.setdefault(str(command.broker_id), []).append(command)
         await replace_broker_commands(grouped)
-        schedule_heartbeat()
+        return "COMPLETED"
 
     async def _flush_all(self) -> bool:
         """Flush durable facts before progressing command reconciliation."""

@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from threading import Event
 from time import monotonic as system_monotonic
 from types import SimpleNamespace
 
@@ -113,9 +114,10 @@ class Core:
     def broker_connection(self, broker_id):
         return BrokerConnection(str(broker_id), "TINVEST_SANDBOX", "sandbox", "synthetic-token", True)
 
-    def heartbeat(self, worker_id, occurred_at):
+    def heartbeat(self, worker_id, occurred_at, diagnostics=None):
         self.heartbeat_value = (worker_id, occurred_at)
         self.heartbeats.append((worker_id, occurred_at))
+        self.diagnostics = diagnostics
 
 
 class Bundle:
@@ -521,3 +523,237 @@ def test_held_nonbootstrap_automation_keeps_uncertain_intent_supervision(tmp_pat
     assert bundle.commands[0][0].state is AutomationState.HOLD
     assert repository.get_active_intent(automation_id).state == "UNCERTAIN"
     engine.dispose()
+
+
+@pytest.mark.parametrize("blocked_flush", [1, 2])
+def test_each_outbox_block_sends_heartbeat_without_successful_progress(blocked_flush):
+    class Blocked(Synchronization):
+        def flush_outbox(self):
+            self.flushed += 1
+            return self.flushed != blocked_flush
+
+    async def scenario():
+        core = Core()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(Repository(), Blocked(), core, builder, worker_id="worker", now=lambda: NOW)
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert len(core.heartbeats) == 1
+    assert core.diagnostics.completed_iterations == 0
+    assert core.diagnostics.last_completed_at is None
+    assert core.diagnostics.last_result == "OUTBOX_BLOCKED"
+
+
+def test_iteration_exception_reports_safe_error_and_preserves_original_exception():
+    failure = ValueError("synthetic-secret")
+
+    class Failed(Synchronization):
+        def flush_outbox(self):
+            raise failure
+
+    async def scenario():
+        core = Core()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(Repository(), Failed(), core, builder, worker_id="worker", now=lambda: NOW)
+        with pytest.raises(ValueError, match="synthetic-secret") as caught:
+            await service.run_iteration()
+        assert caught.value is failure
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert core.diagnostics.last_result == "ERROR"
+    assert core.diagnostics.error_code == "ITERATION_FAILED"
+    assert "synthetic-secret" not in core.diagnostics.model_dump_json()
+
+
+def test_completed_control_iteration_increments_progress_and_hb_failure_is_consumed(caplog, monkeypatch):
+    # Alembic's fileConfig disables existing loggers in preceding migration tests.
+    monkeypatch.setattr(LOGGER, "disabled", False)
+
+    class FailedHeartbeat(Core):
+        def heartbeat(self, worker_id, occurred_at, diagnostics=None):
+            super().heartbeat(worker_id, occurred_at, diagnostics)
+            raise ValueError("heartbeat-secret")
+
+    async def scenario():
+        core = FailedHeartbeat()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(Repository(), Synchronization(), core, builder, worker_id="worker", now=lambda: NOW)
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        core = asyncio.run(scenario())
+    assert core.diagnostics.completed_iterations == 1
+    assert core.diagnostics.last_result == "COMPLETED"
+    assert core.diagnostics.last_completed_at == NOW
+    assert "Heartbeat delivery failed: ValueError" in caplog.text
+    assert "heartbeat-secret" not in caplog.text
+
+
+def test_cancelled_hanging_iteration_never_claims_completion():
+    async def scenario():
+        core = Core()
+        entered = asyncio.Event()
+
+        async def builder(_connection):
+            entered.set()
+            await asyncio.Event().wait()
+
+        service = build_coordinator(Repository(), Synchronization(), core, builder, worker_id="worker", now=lambda: NOW)
+        task = asyncio.create_task(service.run_iteration())
+        await entered.wait()
+        assert not core.heartbeats
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await service.close()
+        assert not core.heartbeats
+
+    asyncio.run(scenario())
+
+
+def test_outbox_read_failure_preserves_control_heartbeat_and_interval_bounds():
+    samples = []
+
+    def failed_read():
+        samples.append(1)
+        raise RuntimeError("storage-secret")
+
+    async def scenario():
+        core = Core()
+        repository = Repository()
+        synchronization = Synchronization()
+        ticks = [0.0]
+
+        async def builder(_connection):
+            return Bundle()
+
+        iteration = SynchronizeTradingRuntimeUsecase(
+            repository,
+            synchronization,
+            core,
+            WorkerAutomationLifecycleService(repository),
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        service = StreamingRuntimeCoordinator(
+            iteration,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            monotonic=lambda: ticks[0],
+            outbox_diagnostics=failed_read,
+        )
+        await service.run_iteration()
+        await service._heartbeat_task
+        ticks[0] = 1
+        await service.run_iteration()
+        assert len(samples) == 1
+        ticks[0] = 3
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert len(samples) == 2
+    assert core.diagnostics.completed_iterations == 3
+    assert core.diagnostics.outbox.observation == "UNKNOWN"
+    assert core.diagnostics.outbox.pending_count is None
+
+
+def test_slow_heartbeat_remains_single_and_close_waits_for_delivery():
+    entered, release = Event(), Event()
+
+    class SlowCore(Core):
+        def heartbeat(self, worker_id, occurred_at, diagnostics=None):
+            entered.set()
+            assert release.wait(timeout=5)
+            super().heartbeat(worker_id, occurred_at, diagnostics)
+
+    async def scenario():
+        core = SlowCore()
+        ticks = [0.0]
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(
+            Repository(),
+            Synchronization(),
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            monotonic=lambda: ticks[0],
+        )
+        try:
+            await service.run_iteration()
+            assert await asyncio.to_thread(entered.wait, 5)
+            ticks[0] = 6
+            await service.run_iteration()
+            assert not core.heartbeats
+            closing = asyncio.create_task(service.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            release.set()
+            await closing
+            assert len(core.heartbeats) == 1
+            assert core.diagnostics.completed_iterations == 1
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_iteration_after_success_does_not_send_fresh_completed_heartbeat():
+    async def scenario():
+        core, synchronization = Core(), Synchronization()
+        synchronization.claimed = True
+        entered = asyncio.Event()
+        ticks, clock = [0.0], [NOW]
+
+        async def builder(_connection):
+            entered.set()
+            await asyncio.Event().wait()
+
+        service = build_coordinator(
+            Repository(),
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: clock[0],
+            monotonic=lambda: ticks[0],
+        )
+        await service.run_iteration()
+        await service._heartbeat_task
+        synchronization.claimed = False
+        ticks[0], clock[0] = 3.0, NOW + timedelta(seconds=3)
+        task = asyncio.create_task(service.run_iteration())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await service.close()
+        assert len(core.heartbeats) == 1
+        assert core.diagnostics.completed_iterations == 1
+        assert core.diagnostics.last_completed_at == NOW
+        assert core.diagnostics.last_finished_at == NOW
+
+    asyncio.run(scenario())

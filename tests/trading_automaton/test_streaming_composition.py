@@ -2,14 +2,19 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import httpx
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from moex_sentinel.api.app import create_app
+from moex_sentinel.storage.models import Base as CoreBase
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerPosition
 from tests.trading_automaton.services.test_broker_tick_preparation_service import bootstrap_market
 from tests.trading_automaton.services.test_streaming_runtime_coordinator_service import bootstrap_command
 from trading_automaton import composition
+from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.composition import BrokerRuntimeBundle, build_broker_runtime, build_streaming_runtime
 from trading_automaton.config import AutomatonSettings, StrategySettings
 from trading_automaton.domain.dtos import CommissionQuote
@@ -246,3 +251,47 @@ def test_streaming_composition_opens_only_supplied_local_sqlite(monkeypatch, tmp
     http.close()
 
     assert opened_urls == [database_url]
+
+
+def test_composed_empty_control_iteration_delivers_actual_worker_diagnostics_to_core(tmp_path, monkeypatch):
+    application = create_app(
+        test_auth_bypass=True,
+        database_url=f"sqlite:///{tmp_path/'core-diagnostics.db'}",
+        schema_checker=lambda _engine: True,
+    )
+    with TestClient(application) as client:
+        CoreBase.metadata.create_all(application.state.database_engine)
+
+        def forward(request):
+            response = client.request(
+                request.method, request.url.path, content=request.content, headers={"content-type": "application/json"}
+            )
+            return httpx.Response(response.status_code, content=response.content)
+
+        with httpx.Client(base_url="http://core", transport=httpx.MockTransport(forward)) as forwarding:
+            core = CoreClient(forwarding, application_environment="TEST", access_mode="READ_ONLY")
+            monkeypatch.setattr(composition, "CoreClient", lambda *_args, **_kwargs: core)
+            runtime, repository, http = build_streaming_runtime(
+                AutomatonSettings(
+                    CORE_URL="http://core.invalid",
+                    AUTOMATON_DATABASE_URL=f"sqlite:///{tmp_path/'worker-diagnostics.db'}",
+                ),
+                StrategySettings(),
+            )
+
+            async def scenario():
+                try:
+                    await runtime.run_iteration()
+                finally:
+                    await runtime.close()
+
+            try:
+                asyncio.run(scenario())
+                snapshot = client.get("/api/diagnostics/status").json()
+                assert snapshot["worker"]["completed_iterations"] == 1
+                assert snapshot["worker"]["reason"] == "CONTROL_PROGRESS"
+                assert snapshot["worker"]["outbox"]["reason"] == "CLEAR"
+                assert snapshot["status"] == "UNKNOWN"
+                assert repository.outbox_diagnostics().pending_count == 0
+            finally:
+                http.close()

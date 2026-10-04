@@ -9,7 +9,7 @@ from threading import Lock
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import and_, delete, exists, func, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, update
 from sqlalchemy.engine import Row
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -47,6 +47,7 @@ from sentinel_contracts.trading_facts import (
     TradeDecisionRecordedPayload,
     TradeExecutionRecordedPayload,
 )
+from sentinel_contracts.worker_diagnostics import OutboxDiagnostics
 from trading_automaton.domain.position_valuation import lot_position_snapshot
 from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfile,
@@ -355,9 +356,27 @@ class LocalAutomationRepository:
                 if ledger_already_applied:
                     self._validate_preapplied_execution(session, intent)
                 elif intent.side == "BUY":
-                    self._create_trade_lot_in_session(session, intent, finalization)
+                    self._create_trade_lot_in_session(
+                        session,
+                        automation_id=intent.automation_id,
+                        source_intent_id=intent.idempotency_key,
+                        source="EXECUTED",
+                        quantity_lots=finalization.executed_lots,
+                        entry_price=finalization.executed_price,
+                        entry_commission=finalization.executed_commission,
+                        opened_at=finalization.executed_at or finalization.occurred_at,
+                    )
                 elif intent.side == "SELL":
-                    self._allocate_sell_lifo_in_session(session, intent, finalization)
+                    self._allocate_sell_lifo_in_session(
+                        session,
+                        automation_id=intent.automation_id,
+                        sell_intent_id=intent.idempotency_key,
+                        quantity_lots=finalization.executed_lots,
+                        exit_price=finalization.executed_price,
+                        exit_commission=finalization.executed_commission,
+                        closed_at=finalization.executed_at or finalization.occurred_at,
+                        lot_size=finalization.lot_size,
+                    )
                 self._finalize_trading_cycle(session, intent, finalization)
                 snapshot = self._authoritative_position_snapshot(
                     session,
@@ -686,72 +705,79 @@ class LocalAutomationRepository:
     @staticmethod
     def _create_trade_lot_in_session(
         session: Session,
-        intent: LocalIntentModel,
-        finalization: ExecutionFinalization,
-    ) -> None:
-        existing = session.scalar(select(TradeLotModel).where(TradeLotModel.source_intent_id == intent.idempotency_key))
-        if existing is not None:
-            return
-        session.add(
-            TradeLotModel(
-                id=str(uuid4()),
-                automation_id=intent.automation_id,
-                source_intent_id=intent.idempotency_key,
-                source="EXECUTED",
-                original_lots=finalization.executed_lots,
-                remaining_lots=finalization.executed_lots,
-                entry_price=finalization.executed_price,
-                entry_commission=finalization.executed_commission,
-                opened_at=finalization.executed_at or finalization.occurred_at,
-            )
+        *,
+        automation_id: str,
+        source_intent_id: str | None,
+        source: str,
+        quantity_lots: int,
+        entry_price: Decimal,
+        entry_commission: Decimal,
+        opened_at: datetime,
+    ) -> TradeLotModel:
+        if source_intent_id is not None:
+            existing = session.scalar(select(TradeLotModel).where(TradeLotModel.source_intent_id == source_intent_id))
+            if existing is not None:
+                return existing
+        model = TradeLotModel(
+            id=str(uuid4()),
+            automation_id=automation_id,
+            source_intent_id=source_intent_id,
+            source=source,
+            original_lots=quantity_lots,
+            remaining_lots=quantity_lots,
+            entry_price=entry_price,
+            entry_commission=entry_commission,
+            opened_at=opened_at,
         )
+        session.add(model)
+        return model
 
     @staticmethod
     def _allocate_sell_lifo_in_session(
         session: Session,
-        intent: LocalIntentModel,
-        finalization: ExecutionFinalization,
+        *,
+        automation_id: str,
+        sell_intent_id: str,
+        quantity_lots: int,
+        exit_price: Decimal,
+        exit_commission: Decimal,
+        closed_at: datetime,
+        lot_size: int,
     ) -> None:
         existing = session.scalar(
-            select(LotAllocationModel).where(LotAllocationModel.sell_intent_id == intent.idempotency_key).limit(1)
+            select(LotAllocationModel).where(LotAllocationModel.sell_intent_id == sell_intent_id).limit(1)
         )
         if existing is not None:
             return
         lots = session.scalars(
             select(TradeLotModel)
             .where(
-                TradeLotModel.automation_id == intent.automation_id,
+                TradeLotModel.automation_id == automation_id,
                 TradeLotModel.remaining_lots > 0,
             )
             .order_by(TradeLotModel.opened_at.desc(), TradeLotModel.id.desc())
         ).all()
-        if sum(row.remaining_lots for row in lots) < finalization.executed_lots:
+        if sum(row.remaining_lots for row in lots) < quantity_lots:
             raise ValueError("Sell execution exceeds the worker lot ledger.")
-        remaining = finalization.executed_lots
+        remaining = quantity_lots
         for lot in lots:
             if remaining == 0:
                 break
             allocated = min(remaining, lot.remaining_lots)
-            exit_commission = (
-                finalization.executed_commission * Decimal(allocated) / Decimal(finalization.executed_lots)
-            )
+            commission = exit_commission * Decimal(allocated) / Decimal(quantity_lots)
             entry_commission = lot.entry_commission * Decimal(allocated) / Decimal(lot.original_lots)
-            realized_pnl = (
-                (finalization.executed_price - lot.entry_price) * finalization.lot_size * allocated
-                - entry_commission
-                - exit_commission
-            )
+            pnl = (exit_price - lot.entry_price) * lot_size * allocated - entry_commission - commission
             session.add(
                 LotAllocationModel(
                     id=str(uuid4()),
-                    automation_id=intent.automation_id,
-                    sell_intent_id=intent.idempotency_key,
+                    automation_id=automation_id,
+                    sell_intent_id=sell_intent_id,
                     lot_id=lot.id,
                     quantity_lots=allocated,
-                    exit_price=finalization.executed_price,
-                    exit_commission=exit_commission,
-                    realized_pnl=realized_pnl,
-                    closed_at=finalization.executed_at or finalization.occurred_at,
+                    exit_price=exit_price,
+                    exit_commission=commission,
+                    realized_pnl=pnl,
+                    closed_at=closed_at,
                 )
             )
             lot.remaining_lots -= allocated
@@ -1398,6 +1424,28 @@ class LocalAutomationRepository:
             and payloads[quartet[3].event_id]["state"] == AutomationState.IN_WORK.value
         )
 
+    def outbox_diagnostics(self) -> OutboxDiagnostics:
+        """Read only scalar queue aggregates, without loading facts or taking writer locks."""
+        pending = FactOutboxModel.delivery_state == "PENDING"
+        failed = FactOutboxModel.delivery_state == "FAILED"
+        with self._factory() as session:
+            counts = session.execute(
+                select(
+                    func.count(case((pending, 1))),
+                    func.count(case((failed, 1))),
+                    func.min(case((pending, FactOutboxModel.created_at))),
+                    func.max(case((pending, FactOutboxModel.retry_count))),
+                )
+            ).one()
+        return OutboxDiagnostics(
+            observation="OBSERVED",
+            reason="OBSERVED",
+            pending_count=counts[0],
+            failed_count=counts[1],
+            oldest_pending_at=counts[2],
+            max_retry_count=counts[3],
+        )
+
     def has_pending_fact_outbox(self, automation_id: str) -> bool:
         with self._factory() as session:
             return (
@@ -1957,26 +2005,18 @@ class LocalAutomationRepository:
         opened_at: datetime,
     ) -> TradeLotRecord:
         with self._factory.begin() as session:
-            if source_intent_id is not None:
-                existing = session.scalar(
-                    select(TradeLotModel).where(TradeLotModel.source_intent_id == source_intent_id)
-                )
-                if existing is not None:
-                    intent = session.get(LocalIntentModel, source_intent_id)
-                    return self._lot_record(existing, None if intent is None else intent.kind)
-            model = TradeLotModel(
-                id=str(uuid4()),
+            model = self._create_trade_lot_in_session(
+                session,
                 automation_id=automation_id,
                 source_intent_id=source_intent_id,
                 source=source,
-                original_lots=quantity_lots,
-                remaining_lots=quantity_lots,
+                quantity_lots=quantity_lots,
                 entry_price=entry_price,
                 entry_commission=entry_commission,
                 opened_at=opened_at,
             )
-            session.add(model)
-            session.flush()
+            if model in session.new:
+                session.flush()
             intent_kind = None
             if source_intent_id is not None:
                 intent = session.get(LocalIntentModel, source_intent_id)
@@ -2020,44 +2060,16 @@ class LocalAutomationRepository:
         lot_size: int,
     ) -> None:
         with self._factory.begin() as session:
-            existing = session.scalar(
-                select(LotAllocationModel).where(LotAllocationModel.sell_intent_id == sell_intent_id).limit(1)
+            self._allocate_sell_lifo_in_session(
+                session,
+                automation_id=automation_id,
+                sell_intent_id=sell_intent_id,
+                quantity_lots=quantity_lots,
+                exit_price=exit_price,
+                exit_commission=exit_commission,
+                closed_at=closed_at,
+                lot_size=lot_size,
             )
-            if existing is not None:
-                return
-            lots = session.scalars(
-                select(TradeLotModel)
-                .where(
-                    TradeLotModel.automation_id == automation_id,
-                    TradeLotModel.remaining_lots > 0,
-                )
-                .order_by(TradeLotModel.opened_at.desc(), TradeLotModel.id.desc())
-            ).all()
-            if sum(row.remaining_lots for row in lots) < quantity_lots:
-                raise ValueError("Sell execution exceeds the worker lot ledger.")
-            remaining = quantity_lots
-            for lot in lots:
-                if remaining == 0:
-                    break
-                allocated = min(remaining, lot.remaining_lots)
-                commission = exit_commission * Decimal(allocated) / Decimal(quantity_lots)
-                entry_commission = lot.entry_commission * Decimal(allocated) / Decimal(lot.original_lots)
-                pnl = (exit_price - lot.entry_price) * lot_size * allocated - entry_commission - commission
-                session.add(
-                    LotAllocationModel(
-                        id=str(uuid4()),
-                        automation_id=automation_id,
-                        sell_intent_id=sell_intent_id,
-                        lot_id=lot.id,
-                        quantity_lots=allocated,
-                        exit_price=exit_price,
-                        exit_commission=commission,
-                        realized_pnl=pnl,
-                        closed_at=closed_at,
-                    )
-                )
-                lot.remaining_lots -= allocated
-                remaining -= allocated
 
     def get_position_cycle_id(self, automation_id: str) -> str | None:
         """Read the current financial cycle identity without creating state."""

@@ -68,6 +68,7 @@ class AutomationRecord(PositionalModel):
     broker_name: str = ""
     ticker: str = ""
     instrument_name: str = ""
+    bootstrap_pending: bool = False
 
 
 class HeartbeatRecord(PositionalModel):

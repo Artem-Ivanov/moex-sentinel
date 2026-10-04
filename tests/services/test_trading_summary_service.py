@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from moex_sentinel.domain.portfolio import BrokerReadError
@@ -200,3 +201,41 @@ def test_summary_uses_one_common_run_when_account_missed_requested_boundary(
     assert period.value == Decimal("11")
     assert period.from_at == NOW - timedelta(days=2)
     assert period.complete is False
+
+
+@pytest.mark.parametrize(("environment", "budget"), [(None, 6), ("TEST", 7)])
+def test_multicurrency_summary_batches_windows_and_preserves_pnl(
+    repository: PortfolioSnapshotRepository, environment: str | None, budget: int
+) -> None:
+    error = BrokerReadError("broker-1", "Broker", "account-1", "BROKER_UNAVAILABLE", "Unavailable")
+    for days, rub, usd in ((40, "10.01", "20.02"), (0, "15.05", "28.08")):
+        append_run(
+            repository,
+            NOW - timedelta(days=days),
+            (
+                ("broker-1", "account-1", "RUB", "100.01", "25.01", rub),
+                ("broker-2", "account-2", "USD", "200.02", "50.02", usd),
+            ),
+            errors=(error,) if days == 0 else (),
+        )
+    scoped = PortfolioSnapshotRepository(repository._session, environment=environment)
+    statements: list[str] = []
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    engine = repository._session.get_bind()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = TradingSummaryService(scoped).view()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert result.errors == (error,)
+    assert tuple(value.currency for value in result.currencies) == ("RUB", "USD")
+    for summary, expected in zip(result.currencies, (Decimal("5.04"), Decimal("8.06")), strict=True):
+        assert summary.pnl_24h.value == expected
+        assert summary.pnl_7d.value == expected
+        assert summary.pnl_30d.value == expected
+    assert all(statement.lstrip().upper().startswith(("SELECT", "WITH")) for statement in statements)
+    assert len(statements) == budget

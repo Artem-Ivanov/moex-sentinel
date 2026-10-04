@@ -4,15 +4,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, event, insert, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.domain.instrument_catalog import (
     CatalogInstrumentNotFoundError,
+    UserBrokerCatalogInstrument,
     UserBrokerCatalogInstrumentDraft,
 )
 from moex_sentinel.domain.user_brokers import UserBrokerDraft, UserBrokerState
 from moex_sentinel.storage.database import create_session_factory
+from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
 from moex_sentinel.storage.repositories.reference_catalog import ReferenceCatalogRepository
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
 
@@ -130,3 +132,100 @@ def test_catalog_finds_external_instrument_only_inside_requested_scope(
     assert second_record is not None
     assert second_record.ticker == "SECOND"
     assert repository.find_by_external_instrument_id(first.id, "missing-uid") is None
+
+
+@pytest.fixture
+def large_catalog(database: tuple[Engine, sessionmaker[Session]]) -> tuple[Engine, sessionmaker[Session]]:
+    engine, factory = database
+    brokers = UserBrokerRepository(factory)
+    brokers.create(user_broker_draft("account-1"), record_id="scope-1")
+    brokers.create(user_broker_draft("account-2"), record_id="scope-2")
+    timestamp = datetime(2026, 8, 10, 10, tzinfo=UTC)
+    rows = [
+        {
+            "id": f"instrument-{index:04d}",
+            "user_broker_id": "scope-1" if index < 1201 else "scope-2",
+            "external_instrument_id": f"uid-{index}",
+            "external_identifiers": {"figi": f"figi-{index}", "nested": {"index": index}},
+            "ticker": f"T{index % 7}",
+            "name": f"Name {index % 5}",
+            "instrument_type": "SHARE",
+            "class_code": "TQBR",
+            "currency": "RUB" if index % 2 else "USD",
+            "lot_size": index % 10 + 1,
+            "min_price_increment": Decimal("0.01"),
+            "api_trade_available": index % 3 != 0,
+            "is_active": index % 4 != 0,
+            "is_selected": index % 6 == 0,
+            "first_seen_at": timestamp,
+            "last_seen_at": timestamp,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        for index in range(1208)
+    ]
+    with engine.begin() as connection:
+        connection.execute(insert(BrokerInstrumentModel.__table__), rows)
+    return engine, factory
+
+
+@pytest.mark.parametrize("include_inactive", [True, False])
+def test_catalog_list_bounds_live_orm_objects_without_changing_complete_result(
+    large_catalog: tuple[Engine, sessionmaker[Session]], include_inactive: bool
+) -> None:
+    engine, factory = large_catalog
+    table = BrokerInstrumentModel.__table__
+    statement = select(table).where(table.c.user_broker_id == "scope-1")
+    if not include_inactive:
+        statement = statement.where(table.c.is_active.is_(True))
+    statement = statement.order_by(table.c.ticker, table.c.name, table.c.id)
+    with engine.connect() as connection:
+        expected = tuple(
+            UserBrokerCatalogInstrument.model_validate(dict(row)) for row in connection.execute(statement).mappings()
+        )
+    peak_live_objects = 0
+    loaded = 0
+
+    def observe_load(session: Session, _instance: object) -> None:
+        nonlocal peak_live_objects, loaded
+        loaded += 1
+        peak_live_objects = max(peak_live_objects, len(session.identity_map))
+
+    event.listen(factory, "loaded_as_persistent", observe_load)
+    try:
+        actual = ReferenceCatalogRepository(factory).list("scope-1", include_inactive=include_inactive)
+    finally:
+        event.remove(factory, "loaded_as_persistent", observe_load)
+    assert actual == expected
+    assert loaded == len(expected) > 600
+    assert peak_live_objects <= 600
+
+
+def test_catalog_list_returns_connection_after_midstream_load_error(
+    large_catalog: tuple[Engine, sessionmaker[Session]],
+) -> None:
+    engine, factory = large_catalog
+    loaded = 0
+    returned_connections = 0
+
+    def fail_midstream(_session: Session, _instance: object) -> None:
+        nonlocal loaded
+        loaded += 1
+        if loaded == 401:
+            raise RuntimeError("synthetic load failure")
+
+    def observe_checkin(_connection: object, _record: object) -> None:
+        nonlocal returned_connections
+        returned_connections += 1
+
+    event.listen(factory, "loaded_as_persistent", fail_midstream)
+    event.listen(engine, "checkin", observe_checkin)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic load failure"):
+            ReferenceCatalogRepository(factory).list("scope-1", include_inactive=True)
+    finally:
+        event.remove(factory, "loaded_as_persistent", fail_midstream)
+        event.remove(engine, "checkin", observe_checkin)
+    assert loaded == 401
+    assert returned_connections == 1
+    assert len(ReferenceCatalogRepository(factory).list("scope-1", include_inactive=True)) == 1201

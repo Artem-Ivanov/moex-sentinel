@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Protocol
 
 from moex_sentinel.domain.instrument_catalog import (
@@ -23,6 +24,7 @@ from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle, Las
 from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.market_data_ports import MarketDataPort
+from moex_sentinel.services.sync_execution import run_sync
 
 CATEGORY_LABELS = {
     "SHARE": "Акции",
@@ -87,14 +89,17 @@ class InstrumentCatalogService:
         self._clock = clock
 
     async def synchronize(self, broker_id: str) -> CatalogReconciliationResult:
-        adapter = self._adapter(broker_id)
+        adapter = self._adapter_factory(await run_sync(partial(self._broker, broker_id)))
         try:
             external = await adapter.list_instruments()
         except Exception:
-            self._catalog.mark_failed(
-                broker_id,
-                self._clock(),
-                "Не удалось синхронизировать справочник.",  # noqa: RUF001
+            await run_sync(
+                partial(
+                    self._catalog.mark_failed,
+                    broker_id,
+                    self._clock(),
+                    "Не удалось синхронизировать справочник.",  # noqa: RUF001
+                )
             )
             raise
         unique = {
@@ -113,7 +118,7 @@ class InstrumentCatalogService:
             for item in external
             if item.instrument_id.strip() and item.ticker.strip() and item.lot > 0 and item.min_price_increment > 0
         }
-        result = self._catalog.reconcile(broker_id, tuple(unique.values()), self._clock())
+        result = await run_sync(partial(self._catalog.reconcile, broker_id, tuple(unique.values()), self._clock()))
         return CatalogReconciliationResult(
             broker_id=result.user_broker_id,
             added=result.added,
@@ -141,8 +146,7 @@ class InstrumentCatalogService:
             raise InstrumentLotPriceRangeError("Максимальная цена лота не может быть отрицательной.")
         if lot_price_from is not None and lot_price_to is not None and lot_price_from > lot_price_to:
             raise InstrumentLotPriceRangeError("Минимальная цена лота не может превышать максимальную.")
-        broker = self._broker(broker_id)
-        all_records = self._catalog.list(broker_id, include_inactive=include_inactive)
+        broker, all_records = await run_sync(partial(self._list_records, broker_id, include_inactive))
         all_items = tuple(self._instrument(item) for item in all_records)
         currencies = tuple(sorted({item.currency for item in all_items if item.currency}))
         normalized_currency = currency.strip().upper()
@@ -184,13 +188,12 @@ class InstrumentCatalogService:
             broker_id=broker_id,
             items=tuple(items),
             categories=categories,
-            sync_state=self._sync_state(self._catalog.sync_state(broker_id)),
+            sync_state=self._sync_state(await run_sync(partial(self._catalog.sync_state, broker_id))),
             currencies=currencies,
         )
 
     async def details(self, broker_id: str, instrument_id: str) -> InstrumentDetailsView:
-        broker = self._broker(broker_id)
-        record = self._catalog.get(broker_id, instrument_id)
+        broker, record = await run_sync(partial(self._instrument_context, broker_id, instrument_id))
         instrument = self._instrument(record)
         prices = await self._adapter_factory(broker).get_last_prices((record.external_instrument_id,))
         return InstrumentDetailsView(
@@ -198,7 +201,7 @@ class InstrumentCatalogService:
             instrument=instrument,
             last_price=prices[0] if prices else None,
             lot_price=None if not prices else prices[0].price * instrument.lot,
-            sync_state=self._sync_state(self._catalog.sync_state(broker_id)),
+            sync_state=self._sync_state(await run_sync(partial(self._catalog.sync_state, broker_id))),
         )
 
     async def candles(
@@ -210,17 +213,19 @@ class InstrumentCatalogService:
         interval: CandleInterval,
     ) -> tuple[HistoricCandle, ...]:
         """Read completed candles for an internal catalog ID in the broker scope."""
-        broker = self._broker(broker_id)
-        record = self._catalog.get(broker_id, instrument_id)
+        broker, record = await run_sync(partial(self._instrument_context, broker_id, instrument_id))
         candles = await self._adapter_factory(broker).get_candles(record.external_instrument_id, start, end, interval)
         return tuple(candle for candle in candles if candle.is_complete)
+
+    def _list_records(self, broker_id: str, include_inactive: bool):
+        return self._broker(broker_id), self._catalog.list(broker_id, include_inactive=include_inactive)
+
+    def _instrument_context(self, broker_id: str, instrument_id: str):
+        return self._broker(broker_id), self._catalog.get(broker_id, instrument_id)
 
     def set_selected(self, broker_id: str, instrument_id: str, selected: bool) -> CatalogInstrument:
         self._broker(broker_id)
         return self._instrument(self._catalog.set_selected(broker_id, instrument_id, selected))
-
-    def _adapter(self, broker_id: str) -> MarketDataPort:
-        return self._adapter_factory(self._broker(broker_id))
 
     def _broker(self, broker_id: str) -> UserBroker:
         broker = self._brokers.get(broker_id)

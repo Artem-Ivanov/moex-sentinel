@@ -7,6 +7,7 @@ from typing import Protocol
 
 from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
 from moex_sentinel.domain.trading_sessions import TradingSessionsStatus
+from moex_sentinel.services.sync_execution import run_sync
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerTradingStatus
 
 
@@ -56,12 +57,11 @@ class TradingSessionService:
             return await self._status()
 
     async def _status(self) -> TradingSessionsStatus:
-        targets = sorted({(item.broker_id, item.instrument_id) for item in self._automations.list_active()})
+        targets, resolved = await run_sync(self._targets)
         if not targets:
             self._cached_status = None
             self._cached_targets = ()
             return TradingSessionsStatus(status="NO_ACTIVE", total=0, open=0, closed=0, unavailable=0)
-        resolved = tuple(self._resolve(broker_id, instrument_id) for broker_id, instrument_id in targets)
         if self._cached_status is not None and resolved == self._cached_targets and monotonic() < self._expires_at:
             return self._cached_status
         self._cached_status = None
@@ -83,6 +83,10 @@ class TradingSessionService:
             self._cached_status = result
             self._expires_at = monotonic() + 60.0
         return result
+
+    def _targets(self):
+        targets = sorted({(item.broker_id, item.instrument_id) for item in self._automations.list_active()})
+        return targets, tuple(self._resolve(broker_id, instrument_id) for broker_id, instrument_id in targets)
 
     def _resolve(self, broker_id: str, instrument_id: str) -> tuple[BrokerConnection, str] | None:
         """Resolve live configuration before consulting the successful summary cache."""

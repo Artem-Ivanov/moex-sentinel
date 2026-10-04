@@ -155,7 +155,7 @@ class ReferenceCatalogRepository:
                 BrokerInstrumentModel.name,
                 BrokerInstrumentModel.id,
             )
-            return tuple(_record(model) for model in session.scalars(statement))
+            return tuple(_record(model) for model in session.scalars(statement.execution_options(yield_per=300)))
 
     def get(self, user_broker_id: str, instrument_id: str) -> UserBrokerCatalogInstrument:
         with session_scope(self._factory) as session:

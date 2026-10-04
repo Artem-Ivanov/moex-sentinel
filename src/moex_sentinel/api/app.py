@@ -1,5 +1,6 @@
 """FastAPI application factory."""
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -19,8 +20,10 @@ from sqlalchemy.engine import URL
 from moex_sentinel import __version__
 from moex_sentinel.adapters.analytics_version import AnalyticsVersionClient
 from moex_sentinel.api.auth import OperatorAuth
+from moex_sentinel.api.sync_execution import SyncExecutor
 from moex_sentinel.config import Settings
 from moex_sentinel.services.runtime_versions import WorkerVersionStore
+from moex_sentinel.services.sync_execution import bind_sync_runner
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
 from moex_sentinel.usecases.diagnostics import GetDiagnosticsStatusUsecase
@@ -106,40 +109,66 @@ def create_app(
             configure_logging("backend", level=settings.log_level, format=settings.log_format)
         engine = create_database_engine(configured_url)
         application.state.database_engine = engine
-        application.state.session_factory = create_session_factory(engine)
-        application.state.usecases = build_application_usecases(application.state.session_factory, settings=settings)
-        market_gateway = build_market_snapshot_gateway(
-            application.state.session_factory, retry_limit=settings.sandbox_retry_limit, settings=settings
-        )
-        application.state.market_snapshot_usecase = GetMarketSnapshotUsecase(market_gateway)
-        application.state.readiness_usecase = CheckReadinessUsecase(
-            partial(database_checker, engine), partial(schema_checker, engine)
-        )
-        application.state.worker_versions = WorkerVersionStore(
-            settings.application_environment, settings.broker_access_mode
-        )
-        analytics_http = httpx.AsyncClient(trust_env=False, follow_redirects=False)
-        application.state.analytics_versions = AnalyticsVersionClient(settings.analytics_url, analytics_http)
-        application.state.diagnostics_usecase = GetDiagnosticsStatusUsecase(
-            application.state.readiness_usecase,
-            settings.application_environment,
-            settings.broker_access_mode,
-            worker_versions=application.state.worker_versions.snapshot,
-        )
-        with business_process():
-            audit_event(LOGGER, "APPLICATION_STARTED", "Backend application started")
+        executor = None
+        market_gateway = None
+        analytics_http = None
         try:
+            executor = SyncExecutor(capacity=4)
+            application.state.sync_executor = executor
+            application.state.session_factory = create_session_factory(engine)
+            application.state.usecases = build_application_usecases(
+                application.state.session_factory, settings=settings
+            )
+            market_gateway = build_market_snapshot_gateway(
+                application.state.session_factory, retry_limit=settings.sandbox_retry_limit, settings=settings
+            )
+            application.state.market_snapshot_usecase = GetMarketSnapshotUsecase(market_gateway)
+            application.state.readiness_usecase = CheckReadinessUsecase(
+                partial(database_checker, engine), partial(schema_checker, engine)
+            )
+            application.state.worker_versions = WorkerVersionStore(
+                settings.application_environment, settings.broker_access_mode
+            )
+            analytics_http = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+            application.state.analytics_versions = AnalyticsVersionClient(settings.analytics_url, analytics_http)
+            application.state.diagnostics_usecase = GetDiagnosticsStatusUsecase(
+                application.state.readiness_usecase,
+                settings.application_environment,
+                settings.broker_access_mode,
+                worker_observations=application.state.worker_versions.diagnostics_snapshot,
+            )
+            with business_process():
+                audit_event(LOGGER, "APPLICATION_STARTED", "Backend application started")
             yield
         finally:
-            try:
+
+            async def cleanup() -> None:
                 try:
-                    await analytics_http.aclose()
+                    if executor is not None:
+                        await executor.aclose()
                 finally:
-                    await market_gateway.close()
-            finally:
-                with business_process():
-                    audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")
-                engine.dispose()
+                    try:
+                        if analytics_http is not None:
+                            await analytics_http.aclose()
+                    finally:
+                        try:
+                            if market_gateway is not None:
+                                await market_gateway.close()
+                        finally:
+                            with business_process():
+                                audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")
+                            engine.dispose()
+
+            cleanup_task = asyncio.create_task(cleanup())
+            cancelled = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup_task.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
     application = FastAPI(
         title="MOEX Sentinel API",
@@ -243,7 +272,10 @@ def create_app(
             inherited = None if supplied is None else str(UUID(supplied))
         except ValueError:
             inherited = None
-        with business_process(process_id=inherited) as process_id:
+        with (
+            business_process(process_id=inherited) as process_id,
+            bind_sync_runner(request.app.state.sync_executor.run),
+        ):
             audit_event(
                 LOGGER,
                 "HTTP_REQUEST_STARTED",

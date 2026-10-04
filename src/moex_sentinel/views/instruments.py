@@ -1,9 +1,11 @@
 """Thin HTTP Views for the broker instrument catalog."""
 
 from decimal import Decimal
+from functools import partial
 
 from fastapi import APIRouter, Request
 
+from moex_sentinel.services.sync_execution import run_sync
 from moex_sentinel.views.dependencies import usecases as _usecases
 from moex_sentinel.views.schemas.instruments import (
     CatalogInstrumentSchema,
@@ -58,7 +60,9 @@ async def set_selection(
     payload: InstrumentSelectionSchema,
     request: Request,
 ) -> CatalogInstrumentSchema:
-    result = _usecases(request).set_instrument_selection.execute(broker_id, instrument_id, payload.selected)
+    result = await run_sync(
+        partial(_usecases(request).set_instrument_selection.execute, broker_id, instrument_id, payload.selected)
+    )
     return CatalogInstrumentSchema.from_domain(result)
 
 

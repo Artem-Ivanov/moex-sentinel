@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 
 import { fetchBrokerSettings, type Broker } from "../api/brokers"
@@ -24,12 +24,28 @@ const lotPriceFrom = ref("")
 const lotPriceTo = ref("")
 const currency = ref("RUB")
 const selectedRow = ref<string | null>(null)
-const loading = ref(false)
+const readLoading = ref(false)
+const syncing = ref(false)
+const loading = computed(() => readLoading.value || syncing.value)
+let active = true
+let readGeneration = 0
+let brokerScope = 0
+onUnmounted(() => { active = false; readGeneration += 1; brokerScope += 1 })
 const settingsLoaded = ref(false)
 const error = ref("")
 const syncMessage = ref("")
 const adoption = ref<PositionAdoptionResult | null>(null)
-watch(brokerId, () => { adoption.value = null; syncMessage.value = "" })
+watch(brokerId, () => {
+  brokerScope += 1
+  readGeneration += 1
+  data.value = undefined
+  selectedRow.value = null
+  adoption.value = null
+  syncMessage.value = ""
+  error.value = ""
+  readLoading.value = false
+  syncing.value = false
+}, { flush: "sync" })
 const adoptionReasons: Record<PositionAdoptionReason, string> = {
   BOOTSTRAP_BLOCKED_INVENTORY: "Заблокированный остаток: нужна сверка доступного количества.",
   BOOTSTRAP_INVALID_QUANTITY: "Короткая позиция или некорректное количество (включая дробные лоты): автомат не создан.",
@@ -58,34 +74,44 @@ const visibleItems = computed(() => {
 onMounted(async () => {
   try {
     const settings = await fetchBrokerSettings()
+    if (!active) return
     brokers.value = settings.brokers.filter((broker) => broker.enabled)
     brokerId.value = brokers.value[0]?.id ?? ""
     settingsLoaded.value = true
     if (brokerId.value) await loadCatalog()
   } catch {
+    if (!active) return
     error.value = "Не удалось загрузить справочник инструментов."
   }
 })
 
 async function loadCatalog(): Promise<void> {
-  if (!brokerId.value) return
-  loading.value = true
+  if (!active || !brokerId.value) return
+  const generation = ++readGeneration
+  const scope = brokerScope
+  const request = {
+    brokerId: brokerId.value,
+    category: category.value,
+    selectedOnly: selectedOnly.value,
+    lotPriceFrom: lotPriceFrom.value,
+    lotPriceTo: lotPriceTo.value,
+    currency: currency.value,
+  }
+  const current = () => active && generation === readGeneration && scope === brokerScope
+  readLoading.value = true
   error.value = ""
   try {
-    data.value = await fetchInstruments(
-      brokerId.value,
-      category.value,
-      false,
-      selectedOnly.value,
-      lotPriceFrom.value,
-      lotPriceTo.value,
-      currency.value,
+    const result = await fetchInstruments(
+      request.brokerId, request.category, false, request.selectedOnly,
+      request.lotPriceFrom, request.lotPriceTo, request.currency,
     )
-    selectedRow.value = null
+    if (!current()) return
+    data.value = result
+    if (!result.items.some((item) => item.id === selectedRow.value)) selectedRow.value = null
   } catch (caught: unknown) {
-    error.value = caught instanceof Error ? caught.message : "Не удалось загрузить инструменты."
+    if (current()) error.value = caught instanceof Error ? caught.message : "Не удалось загрузить инструменты."
   } finally {
-    loading.value = false
+    if (current()) readLoading.value = false
   }
 }
 
@@ -110,32 +136,38 @@ async function resetFilters(): Promise<void> {
 }
 
 async function synchronize(): Promise<void> {
-  loading.value = true
+  if (!active || !brokerId.value || syncing.value) return
+  const scope = brokerScope
+  const requestBrokerId = brokerId.value
+  const current = () => active && scope === brokerScope
+  syncing.value = true
   error.value = ""
   syncMessage.value = ""
   adoption.value = null
   try {
-    const result = await synchronizeInstruments(brokerId.value)
+    const result = await synchronizeInstruments(requestBrokerId)
+    if (!current()) return
     adoption.value = result.adoption ?? null
     syncMessage.value = `Добавлено: ${result.added}, обновлено: ${result.updated}, деактивировано: ${result.deactivated}`
-    await loadCatalog()
+    void loadCatalog()
   } catch (caught: unknown) {
-    error.value = caught instanceof Error ? caught.message : "Не удалось обновить справочник."
-    loading.value = false
+    if (current()) error.value = caught instanceof Error ? caught.message : "Не удалось обновить справочник."
+  } finally {
+    if (current()) syncing.value = false
   }
 }
 
 async function toggleSelection(item: CatalogInstrument): Promise<void> {
+  const scope = brokerScope
+  const current = () => active && scope === brokerScope && data.value?.items.some((value) => value === item)
+  if (!current()) return
+  const request = { brokerId: item.broker_id, id: item.id, selected: !item.is_selected }
   error.value = ""
   try {
-    const updated = await setInstrumentSelection(
-      item.broker_id,
-      item.id,
-      !item.is_selected,
-    )
-    Object.assign(item, updated)
+    const updated = await setInstrumentSelection(request.brokerId, request.id, request.selected)
+    if (current()) Object.assign(item, updated)
   } catch {
-    error.value = "Не удалось изменить отбор инструмента."
+    if (current()) error.value = "Не удалось изменить отбор инструмента."
   }
 }
 
@@ -160,7 +192,7 @@ function openDetails(item?: CatalogInstrument): void {
     </div>
     <div class="toolbar instrument-toolbar">
       <label>Брокер
-        <select v-model="brokerId" :disabled="loading" @change="loadCatalog">
+        <select v-model="brokerId" @change="loadCatalog">
           <option v-for="broker in brokers" :key="broker.id" :value="broker.id">{{ broker.display_name }}</option>
         </select>
       </label>
@@ -174,7 +206,7 @@ function openDetails(item?: CatalogInstrument): void {
         >
       </label>
       <label>Валюта
-        <select v-model="currency" :disabled="loading" aria-label="Валюта инструментов" @change="loadCatalog">
+        <select v-model="currency" aria-label="Валюта инструментов" @change="loadCatalog">
           <option v-for="value in (data?.currencies ?? ['RUB'])" :key="value" :value="value">{{ value }}</option>
         </select>
       </label>
@@ -184,7 +216,7 @@ function openDetails(item?: CatalogInstrument): void {
       <label>Цена лота до
         <input v-model="lotPriceTo" class="lot-price-filter" type="text" inputmode="decimal">
       </label>
-      <button :disabled="loading" @click="loadCatalog">Применить цену</button>
+      <button @click="loadCatalog">Применить цену</button>
       <button :class="{ 'filter-button--active': selectedOnly }" @click="toggleSelectedFilter">Только выделенные</button>
       <button @click="resetFilters">Сбросить фильтры</button>
       <button :disabled="!selectedRow" @click="openDetails()">Подробнее</button>

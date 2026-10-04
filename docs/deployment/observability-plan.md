@@ -1,13 +1,15 @@
 # Наблюдаемость MOEX Sentinel
 
-Статус: проект для согласования от 02.10.2026, код/stack не развёрнуты.
+Статус: общий план от 02.10.2026. O1.1/V1 развёрнуты 03.10 в be84ed4;
+полные O1/O2/S1/M1 остаются открытыми. O1.2 LOCAL DONE / NOT DEPLOYED в первом patch.
 03.10 принят отдельный локальный кодовый этап [O1.1](../superpowers/specs/o1-core-diagnostics-design.md):
 готовность Core и режим экземпляра, остальные подсистемы явно UNKNOWN.
 Задачи и результат приёмки записаны в [плане](../superpowers/plans/o1-core-diagnostics.md).
-Этот этап не подтверждает heartbeat, audit query, метрики, alerts или deployment.
+Историческая локальная приёмка этого этапа не подтверждала heartbeat, audit query,
+метрики или alerts. Deployment03.10 принят отдельными release receipts.
 V1 добавляет отдельные version observations в diagnostics и собственную UI версию
-([план](../superpowers/plans/v1-service-versions.md)); локально DONE / NOT_DEPLOYED,
-итоговая независимая приёмка PASS. Version heartbeat имеет volatile TTL и scope, но не измеряет прогресс
+([план](../superpowers/plans/v1-service-versions.md)); code DONE / DEPLOYED03.10,
+итоговая независимая source и отдельная HTTP приёмка PASS. Version heartbeat имеет volatile TTL и scope, но не измеряет прогресс
 итераций, broker/market/outbox или готовность стратегии. Private Analytics health
 сообщает версию, не свежесть рынка. Полные O1/O2/S1/M1 остаются OPEN.
 Цель — видеть состояние решения и разбирать инциденты через интерфейс,
@@ -20,7 +22,7 @@ JSON-логи с UTC/process_id/stage, durable business audit Worker/Core,
 описания решений/позиций и периодические portfolio snapshots.
 `/api/health` показывает готовность Core DB/schema; Analytics health
 не проверяет свежесть рынка. На VPS baseline02.10 heartbeat каждые3секунды
-оставался stateless. Локальный V1 сохраняет только version observation, время
+оставался stateless. V1 сохраняет только version observation, время
 приёма Core и TTL/age и возвращает их в diagnostics; прогресс итераций и
 broker/outbox/market состояние этим не измеряются. Полноценного HTTP query
 журнала аудита, `/metrics`, dashboards и alerting нет.
@@ -96,6 +98,40 @@ safe allowlist полей без token/cookies/сырого SDK error body.
   показывают разные причины. Empty/partial/failed snapshot видны отдельно.
 - [ ] Проверить интерфейс и query cost на отдельной тестовой БД;
   измерить overhead heartbeat/метрик; независимое ревью до деплоя.
+
+### O1.2: цикл управления Worker и outbox — LOCAL DONE / NOT DEPLOYED
+
+Проверка актуальности04.10: существующие `/diagnostics` и пункт меню сохраняются.
+Version heartbeat не доказывает прогресс; при control error и втором flush=false
+старый coordinator не отправляет heartbeat. Root и независимый архитектор
+подтвердили ограниченный пакет вместе с M1.1 каталога. Код реализован; root
+backend1512 PASS (без PG), frontend158 PASS/typecheck/build, lint/release/diff PASS.
+Авторы `o12_backend_senior`/`o12_frontend_junior`; независимый
+`o12_relevance_architect` проверил source/контракты и исправления, C/I/M0.
+
+- Additive nullable heartbeat diagnostic payload, связанный с существующей
+  runtime identity/environment/access mode; legacy heartbeat совместим.
+- Завершённые control synchronization, blocked delivery и error различаются.
+  Completion counter/time меняются только при полном control completion.
+  Heartbeat планируется в coordinator после normal/error outcome, один task/3s;
+  primary exception, cancellation, flush/claim/reconcile/dispatch сохраняются.
+- Worker читает scalar counts PENDING/FAILED, oldest pending и retries в своей
+  SQLite; ошибка чтения даёт UNKNOWN/null, не пустую очередь. Не читать payloads.
+- Core держит один атомарный volatile version/control snapshot: scope и UTC
+  checks, counter/time consistency, новый instance без старого success, TTL30s
+  и возраст по monotonic. Fresh frozen progress → DEGRADED; stale → UNKNOWN.
+  Failed outbox либо pending возраст60s → DEGRADED. Это диагностические пороги,
+  без alerts и без изменения торговых guards.
+- Existing authenticated UI показывает control progress и delivery отдельно от
+  versions и готовности торговли. Overall OK по Core/Worker не возвращается:
+  broker/market/portfolio/strategy остаются непроверенными.
+
+Задачи, владельцы, проверки и границы —
+[O1 plan](../superpowers/plans/o1-core-diagnostics.md#o12-control-loop-и-outbox).
+Это локальная разработка, NOT DEPLOYED; новый Core перед новым Worker,
+commit владельца и отдельный deployment GO обязательны. Audit query, broker RPC
+health, market freshness и отдельный continuous heartbeat timer не входят.
+Полный O1 остаётся OPEN; текущий PROD bootstrap и допуск торговли этим не закрыты.
 
 ## O2. Метрики, графики и уведомления
 

@@ -60,10 +60,26 @@ class AutomationService:
         return value
 
     def get_many(self, automation_ids: list[str]) -> list[AutomationRecord]:
-        return [value for value in self._repository.get_many(automation_ids) if self._in_environment(value)]
+        return self._filter_environment(self._repository.get_many(automation_ids))
 
     def list_active(self) -> list[AutomationRecord]:
-        return [value for value in self._repository.list_active() if self._in_environment(value)]
+        return self._filter_environment(self._repository.list_active())
+
+    def _filter_environment(self, values: list[AutomationRecord]) -> list[AutomationRecord]:
+        if not values or self._environment is None or self._brokers is None:
+            return values
+        brokers = {broker.id: broker for broker in self._brokers.list()}
+        is_test = None
+        records = []
+        for value in values:
+            broker = brokers.get(value.broker_id)
+            if broker is None:
+                broker = self._brokers.get(value.broker_id)
+            if is_test is None:
+                is_test = self._environment.view().active_environment == "TEST"
+            if broker.is_test == is_test:
+                records.append(value)
+        return records
 
     def hold(self, automation_id: str, reason: str) -> AutomationRecord:
         current = self.get(automation_id)

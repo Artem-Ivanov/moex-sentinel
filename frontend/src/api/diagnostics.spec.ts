@@ -14,6 +14,16 @@ it("uses the protected endpoint with cancellation", async () => {
       worker: { observation: "OBSERVED", version: "1.4.2", received_at: "2026-10-03T09:00:00.000Z", age_ms: 123, reason: "OBSERVED" },
       analytics: { observation: "UNKNOWN", version: null, received_at: null, age_ms: null, reason: "NOT_CONFIGURED" },
     },
+    worker: {
+      observation: "OBSERVED", status: "DEGRADED", reason: "OUTBOX_BLOCKED", instance_id: "123e4567-e89b-12d3-a456-426614174000",
+      received_at: "2026-10-03T09:00:00.000Z", age_ms: 123, completed_iterations: 4,
+      last_completed_at: "2026-10-03T08:58:00.000Z", completion_age_ms: 120123,
+      last_finished_at: "2026-10-03T08:59:00.000Z", last_result: "OUTBOX_BLOCKED", error_code: null,
+      outbox: {
+        observation: "OBSERVED", status: "DEGRADED", reason: "OLD_PENDING", pending_count: 2, failed_count: 1,
+        oldest_pending_at: "2026-10-03T08:30:00.000Z", oldest_pending_age_ms: 1800123, max_retry_count: 5,
+      },
+    },
     awaiting_observations: ["worker", "broker", "analytics", "market", "outbox", "portfolio", "strategy"],
   } satisfies DiagnosticsStatus
   const fetchMock = vi.fn().mockResolvedValue(Response.json(snapshot))

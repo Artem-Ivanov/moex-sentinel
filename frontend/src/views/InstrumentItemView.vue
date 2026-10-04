@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { tradingAllowed, tradingDisabledReason } from "../runtime"
-import { onBeforeUnmount, onMounted, ref } from "vue"
+import { onBeforeUnmount, ref, watch } from "vue"
 import { RouterLink, useRoute, useRouter } from "vue-router"
 
 import { fetchHistoricCandles, type HistoricCandle } from "../api/marketData"
@@ -24,31 +24,53 @@ const tradeError = ref("")
 const tradeLoading = ref(false)
 let refreshTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
+let generation = 0
+let loadedGeneration = -1
+
+function isCurrent(requestGeneration: number): boolean {
+  return !disposed && requestGeneration === generation
+}
 
 async function openTrade(): Promise<void> {
-  if (!tradingAllowed.value) return
+  if (!tradingAllowed.value || tradeLoading.value || !data.value || loadedGeneration !== generation) return
+  const requestGeneration = generation
+  const brokerId = String(route.params.brokerId)
   tradeOpen.value = true
   tradeLoading.value = true
   tradeError.value = ""
   try {
-    const response = await fetchBrokerAccounts(String(route.params.brokerId))
+    const response = await fetchBrokerAccounts(brokerId)
+    if (!isCurrent(requestGeneration)) return
     accounts.value = response.accounts
-    selectedAccount.value = response.accounts[0]?.account_id ?? ""
-  } catch { tradeError.value = "Не удалось загрузить счета." }
-  finally { tradeLoading.value = false }
+    if (!accounts.value.some(account => account.account_id === selectedAccount.value)) {
+      selectedAccount.value = response.accounts[0]?.account_id ?? ""
+    }
+  } catch {
+    if (isCurrent(requestGeneration)) tradeError.value = "Не удалось загрузить счета."
+  } finally {
+    if (isCurrent(requestGeneration)) tradeLoading.value = false
+  }
 }
 
 async function startTrade(): Promise<void> {
-  if (!tradingAllowed.value || !selectedAccount.value) return
+  if (!tradingAllowed.value || tradeLoading.value || !data.value || loadedGeneration !== generation
+    || !accounts.value.some(account => account.account_id === selectedAccount.value)) return
+  const requestGeneration = generation
+  const brokerId = String(route.params.brokerId)
+  // The route contains the catalog row ID; the instrument UID is only used for candles.
+  const catalogRowId = String(route.params.instrumentId)
+  const accountId = selectedAccount.value
   tradeLoading.value = true
   tradeError.value = ""
   try {
-    const automation = await createAutomation(
-      String(route.params.brokerId), String(route.params.instrumentId), selectedAccount.value,
-    )
+    const automation = await createAutomation(brokerId, catalogRowId, accountId)
+    if (!isCurrent(requestGeneration)) return
     await router.push({ name: "position-details", params: { id: automation.id } })
-  } catch (caught: unknown) { tradeError.value = caught instanceof Error ? caught.message : "Не удалось создать автомат." }
-  finally { tradeLoading.value = false }
+  } catch (caught: unknown) {
+    if (isCurrent(requestGeneration)) tradeError.value = caught instanceof Error ? caught.message : "Не удалось создать автомат."
+  } finally {
+    if (isCurrent(requestGeneration)) tradeLoading.value = false
+  }
 }
 
 function getSessionStorage(): Storage | null {
@@ -59,8 +81,8 @@ function getSessionStorage(): Storage | null {
   }
 }
 
-async function loadCandles(brokerId: string, instrumentId: string): Promise<void> {
-  if (disposed || candlesLoading.value) return
+async function loadCandles(brokerId: string, instrumentId: string, requestGeneration: number): Promise<void> {
+  if (!isCurrent(requestGeneration) || candlesLoading.value) return
   const storage = getSessionStorage()
   const cached = readCandleCache(storage, brokerId, instrumentId, "1_MIN")
   const isRefresh = cached !== null
@@ -77,7 +99,7 @@ async function loadCandles(brokerId: string, instrumentId: string): Promise<void
       end.toISOString(),
       "1_MIN",
     )
-    if (disposed) return
+    if (!isCurrent(requestGeneration)) return
     candles.value = currentWindow(response.items, instrumentId)
     writeCandleCache(
       storage,
@@ -88,12 +110,12 @@ async function loadCandles(brokerId: string, instrumentId: string): Promise<void
       new Date().toISOString(),
     )
   } catch {
-    if (disposed) return
+    if (!isCurrent(requestGeneration)) return
     candlesError.value = isRefresh
       ? "Не удалось обновить свечи."
       : "Не удалось загрузить свечи."
   } finally {
-    candlesLoading.value = false
+    if (isCurrent(requestGeneration)) candlesLoading.value = false
   }
 }
 
@@ -106,21 +128,43 @@ function currentWindow(items: HistoricCandle[], instrumentId: string): HistoricC
   })
 }
 
-onMounted(async () => {
-  const brokerId = String(route.params.brokerId)
-  const instrumentId = String(route.params.instrumentId)
-  refreshTimer = setInterval(() => {
-    if (data.value) void loadCandles(brokerId, data.value.instrument.instrument_id)
-  }, 60_000)
+async function loadDetails(brokerId: string, catalogRowId: string, requestGeneration: number): Promise<void> {
   try {
-    const details = await fetchInstrumentDetails(brokerId, instrumentId)
-    if (disposed) return
+    const details = await fetchInstrumentDetails(brokerId, catalogRowId)
+    if (!isCurrent(requestGeneration)) return
     data.value = details
-    await loadCandles(brokerId, details.instrument.instrument_id)
+    loadedGeneration = requestGeneration
+    await loadCandles(brokerId, details.instrument.instrument_id, requestGeneration)
   } catch (caught: unknown) {
-    error.value = caught instanceof Error ? caught.message : "Не удалось загрузить инструмент."
+    if (isCurrent(requestGeneration)) error.value = caught instanceof Error ? caught.message : "Не удалось загрузить инструмент."
   }
-})
+}
+
+watch([
+  () => String(route.params.brokerId ?? ""),
+  () => String(route.params.instrumentId ?? ""),
+], ([brokerId, catalogRowId]) => {
+  const requestGeneration = ++generation
+  if (refreshTimer !== undefined) clearInterval(refreshTimer)
+  data.value = undefined
+  loadedGeneration = -1
+  error.value = ""
+  candles.value = []
+  candlesLoading.value = false
+  candlesError.value = ""
+  tradeOpen.value = false
+  accounts.value = []
+  selectedAccount.value = ""
+  tradeError.value = ""
+  tradeLoading.value = false
+  if (disposed || !brokerId || !catalogRowId) return
+  refreshTimer = setInterval(() => {
+    if (isCurrent(requestGeneration) && data.value) {
+      void loadCandles(brokerId, data.value.instrument.instrument_id, requestGeneration)
+    }
+  }, 60_000)
+  void loadDetails(brokerId, catalogRowId, requestGeneration)
+}, { immediate: true, flush: "sync" })
 
 onBeforeUnmount(() => {
   disposed = true
@@ -139,7 +183,7 @@ onBeforeUnmount(() => {
       <h2>{{ data.instrument.ticker }} — {{ data.instrument.name }}</h2>
       <div class="toolbar">
         <button
-          :disabled="!tradingAllowed || !data.instrument.is_active || !data.instrument.api_trade_available"
+          :disabled="!tradingAllowed || tradeLoading || !data.instrument.is_active || !data.instrument.api_trade_available"
           @click="openTrade"
         :title="!tradingAllowed ? tradingDisabledReason : undefined">Торговля</button>
       </div>

@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from hashlib import blake2b
 
-from sqlalchemy import Engine, func, select, text, tuple_
+from sqlalchemy import Engine, func, literal, select, text, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -241,6 +241,90 @@ class PortfolioSnapshotRepository:
             .order_by(PortfolioSnapshotModel.user_broker_id, PortfolioSnapshotModel.account_id)
         )
         return tuple(_snapshot_value(model) for model in models)
+
+    def common_baselines_many(
+        self,
+        latest: tuple[PortfolioSnapshotValue, ...],
+        boundaries: tuple[datetime, ...],
+    ) -> tuple[tuple[PortfolioSnapshotValue, ...], ...]:
+        """Select up to three common historical runs in one query."""
+        if len(boundaries) > 3:
+            raise ValueError("Common baselines support at most three boundaries.")
+        if not boundaries:
+            return ()
+        if not latest:
+            return tuple(() for _ in boundaries)
+        currencies = {snapshot.currency for snapshot in latest}
+        if len(currencies) != 1:
+            raise ValueError("Common baselines must use one currency.")
+        identities = {(snapshot.user_broker_id, snapshot.account_id) for snapshot in latest}
+        if len(identities) != len(latest):
+            raise ValueError("Common baselines require unique broker accounts.")
+        currency = next(iter(currencies))
+        identity_filter = tuple_(
+            PortfolioSnapshotModel.user_broker_id,
+            PortfolioSnapshotModel.account_id,
+        ).in_(identities)
+        common_query = (
+            self._scope_query(select(PortfolioSnapshotModel.run_id, PortfolioSnapshotModel.captured_at))
+            .where(PortfolioSnapshotModel.currency == currency, identity_filter)
+            .group_by(PortfolioSnapshotModel.run_id, PortfolioSnapshotModel.captured_at)
+            .having(func.count(PortfolioSnapshotModel.id) == len(identities))
+        )
+        window_queries = tuple(
+            select(
+                literal(index).label("ordinal"),
+                literal(floor_utc_millisecond(boundary), type_=PortfolioSnapshotModel.captured_at.type).label("cutoff"),
+            )
+            for index, boundary in enumerate(boundaries)
+        )
+        windows = window_queries[0].union_all(*window_queries[1:]).cte("baseline_windows")
+        common_runs = common_query.cte("common_runs")
+        requested_run = (
+            select(common_runs.c.run_id)
+            .where(common_runs.c.captured_at <= windows.c.cutoff)
+            .order_by(common_runs.c.captured_at.desc())
+            .limit(1)
+            .correlate(windows)
+            .scalar_subquery()
+        )
+        first_run = select(common_runs.c.run_id).order_by(common_runs.c.captured_at).limit(1).scalar_subquery()
+        if self._session.get_bind().dialect.name == "postgresql":
+            # Keep GROUP/ORDER/LIMIT together so PostgreSQL can stop at the first complete run.
+            grouped_ids = common_query.with_only_columns(PortfolioSnapshotModel.run_id)
+            requested_run = (
+                grouped_ids.where(PortfolioSnapshotModel.captured_at <= windows.c.cutoff)
+                .order_by(PortfolioSnapshotModel.captured_at.desc())
+                .limit(1)
+                .correlate(windows)
+                .scalar_subquery()
+            )
+            first_run = grouped_ids.order_by(PortfolioSnapshotModel.captured_at).limit(1).scalar_subquery()
+        selected = self._session.execute(
+            select(windows.c.ordinal, func.coalesce(requested_run, first_run).label("run_id"))
+            .select_from(windows)
+            .order_by(windows.c.ordinal)
+        ).all()
+        run_ids = {row.run_id for row in selected if row.run_id is not None}
+        if not run_ids:
+            return tuple(() for _ in boundaries)
+        models = self._session.scalars(
+            self._scope_query(select(PortfolioSnapshotModel))
+            .where(
+                PortfolioSnapshotModel.run_id.in_(run_ids),
+                PortfolioSnapshotModel.currency == currency,
+                identity_filter,
+            )
+            .order_by(
+                PortfolioSnapshotModel.run_id,
+                PortfolioSnapshotModel.user_broker_id,
+                PortfolioSnapshotModel.account_id,
+            )
+        )
+        by_run: dict[str, list[PortfolioSnapshotValue]] = {run_id: [] for run_id in run_ids}
+        for model in models:
+            by_run[model.run_id].append(_snapshot_value(model))
+        return tuple(tuple(by_run.get(row.run_id, ())) for row in selected)
 
     def _account_currency_query(self, user_broker_id: str, account_id: str, currency: str):
         return self._scope_query(select(PortfolioSnapshotModel)).where(

@@ -116,3 +116,82 @@ filesSHA сохранены,2contextdocs намеренно дополнены. 
 develop/reports/o1-status-20261003/{root-verification.json,integration.json,final-review.md}.
 Полный backend/PG suite, VPS/live browser/брокерский API не проверялись; полная
 O1/O2/S1/M1 OPEN. Commit делает владелец; deployment после его отмашки.
+
+## Deployment receipt — 03.10.2026
+
+O1.1 status API deployment принят по
+`develop/reports/vps-release-20261003/root-native-receipts.json` (commit
+`be84ed4f047734ccacfba9b6ccb531af51ba4b94`, release `vps-20261003-be84ed4`,
+17:14 UTC); applied schema `0003_user_broker_archive`. Отдельная post-deploy HTTPS
+verification подтвердила diagnostics/status API и защищённые auth GET в TEST и PROD.
+Observed Core TEST/PROD версии `0.2.0`; TEST Worker OBSERVED `0.2.0`, PROD Worker
+UNKNOWN; TEST Analytics OBSERVED `0.2.0`, PROD Analytics NOT_CONFIGURED. UI build version
+`0.2.0`. Browser acceptance не проводилась; отдельная архивная запись отражена только
+агрегатным read receipt с неизвестным actor и не является частью O1.1 verification.
+Версии/UNKNOWN не подтверждают торговую готовность. O1.1 deployment принят в пределах этих receipts;
+full O1/O2/S1/M1, 24h/7d, PROD Worker и TRADE остаются OPEN.
+
+## O1.2: control loop и outbox
+
+Статус04.10: LOCAL DONE / NOT DEPLOYED. Актуальность подтверждена
+root/`o12_relevance_architect` по коду; пользователь выбрал O1.2 вместе с M1.1
+в первый patch. Предыдущие O1.1/V1 receipts сохраняют самостоятельный scope.
+
+### Задачи и исполнители
+
+1. Root: baseline/DoD/briefs/decomposition ACK; общая интеграция и контекст.
+2. Senior `o12_backend_senior`, sol/medium: shared diagnostic DTO и existing
+   heartbeat/Worker coordinator/outbox scalar query/Core atomic snapshot/read API.
+   Единственный writer11backend source и9associated test files; согласованный
+   список в local task-plan/briefs. Accepted PROD BrokerConnection поля сохранить.
+3. Junior `o12_frontend_junior`, luna/low: existing diagnostics API types/view и
+   их2spec files; четыре sole-owned файла. Страница и navigation уже существуют.
+   No RAM dashboard, polling, dependencies или новых routes.
+4. Независимый `o12_relevance_architect`, sol/high: actualfrozen code/contract/
+   integration/performance methodology review; C/I исправить и перепроверить.
+5. Root: fresh nonPG+frontend regression/typecheck/build/lint/diff, actualhashes,
+   scalar aggregation benchmark, truthful context/doc acceptance. Deployment позже
+   по commit и GO владельца, новый Core прежде нового Worker.
+
+### DoD
+
+- Completed control sync увеличивает counter/time; оба flush blocks не делают
+  fake success; ошибка до broker session видна через heartbeat ERROR.
+- Cancellation и telemetry failure не изменяют финансовый flow/primary error;
+  один heartbeat task/3s, без нового lifetime timer.
+- Outbox одна bounded scalar projection без payload/entity materialization,
+  no mutations/retries changes. READ_FAILED UNKNOWN/null; realzero counts0.
+- Shared identity/scope, legacy heartbeat; Core lock/volatile TTL30s/monotonic,
+  strict newer heartbeat и допустимыйexisting5s clockskew, nestedtime/count
+  consistency. Wrong scope/naive/old/future/rollback не продлевают TTL.
+- Fresh frozen progress DEGRADED, stale/missing UNKNOWN; новый run без oldsuccess.
+  Failed>0 или oldestpending>=60s DEGRADED; no overall tradingOK.
+- UI oldpayload/fresh/error/blocked/stale/queuefail/nullzero/manualrefresh/auth,
+  версия отдельно от control progress. No secrets/extra technical userflows.
+- Изолированные tests/benchmark, независимое review и личная root acceptance.
+  PG/Linux/liveRuntime только отдельными gates; не выдавать sourcePASS за VPS.
+
+### Границы
+
+SQLite durablehistory/intents/outbox/ACK, Core PostgreSQL/sharedDB, Analytics
+market-only, readonly mode/strategyfalse/PRODTRADE hardguard сохранены. No schema
+migration/Redis/Rabbit/SDKcalls/изменениятокена/допускаторговли. ПолныеO1/O2/S1/M1
+остаютсяOPEN. Локальныедоказательства: develop/reports/o12-worker-diagnostics-20261003/
+и root orchestration develop/reports/patch-o12-m1-20261003/.
+
+### Локальная приёмка O1.2
+
+Root лично прочёл diff и проверил frozen SHA; прежние PROD connection поля,
+bootstrap tests/UI и пользовательский dirty набор сохранены. Fresh полный
+backend без PostgreSQL1512 PASS/17warnings; frontend158 PASS/typecheck/build;
+Ruff/Black22files, release metadata и diff PASS. Первый общий прогон1510PASS/2FAIL:
+слово в документации нарушало architecture gate; миграция Alembic отключала
+logger и ломала новый warning-capture test. Документация и изоляция testlogger
+исправлены, actual order RED→GREEN, независимо перепроверены; продуктовая
+финансовая логика не менялась. Независимый `o12_relevance_architect` проверил
+backend/FE/shared contracts, C/I/M0; native/PG/runtime этим не подтверждаются.
+
+Backend выполнял RED/GREEN по пакетам. Frontend сначала реализован до рабочего
+NodePATH; затем отдельно воспроизведён baseline9FAIL/18PASS→candidate27PASS.
+Это доказательство поведения, не строгая исходная TDD хронология. M1.1 имеет
+отдельные code/memory доказательства; latency и fullM1 остаются OPEN.

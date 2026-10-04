@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Protocol
 
 from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
@@ -16,6 +17,7 @@ from moex_sentinel.domain.position_adoption import (
 )
 from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerState
 from moex_sentinel.services.portfolio_ports import PositionAdoptionBrokerPort
+from moex_sentinel.services.sync_execution import run_sync
 
 
 class PositionAdoptionServicePort(Protocol):
@@ -43,7 +45,7 @@ class ConfiguredPositionAdoptionService:
 
     async def adopt(self, user_broker_id: str) -> PositionAdoptionResult:
         """Adopt positions for an ACTIVE account; reject invalid configuration before adapter creation."""
-        broker = self._broker_loader(user_broker_id)
+        broker = await run_sync(partial(self._broker_loader, user_broker_id))
         account_id = broker.external_account_id
         if broker.state is not UserBrokerState.ACTIVE or not account_id:
             raise ValueError("Position adoption requires an active broker account.")
@@ -85,7 +87,9 @@ class PositionAdoptionService:
                 continue
             if position.quantity_lots < 0 or position.quantity_lots != position.quantity_lots.to_integral_value():
                 reason = PositionAdoptionReason.BOOTSTRAP_INVALID_QUANTITY
-            instrument = self._repository.find_instrument(user_broker_id, position.instrument_id)
+            instrument = await run_sync(
+                partial(self._repository.find_instrument, user_broker_id, position.instrument_id)
+            )
             if reason is None and instrument is None:
                 reason = PositionAdoptionReason.BOOTSTRAP_INSTRUMENT_NOT_FOUND
             if reason is None and (position.average_price is None or position.average_price.amount <= 0):
@@ -116,7 +120,7 @@ class PositionAdoptionService:
                 observed_at=self._clock(),
             )
             try:
-                outcome = self._repository.adopt(candidate)
+                outcome = await run_sync(partial(self._repository.adopt, candidate))
             except PositionAdoptionConflictError:
                 held += 1
                 diagnostics.append(

@@ -1,7 +1,10 @@
 """Thin HTTP views for trading automation user actions."""
 
+from functools import partial
+
 from fastapi import APIRouter, Request, status
 
+from moex_sentinel.services.sync_execution import run_sync
 from moex_sentinel.views.dependencies import usecases as _usecases
 from moex_sentinel.views.schemas.automations import (
     AutomationListSchema,
@@ -35,7 +38,7 @@ async def create_automation(
 
 @router.get("/trading-automations", response_model=AutomationListSchema)
 async def list_automations(request: Request) -> AutomationListSchema:
-    records = _usecases(request).view_trading_automations.execute()
+    records = await run_sync(partial(_usecases(request).view_trading_automations.execute))
     return AutomationListSchema(items=[AutomationSchema.from_domain(item) for item in records])
 
 
@@ -47,7 +50,9 @@ async def trading_sessions_status(request: Request) -> TradingSessionsStatusSche
 
 @router.get("/trading-automations/{automation_id}", response_model=AutomationSchema)
 async def view_automation(automation_id: str, request: Request) -> AutomationSchema:
-    return AutomationSchema.from_domain(_usecases(request).view_trading_automation.execute(automation_id))
+    return AutomationSchema.from_domain(
+        await run_sync(partial(_usecases(request).view_trading_automation.execute, automation_id))
+    )
 
 
 @router.get(
@@ -62,14 +67,20 @@ async def view_automation_details(automation_id: str, request: Request) -> Tradi
 
 @router.post("/trading-automations/{automation_id}/hold", response_model=AutomationSchema)
 async def hold_automation(automation_id: str, request: Request) -> AutomationSchema:
-    return AutomationSchema.from_domain(_usecases(request).hold_automation.execute(automation_id))
+    return AutomationSchema.from_domain(
+        await run_sync(partial(_usecases(request).hold_automation.execute, automation_id))
+    )
 
 
 @router.post("/trading-automations/{automation_id}/resume", response_model=AutomationSchema)
 async def resume_automation(automation_id: str, request: Request) -> AutomationSchema:
-    return AutomationSchema.from_domain(_usecases(request).resume_automation.execute(automation_id))
+    return AutomationSchema.from_domain(
+        await run_sync(partial(_usecases(request).resume_automation.execute, automation_id))
+    )
 
 
 @router.post("/trading-automations/{automation_id}/close", response_model=AutomationSchema)
 async def close_automation(automation_id: str, request: Request) -> AutomationSchema:
-    return AutomationSchema.from_domain(_usecases(request).close_automation.execute(automation_id))
+    return AutomationSchema.from_domain(
+        await run_sync(partial(_usecases(request).close_automation.execute, automation_id))
+    )

@@ -162,7 +162,10 @@ async def test_selected_account_rejects_foreign_read_before_sdk():
 def test_automation_reads_filter_inactive_contour():
     records = [SimpleNamespace(broker_id="test"), SimpleNamespace(broker_id="prod")]
     repo = SimpleNamespace(list_active=lambda: records, get=lambda key: records[0])
-    brokers = SimpleNamespace(get=lambda key: SimpleNamespace(is_test=key == "test"))
+    brokers = SimpleNamespace(
+        get=lambda key: SimpleNamespace(id=key, is_test=key == "test"),
+        list=lambda: [SimpleNamespace(id=key, is_test=key == "test") for key in ("test", "prod")],
+    )
     service = AutomationService(repo, environment=PinnedEnvironment("PROD"), brokers=brokers)
     assert service.list_active() == [records[1]]
     with pytest.raises(ValueError, match="environment|adapter|target|broker_access_mode|PROD|pinned|inactive"):

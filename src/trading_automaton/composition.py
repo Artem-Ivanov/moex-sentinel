@@ -14,6 +14,7 @@ from sentinel_contracts.broker_execution import BrokerConnection
 from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 from sentinel_contracts.trading_facts import AutomationCommand, FactEnvelope
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
 from trading_automaton.adapters.analytics_client import AnalyticsClient
 from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
@@ -100,8 +101,8 @@ class FactCoordinatorCoreAdapter:
     def broker_connection(self, broker_id: str) -> BrokerConnection:
         return self._core.broker_connection(broker_id)
 
-    def heartbeat(self, worker_id: str, occurred_at: datetime) -> None:
-        self._core.heartbeat(worker_id, occurred_at)
+    def heartbeat(self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None) -> None:
+        self._core.heartbeat(worker_id, occurred_at, diagnostics)
 
 
 class BrokerRuntimeBundle:
@@ -394,5 +395,6 @@ def build_streaming_runtime(
         worker_id=settings.worker_id,
         now=now,
         heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+        outbox_diagnostics=repository.outbox_diagnostics,
     )
     return runtime, repository, http

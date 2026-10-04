@@ -3,7 +3,7 @@
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, and_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -49,6 +49,22 @@ def _record(
         broker_name=broker.display_name,
         ticker=instrument.ticker,
         instrument_name=instrument.name,
+        bootstrap_pending=(
+            automation.state in {AutomationState.HOLD.value, AutomationState.IN_QUEUE.value}
+            and automation.last_sequence_number == 0
+            and all(
+                value is not None
+                for value in (
+                    automation.bootstrap_position_cycle_id,
+                    automation.bootstrap_position_lot_id,
+                    automation.bootstrap_quantity_lots,
+                    automation.bootstrap_average_price,
+                    automation.bootstrap_invested_amount,
+                    automation.bootstrap_currency,
+                    automation.bootstrap_observed_at,
+                )
+            )
+        ),
     )
 
 
@@ -101,25 +117,42 @@ class AutomationRepository:
         if not requested:
             return []
         with self._factory() as session:
-            return [
-                self._record_for_model(session, model)
-                for model in session.scalars(
-                    select(TradingAutomationModel)
-                    .where(TradingAutomationModel.id.in_(requested))
-                    .order_by(TradingAutomationModel.created_at, TradingAutomationModel.id)
-                )
-            ]
+            return self._list_records(session, TradingAutomationModel.id.in_(requested))
 
     def list_active(self) -> list[AutomationRecord]:
         with self._factory() as session:
-            return [
-                self._record_for_model(session, model)
-                for model in session.scalars(
-                    select(TradingAutomationModel)
-                    .where(TradingAutomationModel.closed_at.is_(None))
-                    .order_by(TradingAutomationModel.created_at, TradingAutomationModel.id)
-                )
-            ]
+            return self._list_records(session, TradingAutomationModel.closed_at.is_(None))
+
+    @staticmethod
+    def _list_records(session: Session, condition: ColumnElement[bool]) -> list[AutomationRecord]:
+        statement = (
+            select(TradingAutomationModel, UserBrokerModel, BrokerInstrumentModel, PositionCycleModel)
+            .select_from(TradingAutomationModel)
+            .outerjoin(UserBrokerModel, UserBrokerModel.id == TradingAutomationModel.user_broker_id)
+            .outerjoin(
+                BrokerInstrumentModel,
+                and_(
+                    BrokerInstrumentModel.id == TradingAutomationModel.instrument_id,
+                    BrokerInstrumentModel.user_broker_id == TradingAutomationModel.user_broker_id,
+                ),
+            )
+            .outerjoin(
+                PositionCycleModel,
+                and_(
+                    PositionCycleModel.user_broker_id == TradingAutomationModel.user_broker_id,
+                    PositionCycleModel.automation_id == TradingAutomationModel.id,
+                    PositionCycleModel.closed_at.is_(None),
+                ),
+            )
+            .where(condition)
+            .order_by(TradingAutomationModel.created_at, TradingAutomationModel.id)
+        )
+        records = []
+        for automation, broker, instrument, cycle in session.execute(statement):
+            if broker is None or instrument is None:
+                raise RecordNotFoundError("Automation scope is incomplete.")
+            records.append(_record(automation, broker, instrument, cycle))
+        return records
 
     def set_state(
         self,

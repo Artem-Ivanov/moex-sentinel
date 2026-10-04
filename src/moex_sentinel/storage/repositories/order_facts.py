@@ -311,12 +311,14 @@ class OrderFactsRepository:
                     terminal_at=value.terminal_at,
                     updated_at=value.updated_at,
                 )
-                .returning(BrokerOrderModel.id)
+                .returning(BrokerOrderModel)
+                .execution_options(populate_existing=True, synchronize_session=False)
             )
-        if result.scalar_one_or_none() is None:
+        model = result.scalar_one_or_none()
+        if model is None:
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order")
         flush_or_translate(self._session, entity_type="broker_order")
-        return self.get_order(user_broker_id, value.id)
+        return _order_value(model)
 
     @staticmethod
     def _same_order_intent(current: BrokerOrderDraft, candidate: BrokerOrderDraft) -> bool:
@@ -344,39 +346,35 @@ class OrderFactsRepository:
         instrument_id: str,
         entity_type: str,
     ) -> None:
-        for scope_column, id_column, reference_id in (
-            (TradingAutomationModel.user_broker_id, TradingAutomationModel.id, automation_id),
-            (PositionCycleModel.user_broker_id, PositionCycleModel.id, cycle_id),
-            (BrokerInstrumentModel.user_broker_id, BrokerInstrumentModel.id, instrument_id),
-        ):
-            require_scoped_reference(
-                self._session,
-                scope_column=scope_column,
-                id_column=id_column,
-                user_broker_id=user_broker_id,
-                reference_id=reference_id,
-                entity_type=entity_type,
-            )
-        matching_automation = self._session.scalar(
-            select(TradingAutomationModel.id).where(
+        automation_instrument = self._session.scalar(
+            select(TradingAutomationModel.instrument_id).where(
                 TradingAutomationModel.user_broker_id == user_broker_id,
                 TradingAutomationModel.id == automation_id,
-                TradingAutomationModel.instrument_id == instrument_id,
             )
         )
-        if matching_automation is None:
+        if automation_instrument is None:
+            raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type=entity_type)
+        cycle = None
+        if cycle_id is not None:
+            cycle = self._session.execute(
+                select(PositionCycleModel.automation_id, PositionCycleModel.instrument_id).where(
+                    PositionCycleModel.user_broker_id == user_broker_id,
+                    PositionCycleModel.id == cycle_id,
+                )
+            ).one_or_none()
+            if cycle is None:
+                raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type=entity_type)
+        require_scoped_reference(
+            self._session,
+            scope_column=BrokerInstrumentModel.user_broker_id,
+            id_column=BrokerInstrumentModel.id,
+            user_broker_id=user_broker_id,
+            reference_id=instrument_id,
+            entity_type=entity_type,
+        )
+        if automation_instrument != instrument_id:
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type=entity_type)
-        if cycle_id is None:
-            return
-        matching_cycle = self._session.scalar(
-            select(PositionCycleModel.id).where(
-                PositionCycleModel.user_broker_id == user_broker_id,
-                PositionCycleModel.id == cycle_id,
-                PositionCycleModel.automation_id == automation_id,
-                PositionCycleModel.instrument_id == instrument_id,
-            )
-        )
-        if matching_cycle is None:
+        if cycle is not None and (cycle.automation_id != automation_id or cycle.instrument_id != instrument_id):
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type=entity_type)
 
     def _require_decision_lineage(self, user_broker_id: str, value: BrokerOrderDraft) -> None:

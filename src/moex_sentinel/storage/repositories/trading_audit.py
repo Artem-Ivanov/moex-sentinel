@@ -69,35 +69,15 @@ class TradingAuditRepository:
 
     def append_audit(self, user_broker_id: str, value: TradeAuditEventDraft) -> TradeAuditEventDraft:
         _require_scope(user_broker_id, value.user_broker_id, "trade_audit_event")
-        for scope_column, id_column, reference_id in (
-            (TradingAutomationModel.user_broker_id, TradingAutomationModel.id, value.automation_id),
-            (TradeDecisionModel.user_broker_id, TradeDecisionModel.id, value.decision_id),
-            (BrokerOrderModel.user_broker_id, BrokerOrderModel.id, value.broker_order_id),
-            (TradeExecutionModel.user_broker_id, TradeExecutionModel.id, value.execution_id),
-            (BrokerInstrumentModel.user_broker_id, BrokerInstrumentModel.id, value.instrument_id),
-        ):
-            require_scoped_reference(
-                self._session,
-                scope_column=scope_column,
-                id_column=id_column,
-                user_broker_id=user_broker_id,
-                reference_id=reference_id,
-                entity_type="trade_audit_event",
+        automation_instrument = self._session.scalar(
+            select(TradingAutomationModel.instrument_id).where(
+                TradingAutomationModel.user_broker_id == user_broker_id,
+                TradingAutomationModel.id == value.automation_id,
             )
-        if (
-            self._session.scalar(
-                select(TradingAutomationModel.id).where(
-                    TradingAutomationModel.user_broker_id == user_broker_id,
-                    TradingAutomationModel.id == value.automation_id,
-                    TradingAutomationModel.instrument_id == value.instrument_id,
-                )
-            )
-            is None
-        ):
-            raise TradingFactPersistenceError(
-                TradingFactErrorCode.INVALID_STATE,
-                entity_type="trade_audit_event",
-            )
+        )
+        if automation_instrument is None:
+            raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type="trade_audit_event")
+        references = []
         for reference_model, reference_id in (
             (TradeDecisionModel, value.decision_id),
             (BrokerOrderModel, value.broker_order_id),
@@ -105,21 +85,28 @@ class TradingAuditRepository:
         ):
             if reference_id is None:
                 continue
-            if (
-                self._session.scalar(
-                    select(reference_model.id).where(
-                        reference_model.user_broker_id == user_broker_id,
-                        reference_model.id == reference_id,
-                        reference_model.automation_id == value.automation_id,
-                        reference_model.instrument_id == value.instrument_id,
-                    )
+            reference = self._session.execute(
+                select(reference_model.automation_id, reference_model.instrument_id).where(
+                    reference_model.user_broker_id == user_broker_id,
+                    reference_model.id == reference_id,
                 )
-                is None
-            ):
-                raise TradingFactPersistenceError(
-                    TradingFactErrorCode.INVALID_STATE,
-                    entity_type="trade_audit_event",
-                )
+            ).one_or_none()
+            if reference is None:
+                raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type="trade_audit_event")
+            references.append(reference)
+        require_scoped_reference(
+            self._session,
+            scope_column=BrokerInstrumentModel.user_broker_id,
+            id_column=BrokerInstrumentModel.id,
+            user_broker_id=user_broker_id,
+            reference_id=value.instrument_id,
+            entity_type="trade_audit_event",
+        )
+        if automation_instrument != value.instrument_id or any(
+            reference.automation_id != value.automation_id or reference.instrument_id != value.instrument_id
+            for reference in references
+        ):
+            raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="trade_audit_event")
         model = TradeAuditEventModel(**value.model_dump(mode="python"))
         return append_idempotent(
             self._session,

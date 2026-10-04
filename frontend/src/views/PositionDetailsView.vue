@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue"
+import { computed, onBeforeUnmount, ref, watch } from "vue"
 import { RouterLink, useRoute } from "vue-router"
 
 import {
@@ -12,6 +12,7 @@ const route = useRoute()
 const details = ref<AutomationDetails>()
 const data = computed(() => details.value?.automation)
 const averagePrice = computed(() => {
+  if (data.value?.bootstrap_pending) return undefined
   const rawValue = data.value?.average_price
   if (typeof rawValue !== "string" || rawValue.trim() === "") return undefined
   const value = Number(rawValue)
@@ -20,24 +21,41 @@ const averagePrice = computed(() => {
 const error = ref("")
 const loading = ref(false)
 
-/** Refresh the selected automation, retaining the existing request overlap guard. */
-async function refresh(): Promise<void> {
-  if (loading.value) return
-  loading.value = true
-  error.value = ""
-  try { details.value = await fetchAutomationDetails(String(route.params.id)) }
-  catch (caught: unknown) { error.value = caught instanceof Error ? caught.message : "Торговый автомат не найден." }
-  finally { loading.value = false }
-}
-
 let refreshTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
-onMounted(async () => {
+let generation = 0
+
+function isCurrent(requestGeneration: number): boolean {
+  return !disposed && requestGeneration === generation
+}
+
+async function refresh(): Promise<void> {
+  if (disposed || loading.value) return
+  const requestGeneration = generation
+  const automationId = String(route.params.id)
+  loading.value = true
+  error.value = ""
+  try {
+    const response = await fetchAutomationDetails(automationId)
+    if (isCurrent(requestGeneration)) details.value = response
+  } catch (caught: unknown) {
+    if (isCurrent(requestGeneration)) error.value = caught instanceof Error ? caught.message : "Торговый автомат не найден."
+  } finally {
+    if (isCurrent(requestGeneration)) loading.value = false
+  }
+}
+
+watch(() => String(route.params.id ?? ""), async (automationId) => {
+  const requestGeneration = ++generation
+  if (refreshTimer !== undefined) clearInterval(refreshTimer)
+  details.value = undefined
+  error.value = ""
+  loading.value = false
+  if (disposed || !automationId) return
   await refresh()
-  // Do not recreate polling after cleanup while the first request was pending.
-  if (disposed) return
-  refreshTimer = setInterval(refresh, 60_000)
-})
+  // A prior route or unmounted page must not resurrect its polling timer.
+  if (isCurrent(requestGeneration)) refreshTimer = setInterval(refresh, 60_000)
+}, { immediate: true, flush: "sync" })
 onBeforeUnmount(() => {
   disposed = true
   if (refreshTimer !== undefined) clearInterval(refreshTimer)
@@ -58,9 +76,10 @@ onBeforeUnmount(() => {
         <span>{{ data.broker_name || data.broker_id }} / {{ data.account_id }}</span>
         <button :disabled="loading" @click="refresh">Обновить</button>
       </div>
+      <p v-if="data.bootstrap_pending" role="status">Ожидает первоначальной сверки позиции</p>
       <div class="detail-grid">
-        <article class="grid-row"><strong>Позиция</strong><p>Лоты: {{ data.quantity_lots }}</p><p>Средняя цена: {{ data.average_price }} {{ data.currency }}</p><p>Вложено: {{ data.invested_amount }} {{ data.currency }}</p></article>
-        <article class="grid-row"><strong>Результат</strong><p>Realized: {{ data.realized_pnl }}</p><p>Unrealized: {{ data.unrealized_pnl }}</p><p>Net P&amp;L: {{ data.net_pnl }}</p><p>Комиссии: {{ data.actual_commissions }}</p></article>
+        <article class="grid-row"><strong>Позиция</strong><p>Лоты: {{ data.bootstrap_pending ? '—' : data.quantity_lots }}</p><p>Средняя цена: {{ data.bootstrap_pending ? '—' : `${data.average_price} ${data.currency}` }}</p><p>Вложено: {{ data.bootstrap_pending ? '—' : `${data.invested_amount} ${data.currency}` }}</p></article>
+        <article class="grid-row"><strong>Результат</strong><p>Realized: {{ data.bootstrap_pending ? '—' : data.realized_pnl }}</p><p>Unrealized: {{ data.bootstrap_pending ? '—' : data.unrealized_pnl }}</p><p>Net P&amp;L: {{ data.bootstrap_pending ? '—' : data.net_pnl }}</p><p>Комиссии: {{ data.bootstrap_pending ? '—' : data.actual_commissions }}</p></article>
         <article class="grid-row"><strong>Стратегия</strong><p>Код: {{ data.strategy_code }}</p><p>Версия: {{ data.strategy_version }}</p><p>Единый алгоритм для всех позиций. Пороги усреднения и частичной прибыли пересчитываются по рынку.</p><p>Revision: {{ data.revision }}</p></article>
       </div>
       <article class="candle-panel">

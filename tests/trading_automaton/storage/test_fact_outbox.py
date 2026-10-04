@@ -1007,3 +1007,47 @@ def test_selector_characterizes_equal_timestamp_id_order_and_deadline_boundary(f
 
     assert before == []
     assert [row.event_id for row in at_boundary] == [str(UUID(int=731)), str(UUID(int=732))]
+
+
+def test_diagnostic_aggregate_is_one_scalar_select_without_loading_payload(factory):
+    with factory.begin() as session:
+        for index, state in enumerate(("PENDING", "PENDING", "FAILED"), start=1):
+            session.add(
+                FactOutboxModel(
+                    event_id=str(index),
+                    user_broker_id=SCOPE_ID,
+                    automation_id=AUTOMATION_A,
+                    sequence_number=index,
+                    expected_revision=index,
+                    fact_kind="TRADE_AUDIT_RECORDED",
+                    payload={"large": "x" * 10000},
+                    safe_message="synthetic",
+                    occurred_at=NOW,
+                    created_at=NOW + timedelta(seconds=index),
+                    delivery_state=state,
+                    retry_count=index,
+                )
+            )
+    statements = []
+    engine = factory.kw["bind"]
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = LocalAutomationRepository(factory).outbox_diagnostics()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert result.observation == "OBSERVED"
+    assert (result.pending_count, result.failed_count, result.max_retry_count) == (2, 1, 2)
+    assert result.oldest_pending_at == NOW + timedelta(seconds=1)
+    assert len(statements) == 1
+    assert "payload" not in statements[0].lower()
+
+
+def test_empty_diagnostic_queue_has_zero_counts_and_no_pending_metadata(factory):
+    result = LocalAutomationRepository(factory).outbox_diagnostics()
+    assert (result.pending_count, result.failed_count) == (0, 0)
+    assert result.oldest_pending_at is None
+    assert result.max_retry_count is None

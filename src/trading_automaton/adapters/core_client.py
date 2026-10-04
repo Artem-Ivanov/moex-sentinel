@@ -17,6 +17,7 @@ from sentinel_contracts.trading_facts import (
     FactEnvelope,
 )
 from sentinel_contracts.version import SERVICE_VERSION
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
 
 
 class CoreClient:
@@ -70,13 +71,14 @@ class CoreClient:
         response.raise_for_status()
         return FactBatchResult.model_validate(response.json())
 
-    def heartbeat(self, worker_id: str, occurred_at: datetime) -> None:
+    def heartbeat(self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None) -> None:
         self.validate_runtime()
         response = self._http.post(
             "/internal/automaton/heartbeats",
             json={
                 "worker_id": worker_id,
                 "occurred_at": _json_value(occurred_at),
+                **({"worker_diagnostics": diagnostics.model_dump(mode="json")} if diagnostics is not None else {}),
                 **(
                     {
                         "runtime_version": {

@@ -270,3 +270,180 @@ it.each([false, true])("shows adoption exceptions despite catalog success or ref
   expect(screen.getByText(/Добавлено: 0, обновлено: 1/)).toBeTruthy()
   if (refreshFails) expect(await screen.findByText("Catalog refresh unavailable.")).toBeTruthy()
 })
+
+function deferredResponse() {
+  let resolve!: (value: Response) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<Response>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+async function renderCatalogue(fetchMock: ReturnType<typeof vi.fn>) {
+  vi.stubGlobal("fetch", fetchMock)
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: "/instruments", component: InstrumentsListView },
+    { path: "/elsewhere", component: { template: "<div>Другая страница</div>" } },
+  ] })
+  await router.push("/instruments"); await router.isReady()
+  render({ template: "<RouterView/>" }, { global: { plugins: [router] } })
+  return router
+}
+const twoBrokerSettings = { adapters: [], brokers: [
+  { id: "broker-1", display_name: "First", enabled: true },
+  { id: "broker-2", display_name: "Second", enabled: true },
+] }
+const otherCatalog = { ...catalog, broker_id: "broker-2", items: [{ ...catalog.items[0], broker_id: "broker-2", ticker: "SECOND" }] }
+const syncResult = { broker_id: "broker-1", added: 7, updated: 0, deactivated: 0, synchronized_at: "2026-10-04T00:00:00Z", adoption: { adopted: 7, existing: 0, held: 0, skipped: 0, diagnostics: [] } }
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+it.each(["success", "error"])("keeps newest catalogue after an older filter %s", async (outcome) => {
+  const older = deferredResponse(); const newer = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise))
+  await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Акции 1" }))
+  await fireEvent.click(screen.getByRole("button", { name: "Только выделенные" }))
+  newer.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "NEWEST" }] }))
+  await screen.findByText("NEWEST")
+  if (outcome === "success") older.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "STALE" }] }))
+  else older.reject(new Error("stale catalogue error"))
+  await settle()
+  expect(screen.queryByText("STALE")).toBeNull()
+  expect(screen.queryByText("stale catalogue error")).toBeNull()
+  expect(screen.getByText("NEWEST")).toBeTruthy()
+})
+it("keeps newer catalogue loading while an older read finishes", async () => {
+  const older = deferredResponse(); const newer = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise))
+  await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Акции 1" }))
+  await fireEvent.click(screen.getByRole("button", { name: "Сбросить фильтры" }))
+  older.resolve(Response.json(catalog)); await settle()
+  expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(true)
+  newer.resolve(Response.json(catalog))
+  await waitFor(() => expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false))
+})
+it("clears old broker actions and keeps broker filters interactive", async () => {
+  const pending = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise))
+  await fireEvent.click((await screen.findByText("SBER")).closest("tr")!)
+  await fireEvent.update(screen.getByRole("combobox", { name: "Брокер" }), "broker-2")
+  expect(screen.queryByText("SBER")).toBeNull()
+  expect((screen.getByRole("button", { name: "Подробнее" }) as HTMLButtonElement).disabled).toBe(true)
+  expect((screen.getByRole("combobox", { name: "Брокер" }) as HTMLSelectElement).disabled).toBe(false)
+  pending.resolve(Response.json(otherCatalog)); await screen.findByText("SECOND")
+})
+it("preserves selected row during same-scope refresh", async () => {
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockResolvedValueOnce(Response.json(catalog)))
+  await fireEvent.click((await screen.findByText("SBER")).closest("tr")!)
+  await fireEvent.click(screen.getByRole("button", { name: "Применить цену" }))
+  await waitFor(() => expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false))
+  expect((screen.getByRole("button", { name: "Подробнее" }) as HTMLButtonElement).disabled).toBe(false)
+})
+it.each(["success", "error"])("ignores old sync %s after broker A to B to A", async (outcome) => {
+  const pending = deferredResponse()
+  const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(Response.json(otherCatalog)).mockResolvedValueOnce(Response.json(catalog))
+  await renderCatalogue(fetchMock); await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await fireEvent.update(screen.getByRole("combobox", { name: "Брокер" }), "broker-2"); await screen.findByText("SECOND")
+  await fireEvent.update(screen.getByRole("combobox", { name: "Брокер" }), "broker-1"); await screen.findByText("SBER")
+  if (outcome === "success") pending.resolve(Response.json(syncResult))
+  else pending.reject(new Error("old sync error"))
+  await settle()
+  expect(screen.queryByText(/Добавлено: 7/)).toBeNull()
+  expect(screen.queryByText("old sync error")).toBeNull()
+  expect(fetchMock).toHaveBeenCalledTimes(5)
+})
+it("ignores old selection failure in replacement catalogue", async () => {
+  const pending = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(Response.json(catalog)))
+  await fireEvent.click(await screen.findByRole("switch"))
+  await fireEvent.click(screen.getByRole("button", { name: "Применить цену" }))
+  await waitFor(() => expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false))
+  pending.reject(new Error("selection failed")); await settle()
+  expect(screen.queryByText("Не удалось изменить отбор инструмента.")).toBeNull()
+  expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true")
+})
+it.each(["settings", "sync"])("does not start catalogue read after unmount with pending %s", async (kind) => {
+  const pending = deferredResponse()
+  const fetchMock = kind === "settings" ? vi.fn().mockReturnValueOnce(pending.promise) : vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise)
+  const router = await renderCatalogue(fetchMock)
+  if (kind === "sync") { await screen.findByText("SBER"); await fireEvent.click(screen.getByRole("button", { name: "Обновить" })) }
+  await router.push("/elsewhere"); await screen.findByText("Другая страница")
+  pending.resolve(Response.json(kind === "settings" ? twoBrokerSettings : syncResult)); await settle()
+  expect(fetchMock).toHaveBeenCalledTimes(kind === "settings" ? 1 : 3)
+})
+
+it("keeps newest catalogue error after older success", async () => {
+  const older = deferredResponse(); const newer = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise))
+  await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Акции 1" }))
+  await fireEvent.click(screen.getByRole("button", { name: "Сбросить фильтры" }))
+  newer.reject(new Error("current catalogue error")); await screen.findByText("current catalogue error")
+  older.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "STALE" }] })); await settle()
+  expect(screen.getByText("current catalogue error")).toBeTruthy()
+  expect(screen.queryByText("STALE")).toBeNull()
+})
+it("uses the requested filter snapshot while price edits remain drafts", async () => {
+  const pending = deferredResponse()
+  const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise)
+  await renderCatalogue(fetchMock); await screen.findByText("SBER")
+  await fireEvent.update(screen.getByLabelText("Цена лота от"), "100")
+  await fireEvent.update(screen.getByLabelText("Цена лота до"), "500")
+  await fireEvent.update(screen.getByRole("combobox", { name: "Валюта инструментов" }), "USD")
+  expect(fetchMock).toHaveBeenLastCalledWith("/api/brokers/broker-1/instruments?include_inactive=false&selected_only=false&lot_price_from=100&lot_price_to=500&currency=USD")
+  await fireEvent.update(screen.getByLabelText("Цена лота от"), "200")
+  pending.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "REQUESTED" }] }))
+  await screen.findByText("REQUESTED")
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+  expect((screen.getByLabelText("Цена лота от") as HTMLInputElement).value).toBe("200")
+})
+it.each(["filter-first", "sync-first"])("applies latest read across sync reload and filters (%s)", async (order) => {
+  const sync = deferredResponse(); const first = deferredResponse(); const second = deferredResponse()
+  const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(sync.promise).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+  await renderCatalogue(fetchMock); await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  if (order === "filter-first") {
+    await fireEvent.click(screen.getByRole("button", { name: "Только выделенные" }))
+    sync.resolve(Response.json(syncResult)); await screen.findByText(/Добавлено: 7/)
+  } else {
+    sync.resolve(Response.json(syncResult)); await screen.findByText(/Добавлено: 7/)
+    await fireEvent.click(screen.getByRole("button", { name: "Только выделенные" }))
+  }
+  first.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "STALE" }] })); await settle()
+  expect(screen.queryByText("STALE")).toBeNull()
+  expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(true)
+  second.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "LATEST" }] }))
+  await screen.findByText("LATEST")
+  await waitFor(() => expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false))
+  expect(screen.getByText(/Позиции: принято 7/)).toBeTruthy()
+})
+it("does not apply old selection success to a new object with the same id", async () => {
+  const pending = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(pending.promise).mockResolvedValueOnce(Response.json(catalog)))
+  await fireEvent.click(await screen.findByRole("switch"))
+  await fireEvent.click(screen.getByRole("button", { name: "Применить цену" }))
+  await waitFor(() => expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false))
+  pending.resolve(Response.json({ ...catalog.items[0], is_selected: false })); await settle()
+  expect(screen.getByRole("switch").getAttribute("aria-checked")).toBe("true")
+})
+it("clears row selection when a refreshed catalogue removes the selected row", async () => {
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockResolvedValueOnce(Response.json({ ...catalog, items: [] })))
+  await fireEvent.click((await screen.findByText("SBER")).closest("tr")!)
+  await fireEvent.click(screen.getByRole("button", { name: "Применить цену" }))
+  await screen.findByText("Справочник инструментов пуст")
+  expect((screen.getByRole("button", { name: "Подробнее" }) as HTMLButtonElement).disabled).toBe(true)
+})
+
+it("releases sync busy after mutation while the newest read owns loading", async () => {
+  const sync = deferredResponse(); const syncRead = deferredResponse(); const latestRead = deferredResponse()
+  await renderCatalogue(vi.fn().mockResolvedValueOnce(Response.json(twoBrokerSettings)).mockResolvedValueOnce(Response.json(catalog)).mockReturnValueOnce(sync.promise).mockReturnValueOnce(syncRead.promise).mockReturnValueOnce(latestRead.promise))
+  await screen.findByText("SBER")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  sync.resolve(Response.json(syncResult)); await screen.findByText(/Добавлено: 7/)
+  await fireEvent.click(screen.getByRole("button", { name: "Только выделенные" }))
+  latestRead.resolve(Response.json({ ...catalog, items: [{ ...catalog.items[0], ticker: "LATEST" }] }))
+  await screen.findByText("LATEST")
+  expect((screen.getByRole("button", { name: "Обновить" }) as HTMLButtonElement).disabled).toBe(false)
+  syncRead.resolve(Response.json(catalog)); await settle()
+  expect(screen.getByText("LATEST")).toBeTruthy()
+})

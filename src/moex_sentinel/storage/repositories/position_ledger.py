@@ -159,15 +159,17 @@ class PositionLedgerRepository:
                 closed_at=value.closed_at,
                 updated_at=value.updated_at,
             )
-            .returning(PositionCycleModel.id)
+            .returning(PositionCycleModel)
+            .execution_options(populate_existing=True, synchronize_session=False)
         )
-        if result.scalar_one_or_none() is None:
+        model = result.scalar_one_or_none()
+        if model is None:
             current = self.get_cycle(user_broker_id, value.id)
             if current.automation_id != value.automation_id or current.instrument_id != value.instrument_id:
                 raise TradingFactPersistenceError(TradingFactErrorCode.NOT_FOUND, entity_type="position_cycle")
             return current
         flush_or_translate(self._session, entity_type="position_cycle")
-        return self.get_cycle(user_broker_id, value.id)
+        return _cycle_value(model)
 
     def append_lot(self, user_broker_id: str, value: PositionLotDraft) -> PositionLotDraft:
         _require_scope(user_broker_id, value.user_broker_id, "position_lot")
@@ -300,7 +302,9 @@ class PositionLedgerRepository:
 
     def get_cycle(self, user_broker_id: str, cycle_id: str) -> PositionCycleDraft:
         model = self._session.scalar(
-            select(PositionCycleModel).where(
+            select(PositionCycleModel)
+            .execution_options(populate_existing=True)
+            .where(
                 PositionCycleModel.user_broker_id == user_broker_id,
                 PositionCycleModel.id == cycle_id,
             )

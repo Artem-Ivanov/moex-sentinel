@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 
+from moex_sentinel import __version__
 from moex_sentinel.api.app import create_app
 from moex_sentinel.storage.database import create_database_engine
 
@@ -38,7 +39,7 @@ def test_core_health_rejects_postgresql_without_current_revision(
     assert response.json() == {
         "status": "error",
         "service": "backend",
-        "version": "0.1.0",
+        "version": __version__,
         "database": "ok",
         "schema": "incompatible",
     }

@@ -13,6 +13,65 @@ receipt16:57 UTC: TEST6+PROD2, одна Core PG/БД, короткие observati
 
 ## Статус объединения БД — 02.10
 
+### Актуальный release snapshot — 03.10.2026
+
+По deployment receipt `develop/reports/vps-release-20261003/root-native-receipts.json`
+(17:14 UTC): deploy commit `be84ed4f047734ccacfba9b6ccb531af51ba4b94`, release
+`vps-20261003-be84ed4`, active path `/opt/moex-sentinel/releases/vps-20261003-be84ed4`
+для TEST и PROD; applied schema `0003_user_broker_archive`. Finalize подтвердил 8 running
+containers, image IDs, лимиты памяти и swap, mounts, networks и scope. TEST доступ READ_ONLY и
+`STRATEGY_ENABLED=false`; PROD Core запущен READ_ONLY, PROD Worker остановлен; TRADE не
+разрешён. Current runtime versions и отдельные HTTPS проверки записаны в
+[снимке VPS](remote-compose.md#текущий-снимок-после-deploy-03102026). Эти сведения не
+закрывают остальные операционные gates.
+
+### Открытая позиция PROD: снимок 03.10, 18:00 UTC
+
+Ограниченные HTTPS GET подтвердили READ_ONLY и один автомат HOLD/sequence0;
+отдельный READ ONLY aggregate подтвердил HOLD/BOOTSTRAPPING, полный исходный
+snapshot и отсутствие цикла. Это ожидание завершения первоначального учёта,
+которое Worker обрабатывает без пользовательского Resume. Диагностика Worker
+UNKNOWN/NOT_OBSERVED не подтверждает его готовность.
+
+Локальный read contract дополнен `bootstrap_pending`; UI показывает причину
+ожидания и неподтверждённые финансовые значения как «—». Этот fix ещё не
+развёрнут и не завершает bootstrap. READ_ONLY/strategy=false сохранены;
+возобновление торговли остаётся запрещённой в этом режиме командой. На момент
+этого снимка PROD Worker для сверки ещё не был запущен; торговый допуск открыт.
+Доказательства: `develop/reports/prod-resume-20261003/`.
+
+### Оперативное завершение первоначальной сверки — в работе
+
+Повторное требование пользователя исправить текущий импорт и прежний допуск
+согласовать broker state разрешают адресно запустить один уже установленный
+be84ed4 Worker READ_ONLY/strategy=false после capacity/token/bootstrap gates.
+Независимый архитектор принял этот scope. Новые образы/локальные изменения,
+Analytics, TRADE и TEST restart в операцию не входят. Для нового кода сохраняются
+commit владельца и отдельное разрешение deployment.
+
+Изолированная composed PROD проверка подтвердила bootstrap при Analytics outage
+и lost ACK/restart/replay: scoped claim, один cycle/lot, четыре факта, отсутствие
+orders/executions. Root fresh 1 PASS; независимый test/probe review C0/I0/M0.
+Метаданные 18:41 UTC: Core/PG healthy, approved installed Worker совпадает TEST,
+PROD volume существует, около 776MiB доступной RAM. После проверки пустого volume
+его owner исправлен на UID/GID установленного Worker, содержимое сохранено.
+Native preflight и start PASS около19:40 UTC; отдельная verify дала
+BOOTSTRAP_NOT_COMPLETE и остановила только созданный PROD Worker. Fresh HTTPS
+19:46 UTC: HOLD/sequence0 сохраняется, TEST6 IN_WORK, broker reads доступны.
+Metadata 20:01 UTC: штатная остановка exit0, OOM=false/restart0, ошибки рабочего
+цикла. Structured read-only counters 20:08 UTC: 40 `ValidationError` при
+connection/commands HTTP200. Installed internal connection DTO теряет выбранный
+account и environment/access mode; Worker не проходит validation до heartbeat.
+Локальный fix трёх DTO-полей и real HTTP roundtrip PROD READ_ONLY/TEST
+READ_ONLY/TRADE готовы: root fresh29 PASS, Ruff/diff PASS, независимый
+prod_resume_architect source/contract review C/I/M0. Код NOT DEPLOYED.
+Повторного запуска нет, восстановление пока НЕ принято. Новый код требует owner commit и
+отдельного deployment GO; READ_ONLY/strategy=false и токен только для чтения
+сохраняют запрет заявок. Доказательства:
+`develop/reports/prod-bootstrap-20261003/`.
+
+Абзацы ниже — историческое состояние на 02.10 и сохранены для аудита.
+
 Владелец требует одну PostgreSQL/одну database. Первоначальный отдельный PROD
 prototype PostgreSQL остановлен, его данные/volumes сохранены. Новый listener8443
 обслуживает initial PROD на общей Core БД. Неизменяемый master `1b410a9` развёрнут

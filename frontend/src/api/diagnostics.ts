@@ -11,6 +11,37 @@ export interface ServiceVersionObservation<Reason extends ServiceVersionReason =
   reason: Reason
 }
 
+export type WorkerDiagnosticReason = "NOT_OBSERVED" | "STALE" | "CONTROL_PROGRESS" | "CONTROL_STALLED" | "OUTBOX_BLOCKED" | "ITERATION_FAILED"
+export type OutboxDiagnosticReason = "NOT_OBSERVED" | "STALE" | "READ_FAILED" | "CLEAR" | "PENDING" | "FAILED" | "OLD_PENDING"
+export type WorkerIterationResult = "COMPLETED" | "OUTBOX_BLOCKED" | "ERROR"
+
+export interface OutboxDiagnosticsObservation {
+  observation: "OBSERVED" | "UNKNOWN"
+  status: "OK" | "DEGRADED" | "UNKNOWN"
+  reason: OutboxDiagnosticReason
+  pending_count: number | null
+  failed_count: number | null
+  oldest_pending_at: string | null
+  oldest_pending_age_ms: number | null
+  max_retry_count: number | null
+}
+
+export interface WorkerDiagnosticsObservation {
+  observation: "OBSERVED" | "UNKNOWN"
+  status: "OK" | "DEGRADED" | "UNKNOWN"
+  reason: WorkerDiagnosticReason
+  instance_id: string | null
+  received_at: string | null
+  age_ms: number | null
+  completed_iterations: number | null
+  last_completed_at: string | null
+  completion_age_ms: number | null
+  last_finished_at: string | null
+  last_result: WorkerIterationResult | null
+  error_code: "ITERATION_FAILED" | null
+  outbox: OutboxDiagnosticsObservation
+}
+
 export interface DiagnosticsStatus {
   captured_at: string
   status: "UNKNOWN" | "DOWN" | "DEGRADED"
@@ -26,6 +57,8 @@ export interface DiagnosticsStatus {
     worker: ServiceVersionObservation<"OBSERVED" | "NOT_OBSERVED" | "STALE">
     analytics: ServiceVersionObservation<"OBSERVED" | "NOT_CONFIGURED" | "UNAVAILABLE" | "INVALID_RESPONSE">
   }
+  /** Absent in responses from earlier Core versions. */
+  worker?: WorkerDiagnosticsObservation | null
   awaiting_observations: AwaitingObservation[]
 }
 

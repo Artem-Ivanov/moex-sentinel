@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.views.schemas.market_data import HistoricCandleSchema
@@ -20,7 +20,9 @@ from sentinel_contracts.business_audit import (
     PublishAuditResult,
 )
 from sentinel_contracts.runtime_versions import RuntimeVersion
+from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
 from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
 
 if TYPE_CHECKING:
     from moex_sentinel.domain.automations import TradingAutomationDetails
@@ -57,6 +59,7 @@ class AutomationSchema(StrictSchema):
     broker_name: str
     ticker: str
     instrument_name: str
+    bootstrap_pending: bool = False
 
     @classmethod
     def from_domain(cls, value: AutomationRecord) -> AutomationSchema:
@@ -157,6 +160,13 @@ class HeartbeatRequestSchema(StrictSchema):
     worker_id: str
     occurred_at: datetime
     runtime_version: RuntimeVersion | None = None
+    worker_diagnostics: WorkerDiagnostics | None = None
+
+    @model_validator(mode="after")
+    def require_diagnostic_identity(self):
+        if self.worker_diagnostics is not None and self.runtime_version is None:
+            raise ValueError("Worker diagnostics requires runtime identity")
+        return self
 
 
 class HeartbeatResponseSchema(StrictSchema):
@@ -170,6 +180,9 @@ class BrokerConnectionSchema(StrictSchema):
     target: str
     token: str
     is_test: bool
+    environment: BrokerEnvironment | None = None
+    access_mode: BrokerAccessMode = "READ_ONLY"
+    account_id: str = ""
 
     @classmethod
     def from_domain(cls, value: BrokerConnection) -> BrokerConnectionSchema:

@@ -1,11 +1,13 @@
 """Public health View."""
 
+from functools import partial
 from typing import Literal, cast
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import ConfigDict, Field
 
 from moex_sentinel import __version__
+from moex_sentinel.services.sync_execution import run_sync
 from moex_sentinel.usecases.health import CheckReadinessUsecase
 from sentinel_contracts.base import PositionalModel
 
@@ -28,7 +30,7 @@ class HealthResponse(PositionalModel):
 async def health(request: Request, response: Response) -> HealthResponse:
     """Report HTTP and database readiness without leaking connection errors."""
     usecase = cast(CheckReadinessUsecase, request.app.state.readiness_usecase)
-    readiness = usecase.execute()
+    readiness = await run_sync(partial(usecase.execute))
     ready = readiness.database_ok and readiness.schema_ok
     if not ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

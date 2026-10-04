@@ -81,6 +81,11 @@ def test_diagnostics_readiness_contract(
             "reason": "NOT_CONFIGURED",
         },
     }
+    worker = payload.pop("worker")
+    assert worker["status"] == "UNKNOWN"
+    assert worker["reason"] == "NOT_OBSERVED"
+    assert worker["completed_iterations"] is None
+    assert worker["outbox"]["pending_count"] is None
     assert payload == {
         "status": status,
         "core": {"status": core_status, "version": "0.2.0", "database": database, "schema": schema, "reason": reason},
