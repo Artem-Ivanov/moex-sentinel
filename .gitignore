@@ -19,9 +19,18 @@ frontend/*.tsbuildinfo
 
 .DS_Store
 .idea/
+.vscode/
+# Project agent templates are shared; other agent state remains local.
+.agents/*
+!.agents/README.md
+!.agents/moex_architect.toml
+!.agents/moex_reviewer.toml
+!.agents/moex_backend_developer.toml
+!.agents/moex_frontend_developer.toml
+!.agents/moex_junior_backend_developer.toml
+!.agents/moex_junior_frontend_developer.toml
 
 # Local IDE state and preserved historical document originals.
-/.vscode/
 /docs/audits/2026-08-08-solution-audit.md
 /docs/audits/2026-08-09-trading-automaton-decision-audit.md
 /docs/audits/2026-08-10-trading-automaton-runtime-decision-audit.md
