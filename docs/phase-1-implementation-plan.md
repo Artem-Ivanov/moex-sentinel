@@ -54,7 +54,7 @@ Worker/broker/Analytics/market/outbox/portfolio/strategy имеют UNKNOWN.
 `/root/o1_reviewer` CODE/DOC PASS, существенных замечаний нет.
 Доказательства: develop/reports/o1-status-20261003/.
 
-### O1.2 — цикл управления Worker и доставка событий (LOCAL DONE / NOT DEPLOYED)
+### O1.2 — цикл управления Worker и доставка событий (DEPLOYED)
 
 04.10 пользователь выбрал совместно O1.2 и M1.1 для первого patch. Проверка
 актуальности root/`o12_relevance_architect`: `/diagnostics` и navigation уже
@@ -72,7 +72,9 @@ UNKNOWN, ошибки/остановившийся прогресс DEGRADED. О
 исполнимого RED; отдельное baseline9FAIL→GREEN27 доказательство не выдаётся
 за строгую исходную TDD хронологию.
 [Контракт/задачи/DoD](superpowers/plans/o1-core-diagnostics.md#o12-control-loop-и-outbox).
-Код NOT DEPLOYED; полная O1 и текущий PROD bootstrap не закрываются.
+Код развёрнут 04.10 в f29472f; свежие наблюдения показывают CONTROL_PROGRESS/
+COMPLETED и растущий счётчик в обоих контурах. Полная O1 остаётся открытой;
+read-only PROD bootstrap описан в снимке выкладки 04.10 ниже.
 
 ### PROD: незавершённый импорт позиции и недоступный Resume
 
@@ -117,8 +119,37 @@ NOT DEPLOYED; повторного запуска нет. Независимый
 Read-only токен запрещает торговые поручения; режим приложения и PROD TRADE
 hardguard отдельно сохраняют запрет. Замена токена не является допуском торговли.
 План и доказательства: `develop/reports/prod-bootstrap-20261003/`.
-Новая кодовая версия и локальные UI изменения не развёрнуты: commit делает
-владелец, новый deploy после отдельной отмашки. P3/P4/P5 торговый допуск открыт.
+На момент 03.10 новая версия и UI fix не были развёрнуты. Владелец закоммитил
+пакет и дал deployment GO 04.10; свежий результат ниже. P3/P4/P5 торговый допуск открыт.
+
+### Выкладка 04.10: 0.2.0, f29472f и отдельная проверка
+
+Commit владельца `f29472f405542ba172af4401f81d192246e04f43` установлен по GO
+«Запускаем деплой» в 12:42:22 UTC. Release `vps-20261004-f29472f`, оба current
+links переключены. 9 running контейнеров; TEST/PROD Worker READ_ONLY,
+strategy=false. Shared PG/Worker volumes/caps сохранены, schema0003 уже актуальна:
+миграций и dump в этом patch нет. Собраны5 Linux images до остановки, source/
+imports/UID/dist hashes приняты root и независимым архитектором.
+
+HTTPS/assets, login/logout/foreign-cookie401, accounts/portfolio/automations
+проверены отдельно после delivery. Каталог FUND/RUB nonselected вернул82/82
+элемента, account1/1/errors0. PROD read-only bootstrap завершился штатно:
+pendingfalse/seq6/quartet4/IN_WORKrev2, Broker/Core/Worker qty/price/currency
+совпадают, orders/executions/intents/alloc0. Это не допуск торговли.
+
+Первая strict postverify FAILED на TEST instant outbox0/cache-sequence equality:
+PENDING8→CLEAR0, failed0, progress253→271, финансовые checks истинны.
+Исходный FAILED сохранён. Single high-water followup13:07:57–13:08:09 UTC PASS:
+все6 TEST Core sequence>=captured Worker cutoff, old-prefix absent,
+financial/scope/no-orders parity сохранена. Captured pending cohort пуст: kinds/
+UUID первоначальных8 событий не доказаны. Поздние8 pending вышеcutoff допустимы,
+failed0; это конечная граница доставки, не обещание вечной idle queue/всей истории.
+Core/Worker/API снимки неатомарны, новые READ_ONLY WAIT facts разрешены.
+Native runtime9running/noOOM/restarts/exactpins PASS, HEAD/index/source50
+не изменены. Итоговое независимое runtime/doc review фиксируется отдельно.
+Evidence `develop/reports/deploy-20261004/`, delivery exact SHA
+`f588364af1211e0b080e176ef5ba75e65607ebf9a3aed1d2ac6eb4af631399fa`.
+Подробный scope/первые operational failures: [runtime](deployment/remote-compose.md).
 
 ### Выкладка 03.10: 0.2.0 и отдельная проверка после неё
 
@@ -398,7 +429,7 @@ A1 первый HTTP synthetic replay замер отрицательный и �
 concurrent warmup для old/new exact script архивирован до замера; одна fixed pair
 89.38→100.92req/s, p9559.50→50.98ms. Общего production ускорения не заявляем.
 
-**A1 + C1–C4 + W4: LOCAL DONE / NOT DEPLOYED.**
+**A1 + C1–C4 + W4: DEPLOYED 04.10 в f29472f.**
 Независимый a1_c14_w4_architect: итоговое CODE/CONTRACT/SOLID/TEST/INTEGRATION/
 DOC/RECEIPT PASS, C0/I0/M0; все обязательные локальные gates выполнены.
 Fresh root nonPG1674PASS/0FAIL/0SKIP, PostgreSQL187PASS/0FAIL/0SKIP,
@@ -432,7 +463,7 @@ root-final-acceptance.json,root-integration-independent-review.md}.
 ограниченных пакета перед тем же patch: F3.1 — карточки инструмента/позиции/счёта
 при смене route; F2.1 — поздние чтения каталога и операций при смене фильтров/лимита.
 Всего пять существующих views и пять specs, без изменения API/финансовых команд,
-auth, БД и зависимостей. **F2.1/F3.1 LOCAL DONE / NOT DEPLOYED.** Senior
+auth, БД и зависимостей. **F2.1/F3.1 DEPLOYED 04.10 в f29472f.** Senior
 `next_ui_senior` реализовал карточки, `f2_frontend_senior` — каталог и принял
 операции от junior `f2_operations_junior`. До изменения компонентов выполнены
 RED-прогоны; регрессии проверены через настоящий RouterView и deferred ответы.

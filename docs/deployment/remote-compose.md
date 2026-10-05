@@ -16,7 +16,59 @@ Overlay использует [правила merge Docker Compose](https://docs.
 
 ## Развёрнутый VPS
 
-### Текущий снимок после deploy 03.10.2026
+### Текущий снимок после deploy 04.10.2026
+
+По разрешению владельца установлен commit
+`f29472f405542ba172af4401f81d192246e04f43`, версия сервисов `0.2.0`, release
+`vps-20261004-f29472f`. Обе ссылки current указывают на новый release.
+Delivery завершена в 12:42:22 UTC: 9 running контейнеров, включая Worker TEST
+и PROD. Shared PostgreSQL сохранила ID, volume и schema
+`0003_user_broker_archive`; legacy PROD database остаётся stopped.
+Миграция в этом выпуске отсутствует. Существующие Worker SQLite volumes,
+ограничения ресурсов, scopes и порты сохранены. В canonical env заменён только
+RELEASE_TAG. Оба контура READ_ONLY, `STRATEGY_ENABLED=false`; TRADE не включён.
+
+Committed source и свежий frontend dist проверены до остановки. Новые Linux
+образы построены из прежних образов соответствующих сервисов с проверкой
+неизменности dependency manifests и полной заменой application source;
+фактические imports/source hashes/UID и frontend assets проверены нативно.
+Это не закрывает полную веху M1 по образам, памяти и production latency.
+
+HTTPS с проверкой сертификата и exact index/CSS/JS hashes прошёл в обоих
+контурах. Авторизованные accounts/portfolio/automation reads, вход/выход и
+изоляция cookie прошли. Непустой каталог проверен через существующий фильтр
+FUND/RUB: по 82 элемента в TEST и PROD; это размер выборки, не всего каталога.
+В PROD незавершённый bootstrap завершился: sequence6, quartet4,
+bootstrap_pending=false; количество, средняя цена и валюта согласованы между
+Broker/Core/Worker, orders/executions/intents/allocations0.
+
+Первая отдельная strict postverification сохранена как FAILED: TEST очередь
+PENDING8 в первом снимке и CLEAR0 во втором, failed0 и control progress есть;
+текущие Core/Worker sequences читались неатомарно. Это не доказывает потерю
+доставки и не служит разрешением recovery. Отдельный single read-only followup
+13:07:57–13:08:09 UTC прошёл: для всех6 TEST automation Core sequence достигла
+зафиксированного Worker high-water, старый outbox prefix отсутствует, финансовые/
+scope/no-orders проверки сохранены. На момент capture pending cohort пуст;
+точные UUID/kinds первоначальных8 событий этой проверкой не доказаны.
+Поздние8 pending выше cutoff учтены отдельно, FAILED0. Это подтверждение
+зафиксированной границы доставки, не постоянно пустой очереди и не всей истории.
+Исходный strict FAILED не переписан. HTTPS/API/read-only bootstrap и указанная
+граница доставки проверены; browser click и длительное наблюдение не выполнялись.
+PROD read-only bootstrap подтверждён двумя наблюдениями, торговый допуск P3–P5
+остаётся OPEN. Итоговое независимое runtime/doc review фиксируется отдельно.
+
+Первый quiesce остановился на Analytics exit143: installed Uvicorn0.54.0
+после graceful shutdown повторно поднимает SIGTERM. Исправлен только
+operational gate:143 допускается для Core/Analytics при подтверждённых маркерах
+текущей остановки, прочие роли требуют0. Адресное продолжение прошло независимое
+review и23 offline checks; БД и journals не исправлялись. Первый сбой сохранён.
+Evidence: `develop/reports/deploy-20261004/`; exact server delivery receipt SHA
+`f588364af1211e0b080e176ef5ba75e65607ebf9a3aed1d2ac6eb4af631399fa`.
+Итоговый native снимок:9 running/no OOM/no restarts, exact IDs/images/scopes/
+mounts/caps/env hashes/links; RAM available693MiB, disk free43.7GiB. Это текущий
+снимок, не benchmark экономии памяти.
+
+### Исторический снимок после deploy 03.10.2026
 
 По `develop/reports/vps-release-20261003/root-native-receipts.json` (17:14 UTC):
 commit `be84ed4f047734ccacfba9b6ccb531af51ba4b94`, release
