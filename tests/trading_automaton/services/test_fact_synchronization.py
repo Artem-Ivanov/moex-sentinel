@@ -3,7 +3,6 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-import httpx
 import pytest
 
 from sentinel_contracts.trading import AutomationState
@@ -18,6 +17,7 @@ from sentinel_contracts.trading_facts import (
     FactIngressErrorCode,
 )
 from tests.contracts.trading_facts_helpers import all_envelopes
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.domain.storage_dtos import FactOutboxRecord
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 
@@ -28,7 +28,7 @@ NOW = datetime(2026, 8, 13, 12, tzinfo=UTC)
 def test_long_outage_keeps_next_fact_retry_bounded_and_preserves_envelope(previous_retries):
     pending = row().model_copy(update={"retry_count": previous_retries})
     repository = RepositoryStub([pending])
-    client = ClientStub(httpx.ConnectError("synthetic outage"))
+    client = ClientStub(CoreOperationError(retryable=True))
     service = FactSynchronizationService(
         repository, client, now=lambda: NOW, sleep=lambda _: None, retry_limit=0, deadline_ms=0
     )
@@ -233,7 +233,7 @@ def test_non_retryable_failure_reconciles_without_acknowledging_failed_rows() ->
 def test_retries_byte_equivalent_batch_on_transport_failure() -> None:
     pending = row(0)
     client = ClientStub(
-        httpx.ConnectError("offline"),
+        CoreOperationError(retryable=True),
         FactBatchResult(
             results=(
                 FactGroupAcknowledgement(
@@ -265,12 +265,8 @@ def test_retries_byte_equivalent_batch_on_transport_failure() -> None:
 @pytest.mark.parametrize(
     "failure",
     [
-        httpx.ConnectError("offline"),
-        httpx.HTTPStatusError(
-            "service unavailable",
-            request=httpx.Request("POST", "https://core.test/facts"),
-            response=httpx.Response(503),
-        ),
+        CoreOperationError(retryable=True),
+        CoreOperationError(retryable=True, status_code=503),
     ],
     ids=["transport", "http-503"],
 )
@@ -389,3 +385,20 @@ def test_wrong_closed_outbox_scope_prevents_core_publication():
         service.flush_outbox()
     assert client.published == []
     assert repository.acknowledged == repository.rejected == []
+
+
+@pytest.mark.parametrize("status", [302, 400, 409])
+def test_permanent_protocol_failure_reconciles_and_rejects_without_retry(status):
+    pending = row()
+    repository = RepositoryStub([pending])
+    client = ClientStub(CoreOperationError(retryable=False, status_code=status))
+    delays = []
+    service = FactSynchronizationService(
+        repository, client, now=lambda: NOW, sleep=delays.append, retry_limit=5, deadline_ms=0
+    )
+    assert service.flush_outbox() is True
+    assert len(client.published) == 1
+    assert client.status_batches == [(UUID(pending.automation_id),)]
+    assert repository.rejected == [(pending.automation_id, (pending.event_id,), f"HTTP_{status}")]
+    assert repository.reconciled == [(pending.automation_id, "HOLD", 4, 7)]
+    assert repository.retries == delays == []

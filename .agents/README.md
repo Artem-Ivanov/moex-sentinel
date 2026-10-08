@@ -1,7 +1,8 @@
 # Шаблоны агентов MOEX Sentinel
 
-Шесть редактируемых профилей: архитектор, независимый ревьюэр, два senior и
-два junior разработчика. Backend и frontend разделены по границам проекта.
+Восемь редактируемых профилей: архитектор, независимый reviewer, security-аудитор,
+два senior, два профильных junior и универсальный worker. Backend и frontend
+разделены по границам проекта.
 Root всегда оркестратор: поручает задачи, одобряет декомпозицию и принимает
 пакет после независимого ревью. Реализацию поручает исполнителям.
 Шаблоны хранятся в `.agents/` по решению владельца, рядом с проектными skills.
@@ -20,14 +21,18 @@ Root всегда оркестратор: поручает задачи, одо�
 | --- | --- | --- | --- |
 | [moex_architect.toml](moex_architect.toml) | Реальный поток, границы, контракт, пакеты и приёмка | `gpt-6.1-sol` / `high` | `read-only` |
 | [moex_reviewer.toml](moex_reviewer.toml) | Независимая проверка плана, diff и доказательств | `gpt-6.1-sol` / `high` | `read-only` |
-| [moex_backend_developer.toml](moex_backend_developer.toml) | Senior: декомпозиция, сложный backend, review/integration junior | `gpt-6.1-sol` / `medium` | `workspace-write` |
-| [moex_frontend_developer.toml](moex_frontend_developer.toml) | Senior: декомпозиция, сложный frontend, review/integration junior | `gpt-6.1-sol` / `medium` | `workspace-write` |
+| [moex_security_auditor.toml](moex_security_auditor.toml) | Назначенный read-only аудит auth/authz, сессий, CSRF, секретов и trust boundaries | `gpt-6.1-sol` / `high` | `read-only` |
+| [moex_backend_developer.toml](moex_backend_developer.toml) | Senior: сложная спроектированная backend/financial/security работа и интеграция junior | `gpt-6-luna` / `high` | `workspace-write` |
+| [moex_frontend_developer.toml](moex_frontend_developer.toml) | Senior: спроектированный frontend/API поток и интеграция junior | `gpt-6-luna` / `high` | `workspace-write` |
 | [moex_junior_backend_developer.toml](moex_junior_backend_developer.toml) | Маленькая независимая backend часть по одобренному brief | `gpt-6-luna` / `low` | `workspace-write` |
 | [moex_junior_frontend_developer.toml](moex_junior_frontend_developer.toml) | Маленькая независимая frontend часть по одобренному brief | `gpt-6-luna` / `low` | `workspace-write` |
+| [moex_worker.toml](moex_worker.toml) | Универсальные ограниченные leaf-задачи реализации, тестов, рефакторинга и документации | `gpt-6-luna` / `low` | `workspace-write` |
 
-Модель — стартовое предложение, доступность зависит от аккаунта. В каждом файле
-можно заменить `model` и `model_reasoning_effort` на доступные значения; для
-сложного финансового изменения увеличить глубину или выбрать более сильную модель.
+Модель — стартовое предложение, доступность зависит от аккаунта. TOML принимает
+одно значение `model_reasoning_effort`: root может назначить `medium` для большего,
+но ясно ограниченного junior/worker leaf-пакета и `xhigh` для сложной архитектуры
+или auth/security review. Это решение указывается в брифе запуска, а не как
+массив или диапазон TOML. Senior backend/frontend остаются на `high`.
 Цена и скорость этих профилей не измерены; настройка не гарантирует экономию,
 скорость или качество.
 Модель основного координатора задаётся отдельно в клиенте.
@@ -74,7 +79,8 @@ root (оркестратор)
   ├─ архитектор → план и контракты → root
   ├─ senior backend → одобренные root части → junior backend
   ├─ senior frontend → одобренные root части → junior frontend
-  ├─ junior backend/frontend ← однопунктовый brief напрямую от root
+  ├─ junior backend/frontend или worker ← однопунктовый brief напрямую от root
+  ├─ security auditor ← явно назначенный read-only аудит → root
   └─ независимый reviewer ← пакет и итоговая интеграция от root
 junior → diff/доказательства → parent senior/root → review/integration → root
 ```
@@ -94,7 +100,7 @@ junior → diff/доказательства → parent senior/root → review/i
 4. Senior запускает только junior по одобренному root brief и при свободном
    лимите сеанса. Иначе запрашивает root запуск или последовательное исполнение;
    лимит не обходится. Архитектор и reviewer не запускают агентов самостоятельно.
-   Junior — leaf: не запускает агентов, не расширяет scope, эскалирует сложность
+   Junior и worker — leaf: не запускают агентов, не расширяют scope, эскалируют сложность
    senior/root, не переключает модель/reasoning без ACK root и не принимает
    собственный пакет.
 5. Junior возвращает diff и проверки parent senior/root. Senior отвечает за review,
@@ -106,13 +112,13 @@ junior → diff/доказательства → parent senior/root → review/i
    принимает пакет и один обновляет общий CURRENT/WORK_LOG и очередь. Исполнители
    возвращают ему текст результата, чтобы избежать гонок.
 8. Владелец коммитит; деплой следует после его отмашки. Реальная торговля требует
-   отдельного допуска. Ни одна из шести ролей самостоятельно не выполняет
+   отдельного допуска. Ни одна из ролей самостоятельно не выполняет
    stage/commit/push/deploy или операции с рабочими данными.
 
 Тесты с временными файлами, cache и отдельной тестовой БД выполняют назначенные
 разработчики. Read-only reviewer проверяет доказательства и передаёт недостающие
 команды root для назначения запуска; это не собственный запуск тестов reviewer.
-Шесть профилей не требуют шести одновременно работающих агентов. Свободные
+Восемь профилей не требуют восьми одновременно работающих агентов. Свободные
 слоты считаются по фактическому лимиту сеанса, включая root и живых исполнителей.
 Новые профили не повышают лимит и не разрешают live API/SSH, торговлю или удаление
 истории, recovery journals и persistent volumes.
@@ -144,15 +150,15 @@ max_concurrent_threads_per_session = 3
 [Configuration Reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 Ограничение текущего клиента/сеанса может быть ниже.
 Откройте новый сеанс Codex в доверенном проекте и запросите задачу по именам ролей.
-Клиент должен обнаружить шесть пользовательских профилей; это отдельная
-проверка подключения после редактирования.
+Клиент должен обнаружить профили; это отдельная проверка подключения после
+редактирования, а фактическое число слотов определяется текущим runtime.
 
 ## Шаблон задания координатора
 
 ```text
-Роль: moex_architect / moex_reviewer / moex_backend_developer /
-      moex_frontend_developer / moex_junior_backend_developer /
-      moex_junior_frontend_developer
+Роль: moex_architect / moex_reviewer / moex_security_auditor /
+      moex_backend_developer / moex_frontend_developer /
+      moex_junior_backend_developer / moex_junior_frontend_developer / moex_worker
 Parent senior/root (для junior):
 Модель/reasoning и доступный лимит сеанса:
 Цель и критерии приёмки:

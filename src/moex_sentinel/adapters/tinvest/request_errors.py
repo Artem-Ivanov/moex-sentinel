@@ -1,5 +1,8 @@
 """Translate declared SDK request failures into the safe adapter contract."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from grpc import StatusCode
 from grpc.aio import AioRpcError
 from t_tech.invest.exceptions import AioRequestError
@@ -37,3 +40,20 @@ def invalid_response_error() -> TInvestAdapterError:
         "Не удалось получить данные площадки.",
         retryable=False,  # noqa: RUF001
     )
+
+
+@contextmanager
+def market_request_errors() -> Iterator[None]:
+    """Preserve the stream recovery policy while hiding SDK diagnostics."""
+    try:
+        yield
+    except SDK_REQUEST_ERRORS as error:
+        mapped = map_request_error(error)
+        permanent = {
+            StatusCode.UNAUTHENTICATED,
+            StatusCode.PERMISSION_DENIED,
+            StatusCode.INVALID_ARGUMENT,
+            StatusCode.FAILED_PRECONDITION,
+            StatusCode.UNIMPLEMENTED,
+        }
+        raise TInvestAdapterError(mapped.code, str(mapped), retryable=request_status(error) not in permanent) from error

@@ -1,0 +1,35 @@
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+
+[agents.architect]
+config_file = "../.agents/architect.toml"
+description = "Архитектор: исследует фактический поток, границы, контракты и планирует ограниченные изменения."
+
+[agents.backend_developer]
+config_file = "../.agents/backend_developer.toml"
+description = "Senior-разработчик для назначенных серверных задач и интеграции младших пакетов."
+
+[agents.frontend_developer]
+config_file = "../.agents/frontend_developer.toml"
+description = "Senior-разработчик для назначенных клиентских задач и интеграции младших пакетов."
+
+[agents.junior_backend_developer]
+config_file = "../.agents/junior_backend_developer.toml"
+description = "Junior для маленького независимого серверного leaf-пакета по одобренному brief."
+
+[agents.junior_frontend_developer]
+config_file = "../.agents/junior_frontend_developer.toml"
+description = "Junior для маленького независимого клиентского leaf-пакета по одобренному brief."
+
+[agents.reviewer]
+config_file = "../.agents/reviewer.toml"
+description = "Независимое read-only ревью реализации и доказательств."
+
+[agents.security_auditor]
+config_file = "../.agents/security_auditor.toml"
+description = "Назначенный read-only аудит безопасности, обработки секретов и границ доверия."
+
+[agents.worker]
+config_file = "../.agents/worker.toml"
+description = "Универсальный leaf-исполнитель ограниченных задач реализации, проверок, рефакторинга или документации."

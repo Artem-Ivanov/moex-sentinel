@@ -2,10 +2,11 @@ import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
 from sentinel_contracts.streaming_market import (
     InstrumentMarketState,
@@ -13,16 +14,17 @@ from sentinel_contracts.streaming_market import (
     StreamOrderBook,
     StreamTradingStatus,
 )
-from sentinel_contracts.trading import DecisionKind
+from sentinel_contracts.trading import AutomationState, DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
 from trading_automaton.config import StrategySettings
+from trading_automaton.domain.dtos import BatchTickResult
+from trading_automaton.domain.storage_dtos import BatchPersistResult, LocalIntentRecord
 from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService, PostCommitBatchError
 from trading_automaton.services.decision import TradeDecision
 from trading_automaton.services.decision_materialization import DecisionMaterializerService
-from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_batch_scheduler import (
     PositionBatchSchedulerService,
@@ -34,6 +36,7 @@ from trading_automaton.services.streaming_batch_tick import StreamingBatchTickSe
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import HydratedPositionState
 from trading_automaton.services.trading_cycle import TradingCycleService
+from trading_automaton.storage.models import CachedAutomationModel, LocalIntentModel
 from trading_automaton.storage.repository import IntentHistory, TradingCycleState
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
@@ -172,6 +175,32 @@ def command() -> AutomationCommand:
     return baseline_command()
 
 
+def intent_record(automation_id: str, idempotency_key: str) -> LocalIntentRecord:
+    return LocalIntentRecord(
+        idempotency_key=idempotency_key,
+        automation_id=automation_id,
+        kind="BUY",
+        side="BUY",
+        state="PENDING",
+        quantity_lots=1,
+        limit_price=Decimal("100"),
+        broker_order_id=None,
+        requested_amount=Decimal("100"),
+        executed_amount=Decimal(),
+        estimated_commission=Decimal(),
+        executed_commission=Decimal(),
+        executed_lots=0,
+        executed_price=Decimal(),
+        execution_currency=None,
+        executed_at=None,
+        dispatch_started_at=None,
+        broker_responded_at=None,
+        terminal_at=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
 class Scheduler:
     async def prepare(self, items, snapshot):
         return (
@@ -221,7 +250,7 @@ class Batch:
 
     async def run_batch(self, items, requests, *, snapshot_at):
         self.calls.append((items, requests, snapshot_at))
-        return "result"
+        return BatchTickResult(persisted=BatchPersistResult(decisions=(), intents=()), sla=())
 
 
 class Audit:
@@ -279,7 +308,7 @@ def test_assembles_decision_intent_and_dispatch_from_one_snapshot() -> None:
     audit, batch, result = asyncio.run(scenario())
 
     items, requests, snapshot_at = batch.calls[0]
-    assert result == "result"
+    assert isinstance(result, BatchTickResult)
     assert snapshot_at == NOW
     assert items[0].estimated_commission == Decimal("1.25")
     assert items[0].intent.idempotency_key == "intent-1"
@@ -537,7 +566,7 @@ def test_postcommit_failure_publishes_committed_cycle_before_propagating() -> No
 
     class PostCommitFailingBatch:
         async def run_batch(self, items, requests, *, snapshot_at):
-            persisted = SimpleNamespace(decisions=(), intents=())
+            persisted = BatchPersistResult(decisions=(), intents=())
             raise PostCommitBatchError(persisted, ValueError("cash publication failed"))
 
     async def scenario():
@@ -775,7 +804,7 @@ def test_serializes_concurrent_ticks_before_cash_budgeting() -> None:
             if len(self.calls) == 2:
                 self.second_started.set()
             await self.release.wait()
-            return "result"
+            return BatchTickResult(persisted=BatchPersistResult(decisions=(), intents=()), sla=())
 
     async def scenario():
         cash = AccountCashReservationService()
@@ -828,11 +857,9 @@ def test_marks_position_as_having_active_intent_immediately_after_persistence() 
     class PersistingBatch(Batch):
         async def run_batch(self, items, requests, *, snapshot_at):
             self.calls.append((items, requests, snapshot_at))
-            return SimpleNamespace(
-                persisted=SimpleNamespace(
-                    decisions=(),
-                    intents=(SimpleNamespace(automation_id=automation_id),),
-                )
+            return BatchTickResult(
+                persisted=BatchPersistResult(decisions=(), intents=(intent_record(automation_id, "intent-1"),)),
+                sla=(),
             )
 
     async def scenario():
@@ -893,13 +920,10 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
 
         def save_decision_batch(self, items, *, occurred_at):
             self.batches.append(items)
-            return SimpleNamespace(
+            return BatchPersistResult(
                 decisions=(),
                 intents=tuple(
-                    SimpleNamespace(
-                        automation_id=item.automation_id,
-                        idempotency_key=item.intent.idempotency_key,
-                    )
+                    intent_record(item.automation_id, item.intent.idempotency_key)
                     for item in items
                     if item.intent is not None
                 ),
@@ -974,3 +998,114 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
 
     assert decider.calls == 1
     assert [sum(item.intent is not None for item in batch) for batch in repository.batches] == [1, 0]
+
+
+@pytest.mark.parametrize(
+    ("revoke", "limited_cash", "second_cash_barrier"),
+    [("command", False, False), ("hold", False, False), ("command", True, False), ("command", True, True)],
+)
+def test_revocation_during_materialization_isolated_to_one_automation(
+    worker_repository_factory, revoke, limited_cash, second_cash_barrier
+):
+    """A blocked async tick cannot submit a revoked command; its sibling still trades."""
+
+    repo, factory = worker_repository_factory()
+    first = command()
+    second = baseline_command(automation="second")
+    for value in (first, second):
+        repo.cache_command(value)
+
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        current = {value.automation_id: value for value in (first, second)}
+        sent, tasks = [], []
+
+        class BuyScheduler:
+            async def prepare(self, work, snapshot):
+                return tuple(
+                    PreparedDecision(
+                        item.command,
+                        snapshot.snapshot_id,
+                        snapshot.created_at,
+                        PositionEvaluationResult(
+                            TradeDecision(DecisionKind.BUY_MORE, 1, Decimal("100.1"), "BUY"),
+                            item.state,
+                            Decimal("1.25"),
+                        ),
+                    )
+                    for item in work
+                )
+
+        class BarrierMaterializer(DecisionMaterializerService):
+            async def materialize(self, prepared, *args, **kwargs):
+                if prepared.command == first and not second_cash_barrier:
+                    entered.set()
+                    await release.wait()
+                result = await super().materialize(prepared, *args, **kwargs)
+                return result.model_copy(update={"item": result.item.model_copy(update={"cycle_state": None})})
+
+        class Dispatcher:
+            async def dispatch(self, request, started):
+                sent.append(request.automation_id)
+                started.set_result(NOW)
+
+        class Tracking:
+            def track(self, intent_id, task, *, request=None):
+                tasks.append(task)
+
+        class BarrierCash(AccountCashReservationService):
+            calls = 0
+
+            async def available(self, account_id, currency):
+                self.calls += 1
+                if second_cash_barrier and self.calls == 2:
+                    entered.set()
+                    await release.wait()
+                return await super().available(account_id, currency)
+
+        cash = BarrierCash() if limited_cash else None
+        if cash is not None:
+            await cash.replace_snapshot(first.account_id, "RUB", Decimal("1002.25"))
+        service = StreamingBatchTickService(
+            BuyScheduler(),
+            States(),
+            BatchTradingRuntimeService(repo, Dispatcher(), Tracking(), now=lambda: NOW, access_mode="TRADE"),
+            cash=cash,
+            now=lambda: NOW,
+            materializer=BarrierMaterializer(settings=StrategySettings(enabled=True)),
+            order_books=OrderBookValidationService(),
+        )
+        market = InstrumentMarketState(
+            "instrument",
+            order_book=StreamOrderBook(
+                "instrument", (OrderBookLevel(Decimal("100"), 1),), (OrderBookLevel(Decimal("100.1"), 1),), NOW, True
+            ),
+        )
+        kwargs = {} if revoke == "hold" else {"is_current": lambda value: current.get(value.automation_id) == value}
+        task = asyncio.create_task(
+            service.run_tick(
+                (first, second), MarketBatchSnapshot.immutable("race", NOW, {"instrument": market}), **kwargs
+            )
+        )
+        if revoke == "command":
+            # Missing callback support is itself a pre-fix contract failure.
+            await asyncio.sleep(0)
+            if task.done():
+                await task
+        await asyncio.wait_for(entered.wait(), 1)
+        if revoke == "command":
+            current.pop(first.automation_id)
+        else:
+            repo.hold_active("Control HOLD", str(first.automation_id))
+        release.set()
+        await task
+        await asyncio.gather(*tasks)
+        assert sent == [str(second.automation_id)]
+        with factory() as session:
+            assert list(session.scalars(select(LocalIntentModel.automation_id))) == [str(second.automation_id)]
+            if revoke == "hold":
+                assert (
+                    session.get_one(CachedAutomationModel, str(first.automation_id)).state == AutomationState.HOLD.value
+                )
+
+    asyncio.run(scenario())

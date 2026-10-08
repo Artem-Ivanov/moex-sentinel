@@ -83,5 +83,3 @@ npm --prefix frontend run typecheck
 npm --prefix frontend run build
 docker compose config --quiet
 ```
-
-Разработка описана в [docs/development.md](docs/development.md).

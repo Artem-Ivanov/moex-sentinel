@@ -3,19 +3,19 @@
 import asyncio
 import logging
 
-import httpx
 import pytest
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
+from sentinel_contracts.broker_errors import BrokerOperationError
 from tests.trading_automaton.command_factory import command
 from tests.trading_automaton.test_analytics_runtime import NOW, Source, frame, runtime
+from trading_automaton.domain.errors import AnalyticsUnavailableError
 
 
 def test_repeated_analytics_transport_failures_log_transitions_only(caplog, monkeypatch):
     monkeypatch.setattr("trading_automaton.services.analytics_frame.LOGGER.disabled", False)
 
     async def scenario():
-        source = Source(httpx.ReadTimeout("synthetic failure"))
+        source = Source(AnalyticsUnavailableError("Analytics unavailable"))
         service, preparation, tick = runtime(source)
         await service.replace_commands((command(),))
         for _ in range(3):
@@ -53,7 +53,7 @@ def test_broker_preparation_retries_follow_odd_seconds_and_reset_after_success(m
             if attempts == 8:
                 service._closed.set()
                 return
-            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+            raise BrokerOperationError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
 
         async def wait_without_wall_time(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
             awaitable.close()
@@ -85,7 +85,7 @@ def test_exhausted_broker_retries_probe_until_preparation_recovers(monkeypatch, 
             nonlocal calls
             calls += 1
             if calls <= retry_limit + 2:
-                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+                raise BrokerOperationError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
 
         async def skip_delay(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
             awaitable.close()
@@ -125,7 +125,7 @@ def test_close_interrupts_exhausted_broker_cooldown(monkeypatch, retry_limit):
         async def unavailable(commands, snapshot):
             nonlocal calls
             calls += 1
-            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+            raise BrokerOperationError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
 
         async def wait_without_wall_time(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
             if timeout == 60:
@@ -168,7 +168,7 @@ def test_permanent_broker_error_waits_for_restart_without_repeating_calls(caplog
         async def denied(commands, snapshot):
             nonlocal calls
             calls += 1
-            raise TInvestAdapterError("BROKER_UNAUTHORIZED", "Synthetic denial", retryable=False)
+            raise BrokerOperationError("BROKER_UNAUTHORIZED", "Synthetic denial", retryable=False)
 
         preparation.prepare = denied
         await service.replace_commands((command(),))
@@ -214,7 +214,7 @@ def test_success_cadence_accounts_for_work_but_preserves_error_backoff(
             starts.append(clock[0])
             clock[0] += elapsed
             if fails:
-                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+                raise BrokerOperationError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
 
         async def advance_delay(awaitable, *, timeout):  # noqa: ASYNC109 - virtual elapsed time
             awaitable.close()

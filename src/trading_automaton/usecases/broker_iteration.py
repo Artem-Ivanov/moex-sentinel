@@ -13,7 +13,13 @@ from trading_automaton.services.analytics_frame import AnalyticsFrameService, An
 
 
 class TickPort(Protocol):
-    async def run_tick(self, commands: tuple[AutomationCommand, ...], snapshot: MarketBatchSnapshot) -> object: ...
+    async def run_tick(
+        self,
+        commands: tuple[AutomationCommand, ...],
+        snapshot: MarketBatchSnapshot,
+        *,
+        is_current: Callable[[AutomationCommand], bool] | None = None,
+    ) -> object: ...
 
 
 class PreparationPort(Protocol):
@@ -87,7 +93,11 @@ class RunBrokerIterationUsecase:
             return
         snapshot = self._frames.market_snapshot(frame, fresh)
         try:
-            await self._tick.run_tick(selected, snapshot)
+            await self._tick.run_tick(
+                selected,
+                snapshot,
+                is_current=lambda command: any(current == command for current in self._commands),
+            )
         except DurableDecisionPersistenceError:
             if self._persistence_failure is not None:
                 await self._persistence_failure.hold(selected)

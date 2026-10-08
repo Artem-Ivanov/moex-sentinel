@@ -7,20 +7,20 @@ from decimal import Decimal, InvalidOperation
 from typing import Protocol, TypeVar
 from uuid import uuid4
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.domain.portfolio import BrokerReadError, ExternalOperation
 from moex_sentinel.domain.trading_summary import (
     PortfolioSnapshotValue,
     advance_cumulative_pnl,
     cash_flows,
 )
+from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
-from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.ports import UserBrokerReadPort
+from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.time import floor_utc_millisecond
 
-AdapterFactory = Callable[[Broker], PortfolioPort]
+AdapterFactory = Callable[[UserBroker], PortfolioPort]
 Sleep = Callable[[float], Awaitable[None]]
 ValueT = TypeVar("ValueT")
 _STORAGE_QUANTUM = Decimal("0.000000001")
@@ -49,7 +49,7 @@ class PortfolioSnapshotCollectionService:
 
     def __init__(
         self,
-        brokers: BrokerRepositoryPort,
+        brokers: UserBrokerReadPort,
         adapter_factory: AdapterFactory,
         history: LatestPortfolioSnapshotPort,
         *,
@@ -83,7 +83,7 @@ class PortfolioSnapshotCollectionService:
             try:
                 adapter = self._adapter_factory(broker)
                 accounts = await self._retry(adapter.list_accounts)
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 errors.append(
                     BrokerReadError(
                         broker_id=broker.id,
@@ -134,7 +134,7 @@ class PortfolioSnapshotCollectionService:
                     lambda adapter=adapter, account_id=account_id: adapter.get_portfolio(account_id)
                 )
                 account_read_completed_at = floor_utc_millisecond(self._clock())
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 errors.append(
                     BrokerReadError(
                         broker_id=broker.id,
@@ -178,7 +178,7 @@ class PortfolioSnapshotCollectionService:
                         operations_from,
                         account_read_completed_at,
                     )
-                except TInvestAdapterError as error:
+                except BrokerOperationError as error:
                     errors.append(
                         BrokerReadError(
                             broker_id=broker.id,
@@ -249,7 +249,7 @@ class PortfolioSnapshotCollectionService:
         for attempt in range(self._retry_limit + 1):
             try:
                 return await call()
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 if not error.retryable or attempt == self._retry_limit:
                     raise
                 await self._sleep(self._retry_base_seconds * (2**attempt))

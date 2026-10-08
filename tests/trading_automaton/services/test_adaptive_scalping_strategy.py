@@ -1,11 +1,11 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.trading import DecisionKind
 from trading_automaton.config import StrategySettings
 from trading_automaton.services.account_commission_profile import CommissionSchedule
 from trading_automaton.services.decision import DecisionContext
-from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.strategies import AdaptiveScalpingStrategy
 from trading_automaton.storage.repository import TradeLotRecord, TradingCycleState
 

@@ -12,6 +12,8 @@ from moex_sentinel.domain.market_data import (
 
 
 class MarketDataPort(Protocol):
+    """Read broker market data; declared failures raise neutral BrokerOperationError."""
+
     async def list_instruments(self) -> tuple[MarketInstrument, ...]: ...
 
     async def search_instruments(self, query: str) -> tuple[MarketInstrument, ...]: ...

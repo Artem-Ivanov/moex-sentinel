@@ -1,6 +1,7 @@
 """Trading-worker dependency composition."""
 
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from datetime import datetime
 from time import sleep
 from typing import Any, Protocol
@@ -174,120 +175,131 @@ async def build_broker_runtime(
             )
     session = session_factory(connection)
     await session.start()
-    portfolio = PortfolioStateCacheService()
-    metrics = AnalyticsMetricsCache()
-    commission_profiles = AccountCommissionProfileService(repository)
-    cash = AccountCashReservationService()
-    await cash.restore(repository.list_active_buy_intent_reservations(connection.broker_id))
-    position_states = PositionStateCacheService()
-    active_intents = ActiveIntentGateService()
-    ledger = LotLedgerService(repository)
-    business_audit = BusinessAuditService(repository, now=now)
-    hydration = PositionStateHydrationService(
-        repository,
-        portfolio,
-        None,
-        position_states,
-        consistency=PositionConsistencyService(ledger, repository, now=now),
-        audit=business_audit,
-        settings=strategy_settings,
-        now=now,
-        prepared_metrics=metrics,
-    )
-    order_books = OrderBookValidationService()
-    decider = StreamingPositionDecisionService(
-        commission_profiles,
-        cash=cash,
-        contexts=DecisionContextService(strategy_settings),
-        decisions=TradeDecisionService(),
-    )
-    scheduler = PositionBatchSchedulerService(
-        decider,
-        rate_limit=BrokerRateLimitService(capacity=2, refill_per_second=2.0),
-        order_books=order_books,
-        active_intents=active_intents,
-    )
-    tracking = OrderTrackingService(
-        repository,
-        now=now,
-        broker_id=connection.broker_id,
-        commission_profiles=commission_profiles,
-        broker=session,
-        portfolio=portfolio,
-        audit=business_audit,
-        cash=cash,
-        active_intents=active_intents,
-    )
-    dispatcher = OrderDispatchService(
-        repository,
-        session,
-        now=now,
-        audit=business_audit,
-        access_mode=worker_access_mode,
-        account_id=connection.account_id,
-    )
-    batch = BatchTradingRuntimeService(
-        repository,
-        dispatcher,
-        tracking,
-        now=now,
-        cash=cash,
-        active_intents=active_intents,
-        access_mode=worker_access_mode,
-        account_id=connection.account_id,
-    )
-    tick = StreamingBatchTickService(
-        scheduler,
-        position_states,
-        batch,
-        cash=cash,
-        cycles=StreamingCycleTransitionService(now=now, cycles=TradingCycleService(), order_books=order_books),
-        now=now,
-        audit=business_audit,
-        materializer=DecisionMaterializerService(settings=strategy_settings),
-        order_books=order_books,
-    )
-    preparation = BrokerTickPreparationService(
-        session,
-        portfolio,
-        None,
-        commission_profiles,
-        hydration,
-        position_bootstrap=PositionBootstrapService(repository),
-        strategy_settings=strategy_settings,
-        reconciliation=UncertainIntentReconciliationService(
+    rollback = AsyncExitStack()
+    rollback.push_async_callback(session.close)
+    try:
+        portfolio = PortfolioStateCacheService()
+        metrics = AnalyticsMetricsCache()
+        commission_profiles = AccountCommissionProfileService(repository)
+        cash = AccountCashReservationService()
+        await cash.restore(repository.list_active_buy_intent_reservations(connection.broker_id))
+        position_states = PositionStateCacheService()
+        active_intents = ActiveIntentGateService()
+        ledger = LotLedgerService(repository)
+        business_audit = BusinessAuditService(repository, now=now)
+        hydration = PositionStateHydrationService(
+            repository,
+            portfolio,
+            position_states,
+            consistency=PositionConsistencyService(ledger, repository, now=now),
+            audit=business_audit,
+            now=now,
+            prepared_metrics=metrics,
+        )
+        order_books = OrderBookValidationService()
+        decider = StreamingPositionDecisionService(
+            commission_profiles,
+            cash=cash,
+            contexts=DecisionContextService(strategy_settings),
+            decisions=TradeDecisionService(),
+        )
+        scheduler = PositionBatchSchedulerService(
+            decider,
+            rate_limit=BrokerRateLimitService(capacity=2, refill_per_second=2.0),
+            order_books=order_books,
+            active_intents=active_intents,
+        )
+        tracking = OrderTrackingService(
+            repository,
+            now=now,
+            broker_id=connection.broker_id,
+            commission_profiles=commission_profiles,
+            broker=session,
+            portfolio=portfolio,
+            audit=business_audit,
+            cash=cash,
+            active_intents=active_intents,
+        )
+        dispatcher = OrderDispatchService(
             repository,
             session,
             now=now,
             audit=business_audit,
-            active_intents=active_intents,
+            access_mode=worker_access_mode,
+            account_id=connection.account_id,
+        )
+        batch = BatchTradingRuntimeService(
+            repository,
+            dispatcher,
+            tracking,
+            now=now,
             cash=cash,
-        ),
-        cash=cash,
-        now=now,
-    )
-    analytics = analytics_client or AnalyticsClient(httpx.AsyncClient(base_url=analytics_url, timeout=1.0))
-    iteration = RunBrokerIterationUsecase(
-        AnalyticsFrameService(analytics, now=now, order_books=order_books),
-        tick,
-        preparation=preparation,
-        metrics=metrics,
-        source_id=connection.broker_id,
-        fallback=AdaptiveThresholds(
-            strategy_settings.averaging_step_percent,
-            strategy_settings.partial_take_profit_percent,
-            "STRATEGY",
-        ),
-        persistence_failure=PersistenceFailureService(repository),
-    )
-    runtime = AnalyticsBrokerRuntime(
-        analytics,
-        iteration,
-        tick_seconds=tick_seconds,
-        retry_limit=retry_limit,
-        account_id=connection.account_id,
-    )
-    return BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
+            active_intents=active_intents,
+            access_mode=worker_access_mode,
+            account_id=connection.account_id,
+        )
+        tick = StreamingBatchTickService(
+            scheduler,
+            position_states,
+            batch,
+            cash=cash,
+            cycles=StreamingCycleTransitionService(now=now, cycles=TradingCycleService(), order_books=order_books),
+            now=now,
+            audit=business_audit,
+            materializer=DecisionMaterializerService(settings=strategy_settings),
+            order_books=order_books,
+        )
+        preparation = BrokerTickPreparationService(
+            session,
+            portfolio,
+            None,
+            commission_profiles,
+            hydration,
+            position_bootstrap=PositionBootstrapService(repository),
+            strategy_settings=strategy_settings,
+            reconciliation=UncertainIntentReconciliationService(
+                repository,
+                session,
+                now=now,
+                audit=business_audit,
+                active_intents=active_intents,
+                cash=cash,
+            ),
+            cash=cash,
+            now=now,
+        )
+        analytics = analytics_client or AnalyticsClient(httpx.AsyncClient(base_url=analytics_url, timeout=1.0))
+        if analytics_client is None:
+            rollback.push_async_callback(analytics.close)
+        iteration = RunBrokerIterationUsecase(
+            AnalyticsFrameService(analytics, now=now, order_books=order_books),
+            tick,
+            preparation=preparation,
+            metrics=metrics,
+            source_id=connection.broker_id,
+            fallback=AdaptiveThresholds(
+                strategy_settings.averaging_step_percent,
+                strategy_settings.partial_take_profit_percent,
+                "STRATEGY",
+            ),
+            persistence_failure=PersistenceFailureService(repository),
+        )
+        runtime = AnalyticsBrokerRuntime(
+            analytics,
+            iteration,
+            tick_seconds=tick_seconds,
+            retry_limit=retry_limit,
+            account_id=connection.account_id,
+        )
+        bundle = BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
+        rollback.pop_all()
+        return bundle
+    except BaseException as primary_error:
+        try:
+            await rollback.aclose()
+        except BaseException as cleanup_error:
+            raise primary_error from cleanup_error
+        raise
 
 
 def build_worker_recovery(repository: LocalAutomationRepository, worker_id: str) -> RecoverWorkerRunUsecase:

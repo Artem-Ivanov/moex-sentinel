@@ -3,7 +3,6 @@
 from decimal import Decimal
 from typing import Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from moex_sentinel.domain.errors import FieldError
 from moex_sentinel.domain.instrument_catalog import (
@@ -20,6 +19,7 @@ from moex_sentinel.services.instrument_catalog import (
 )
 from moex_sentinel.services.position_adoption import ConfiguredPositionAdoptionPort
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 class InstrumentCatalogServicePort(Protocol):
@@ -64,7 +64,7 @@ class SynchronizeBrokerInstrumentsUsecase:
             raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
@@ -118,7 +118,7 @@ class ViewBrokerInstrumentsUsecase:
             raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
@@ -149,7 +149,7 @@ class ViewInstrumentDetailsUsecase:
             raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
@@ -180,7 +180,7 @@ class SetInstrumentSelectionUsecase:
             raise UseCaseError("INSTRUMENT_NOT_FOUND", "Инструмент не найден.") from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error

@@ -1,21 +1,15 @@
 """Validated short-lived broker connection metadata for the worker."""
 
-from typing import Protocol
-
-from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
+from moex_sentinel.services.ports import UserBrokerLookupPort
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerScope
 from sentinel_contracts.tinvest import resolve_tinvest_endpoint
-
-
-class BrokerRepositoryPort(Protocol):
-    def get(self, broker_id: str) -> Broker: ...
 
 
 class AutomatonBrokerService:
     def __init__(
         self,
-        repository: BrokerRepositoryPort,
+        repository: UserBrokerLookupPort,
         *,
         access_mode: str = "READ_ONLY",
         environment: EnvironmentStatePort | None = None,

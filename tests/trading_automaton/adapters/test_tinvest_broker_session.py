@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -235,7 +235,7 @@ def test_quotes_commission_through_existing_sdk_context() -> None:
     assert quote.deal_commission == Decimal("1")
 
 
-def test_bootstrap_dispatch_and_stream_reuse_existing_sdk_context() -> None:
+def test_positions_dispatch_and_quotes_reuse_existing_sdk_context() -> None:
     async def scenario():
         client = FakeClient()
         session = BrokerSdkSession(
@@ -246,11 +246,6 @@ def test_bootstrap_dispatch_and_stream_reuse_existing_sdk_context() -> None:
         )
         await session.start()
         positions = await session.get_positions("account")
-        candles = await session.get_candles(
-            "instrument",
-            NOW - timedelta(hours=2),
-            NOW,
-        )
         order = await session.dispatch_limit_order(
             DispatchRequest(
                 "intent-1",
@@ -261,19 +256,16 @@ def test_bootstrap_dispatch_and_stream_reuse_existing_sdk_context() -> None:
                 Decimal("100"),
             )
         )
-        manager = session.create_market_data_stream()
         await session.close()
-        return client, positions, candles, order, manager
+        return client, positions, order
 
-    client, positions, candles, order, manager = asyncio.run(scenario())
+    client, positions, order = asyncio.run(scenario())
 
     assert client.entered == 1
     assert positions[0].quantity_lots == Decimal("2")
-    assert candles[0].close == Decimal("101")
     assert order.status == "ACCEPTED"
     assert order.executed_at is None
     assert client.orders.posted["order_id"] == "intent-1"
-    assert manager is client.manager
 
 
 def test_order_state_prefers_latest_execution_stage_time() -> None:
@@ -526,15 +518,14 @@ def test_inspects_position_and_recent_operations_after_dispatch_failure() -> Non
 
     client, position, operations = asyncio.run(scenario())
 
-    assert position == {
-        "quantity_lots": "2",
-        "average_price": "100",
-        "current_price": "101",
-        "currency": "RUB",
-    }
-    assert operations[0]["state"] == "OPERATION_STATE_EXECUTED"
-    assert operations[0]["operation_id"] == "operation-1"
-    assert operations[0]["currency"] == "RUB"
+    assert position.quantity_lots == Decimal(2)
+    assert position.average_price == Decimal(100)
+    assert position.current_price == Decimal(101)
+    assert position.currency == "RUB"
+    assert operations[0].executed is True
+    assert operations[0].operation_id == "operation-1"
+    assert operations[0].currency == "RUB"
+    assert operations[0].quantity_units == Decimal(1)
     assert client.operations.request.limit == 20
 
 
@@ -636,5 +627,50 @@ def test_snapshot_cancellation_is_not_converted_to_broker_error(operation):
             assert caught.value is cancellation
         finally:
             await session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("vendor_type", "vendor_state", "side", "executed"),
+    [
+        ("OPERATION_TYPE_BUY", "OPERATION_STATE_EXECUTED", OrderSide.BUY, True),
+        ("OPERATION_TYPE_SELL", "OPERATION_STATE_EXECUTED", OrderSide.SELL, True),
+        ("OPERATION_TYPE_BUY", "OPERATION_STATE_CANCELED", OrderSide.BUY, False),
+        ("OPERATION_TYPE_BROKER_FEE", "OPERATION_STATE_EXECUTED", None, True),
+    ],
+)
+def test_sdk_maps_vendor_recovery_observation_to_neutral_units(vendor_type, vendor_state, side, executed):
+    async def scenario():
+        client = FakeClient()
+
+        class Operations(FakeOperations):
+            async def get_operations_by_cursor(self, request):
+                response = await super().get_operations_by_cursor(request)
+                item = response.items[0]
+                item.type, item.state = vendor_type, vendor_state
+                item.quantity_done = 13
+                item.date = NOW.replace(microsecond=123456)
+                return response
+
+        client.services.operations = Operations()
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *args, **kwargs: client,
+            access_mode="TRADE",
+        )
+        await session.start()
+        try:
+            values = await session.inspect_recent_operations("account", "instrument", 20)
+        finally:
+            await session.close()
+        assert len(values) == 1
+        observed = values[0]
+        assert observed.side == side
+        assert observed.executed is executed
+        assert observed.quantity_units == Decimal(13)
+        assert observed.occurred_at == NOW.replace(microsecond=123000)
+        assert observed.price == observed.commission == Decimal(1)
 
     asyncio.run(scenario())

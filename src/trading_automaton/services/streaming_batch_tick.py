@@ -11,8 +11,8 @@ from sentinel_contracts.broker_execution import OrderBookSnapshot
 from sentinel_contracts.streaming_market import InstrumentMarketState, MarketBatchSnapshot
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
-from trading_automaton.domain.dtos import DispatchRequest, HydratedPositionState, PositionWorkItem
-from trading_automaton.domain.storage_dtos import DecisionBatchItem
+from trading_automaton.domain.dtos import BatchTickResult, DispatchRequest, HydratedPositionState, PositionWorkItem
+from trading_automaton.domain.storage_dtos import BatchPersistResult, DecisionBatchItem
 from trading_automaton.services.batch_runtime import PostCommitBatchError
 from trading_automaton.services.decision_materialization import (
     DecisionMaterializerPort,
@@ -47,7 +47,7 @@ class BatchRuntimePort(Protocol):
         requests: tuple[DispatchRequest, ...],
         *,
         snapshot_at: datetime,
-    ) -> object: ...
+    ) -> BatchTickResult: ...
 
 
 class BusinessAuditPort(Protocol):
@@ -104,17 +104,21 @@ class StreamingBatchTickService:
         self,
         commands: tuple[AutomationCommand, ...],
         snapshot: MarketBatchSnapshot,
-    ) -> object:
+        *,
+        is_current: Callable[[AutomationCommand], bool] | None = None,
+    ) -> BatchTickResult | None:
         async with self._tick_lock:
             if self._expired(snapshot):
                 return None
-            return await self._run_tick(commands, snapshot)
+            return await self._run_tick(commands, snapshot, is_current=is_current)
 
     async def _run_tick(
         self,
         commands: tuple[AutomationCommand, ...],
         snapshot: MarketBatchSnapshot,
-    ) -> object:
+        *,
+        is_current: Callable[[AutomationCommand], bool] | None,
+    ) -> BatchTickResult | None:
         loaded_states = await asyncio.gather(*(self._states.get(str(item.automation_id)) for item in commands))
         if self._expired(snapshot):
             return None
@@ -146,6 +150,8 @@ class StreamingBatchTickService:
         pending_cash: dict[tuple[str, str], Decimal] = {}
 
         for result in prepared:
+            if is_current is not None and not is_current(result.command):
+                continue
             market = snapshot.instruments.get(result.command.external_instrument_id)
             if market is None or market.order_book is None:
                 continue
@@ -170,17 +176,38 @@ class StreamingBatchTickService:
             }:
                 continue
 
+            prior_requests = tuple(requests)
+            if is_current is not None:
+                current_ids = {str(command.automation_id) for command in commands if is_current(command)}
+                prior_requests = tuple(request for request in prior_requests if request.automation_id in current_ids)
             work_item = work_by_id[str(result.command.automation_id)]
-            materialized = await self._materializer.materialize(
-                result,
-                work_item,
-                market,
-                cycle_before.get(str(result.command.automation_id)),
-                cash=self._cash,
-                pending_cash=pending_cash,
-                snapshot_at=snapshot.created_at,
-            )
-            if materialized is None:
+            while True:
+                if self._cash is not None and is_current is not None:
+                    pending_cash.clear()
+                    for request in prior_requests:
+                        if request.side.value == "BUY":
+                            key = (request.account_id, request.reservation_currency.upper())
+                            pending_cash[key] = pending_cash.get(key, Decimal()) + request.required_cash
+                materialized = await self._materializer.materialize(
+                    result,
+                    work_item,
+                    market,
+                    cycle_before.get(str(result.command.automation_id)),
+                    cash=self._cash,
+                    pending_cash=pending_cash,
+                    snapshot_at=snapshot.created_at,
+                )
+                if self._expired(snapshot):
+                    return None
+                if self._cash is None or is_current is None or not is_current(result.command):
+                    break
+                current_ids = {str(command.automation_id) for command in commands if is_current(command)}
+                current_prior = tuple(request for request in prior_requests if request.automation_id in current_ids)
+                if current_prior == prior_requests:
+                    break
+                # Every retry removes a revoked prior request, so the loop is bounded by batch size.
+                prior_requests = current_prior
+            if materialized is None or (is_current is not None and not is_current(result.command)):
                 continue
 
             item = materialized.item
@@ -199,17 +226,24 @@ class StreamingBatchTickService:
 
         if self._expired(snapshot):
             return None
+        if is_current is not None:
+            current_ids = {str(command.automation_id) for command in commands if is_current(command)}
+            items = [item for item in items if item.automation_id in current_ids]
+            requests = [request for request in requests if request.automation_id in current_ids]
+            audit_values = [values for values in audit_values if values["automation_id"] in current_ids]
+        if not items:
+            return None
         try:
             batch_result = await self._batch.run_batch(tuple(items), tuple(requests), snapshot_at=snapshot.created_at)
         except PostCommitBatchError as error:
             await self._publish_committed_states(items, state_by_id, loaded_by_id, error.persisted)
             raise
 
-        persisted = getattr(batch_result, "persisted", None)
+        persisted = batch_result.persisted
         await self._publish_committed_states(items, state_by_id, loaded_by_id, persisted)
 
         if self._audit is not None:
-            persisted_decisions = getattr(persisted, "decisions", ())
+            persisted_decisions = persisted.decisions
             actual_by_automation = {item.automation_id: item for item in persisted_decisions}
             for values in audit_values:
                 actual = actual_by_automation.get(values["automation_id"])
@@ -275,10 +309,15 @@ class StreamingBatchTickService:
         items: list[DecisionBatchItem],
         state_by_id: dict[str, HydratedPositionState],
         loaded_by_id: dict[str, HydratedPositionState],
-        persisted: object,
+        persisted: BatchPersistResult,
     ) -> None:
-        active_automation_ids = {item.automation_id for item in getattr(persisted, "intents", ())}
+        active_automation_ids = {item.automation_id for item in persisted.intents}
+        stale_ids = {
+            item.automation_id for item in persisted.decisions if item.reason_code == "AUTOMATION_STATE_CHANGED"
+        }
         for automation_id in {item.automation_id for item in items}:
+            if automation_id in stale_ids:
+                continue
             state = state_by_id.get(automation_id)
             if state is None:
                 continue

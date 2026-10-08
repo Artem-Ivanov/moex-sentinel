@@ -2,13 +2,39 @@
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Protocol
 
 from trading_automaton.domain.storage_dtos import (
     TradeLotRecord,
 )
-from trading_automaton.storage.repository import (
-    LocalAutomationRepository,
-)
+
+
+class LotLedgerRepositoryPort(Protocol):
+    def list_open_lots(self, automation_id: str) -> list[TradeLotRecord]: ...
+
+    def create_trade_lot(
+        self,
+        *,
+        automation_id: str,
+        source_intent_id: str | None,
+        source: str,
+        quantity_lots: int,
+        entry_price: Decimal,
+        entry_commission: Decimal,
+        opened_at: datetime,
+    ) -> TradeLotRecord: ...
+
+    def allocate_sell_lifo(
+        self,
+        *,
+        automation_id: str,
+        sell_intent_id: str,
+        quantity_lots: int,
+        exit_price: Decimal,
+        exit_commission: Decimal,
+        closed_at: datetime,
+        lot_size: int,
+    ) -> None: ...
 
 
 class LotLedgerMismatchError(RuntimeError):
@@ -20,7 +46,7 @@ class ExecutionPriceError(ValueError):
 
 
 class LotLedgerService:
-    def __init__(self, repository: LocalAutomationRepository) -> None:
+    def __init__(self, repository: LotLedgerRepositoryPort) -> None:
         self._repository = repository
 
     def record_buy_execution(

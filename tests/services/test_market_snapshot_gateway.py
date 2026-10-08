@@ -6,12 +6,11 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest
-from grpc import StatusCode
-from t_tech.invest.exceptions import AioRequestError
 
 from moex_sentinel.services.market_recovery import MarketRecoveryPolicy
 from moex_sentinel.services.market_snapshot_gateway import LOGGER, MarketSnapshotGateway
 from sentinel_contracts.analytics import MarketSnapshotRequest
+from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.broker_execution import OrderBookLevel
 from sentinel_contracts.streaming_market import StreamCandle, StreamOrderBook, StreamTradingStatus
 
@@ -346,9 +345,7 @@ def test_disconnect_diagnostics_include_only_exception_type_and_status(caplog, m
         gateway = MarketSnapshotGateway(lambda _: source, now=lambda: NOW)
         request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
         await gateway.snapshot(request)
-        await source.queue.put(
-            AioRequestError(StatusCode.INVALID_ARGUMENT, "MUST_NOT_LOG_DETAILS", {"private": "MUST_NOT_LOG_METADATA"})
-        )
+        await source.queue.put(BrokerOperationError("BROKER_INVALID_REQUEST", "MUST_NOT_LOG_DETAILS", retryable=False))
         await settle()
         await gateway.close()
 
@@ -356,7 +353,7 @@ def test_disconnect_diagnostics_include_only_exception_type_and_status(caplog, m
     record = next(
         item for item in caplog.records if item.message == "Market source blocked until configuration changes"
     )
-    assert record.data == {"exception_types": ["AioRequestError"], "grpc_statuses": ["INVALID_ARGUMENT"]}
+    assert record.data == {"exception_types": ["BrokerOperationError"], "error_codes": ["BROKER_INVALID_REQUEST"]}
     assert "MUST_NOT_LOG" not in caplog.text
     assert "MUST_NOT_LOG" not in str(record.data)
 
@@ -402,7 +399,7 @@ def test_diagnostic_accessors_cannot_kill_source_reconnect(failure, caplog, monk
 
     asyncio.run(run())
     record = next(item for item in caplog.records if item.message == "Market source disconnected; reconnect scheduled")
-    assert record.data == {"exception_types": ["DiagnosticError"], "grpc_statuses": []}
+    assert record.data == {"exception_types": ["DiagnosticError"], "error_codes": []}
     assert "MUST_NOT_LOG" not in caplog.text
     assert "MUST_NOT_LOG" not in str(record.data)
 
@@ -411,7 +408,7 @@ def test_authorization_failure_waits_for_changed_configuration():
     class UnauthorizedSource(Source):
         async def start(self):
             await super().start()
-            raise AioRequestError(StatusCode.UNAUTHENTICATED, "synthetic", {})
+            raise BrokerOperationError("BROKER_AUTH_FAILED", "synthetic", retryable=False)
 
     async def run():
         rejected, replacement = UnauthorizedSource(), Source()
@@ -918,7 +915,7 @@ def test_permanent_history_error_is_not_retried_while_peer_keeps_refreshing():
         async def get_candles(self, instrument_id, start, end):
             if instrument_id == "AAA":
                 self.history_calls.append(instrument_id)
-                raise AioRequestError(StatusCode.PERMISSION_DENIED, "synthetic", {})
+                raise BrokerOperationError("BROKER_FORBIDDEN", "synthetic", retryable=False)
             return await super().get_candles(instrument_id, start, end)
 
     async def run():

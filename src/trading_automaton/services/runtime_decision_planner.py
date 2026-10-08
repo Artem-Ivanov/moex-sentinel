@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
 from pydantic import ConfigDict
 
-from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle
 from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.broker_execution import BrokerPosition, LimitOrderEstimate, OrderBookSnapshot, OrderSide
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import (
-    AdaptiveThresholds,
     CommissionSchedule,
     DecisionContext,
     MarketIndicators,
@@ -29,20 +25,6 @@ from trading_automaton.domain.storage_dtos import (
 )
 from trading_automaton.services.decision import TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
-from trading_automaton.services.market_indicators import MarketIndicatorsService
-from trading_automaton.services.volatility_strategy import VolatilityThresholdCache
-
-
-class CandleDataPort(Protocol):
-    """Port for fetching historic candles used to derive market indicators."""
-
-    async def get_candles(
-        self,
-        instrument_id: str,
-        start: datetime,
-        end: datetime,
-        interval: CandleInterval,
-    ) -> tuple[HistoricCandle, ...]: ...
 
 
 class DecisionEstimatePort(Protocol):
@@ -71,24 +53,17 @@ class DecisionPlan(PositionalModel):
 
 
 class TradingDecisionPlanner:
-    """Isolated layer for decision context, indicator loading and pre-flight estimation."""
+    """Decision context and pre-flight estimation over supplied market metrics."""
 
     def __init__(
         self,
         *,
-        now: Callable[[], datetime],
         settings: StrategySettings | None = None,
         decisions: TradeDecisionService | None = None,
         contexts: DecisionContextService | None = None,
-        indicators_service: MarketIndicatorsService | None = None,
-        threshold_cache: VolatilityThresholdCache | None = None,
     ) -> None:
-        self._now = now
-        self._settings = settings or StrategySettings()
         self._decisions = decisions or TradeDecisionService()
-        self._contexts = contexts or DecisionContextService(self._settings)
-        self._indicators_service = indicators_service or MarketIndicatorsService()
-        self._threshold_cache = threshold_cache or VolatilityThresholdCache(now=now)
+        self._contexts = contexts or DecisionContextService(settings or StrategySettings())
 
     @property
     def strategy_code(self) -> str:
@@ -97,31 +72,6 @@ class TradingDecisionPlanner:
     @property
     def strategy_version(self) -> str:
         return self._decisions.strategy_version
-
-    async def load_market_indicators(
-        self,
-        command: AutomationCommand,
-        candles: CandleDataPort | None = None,
-    ) -> MarketIndicators:
-        fallback = AdaptiveThresholds(
-            self._settings.averaging_step_percent,
-            self._settings.partial_take_profit_percent,
-            "FALLBACK",
-        )
-        if candles is None:
-            return self._indicators_service.calculate((), fallback)
-
-        async def load() -> MarketIndicators:
-            end = self._now()
-            payload = await candles.get_candles(
-                command.external_instrument_id,
-                end - timedelta(hours=2),
-                end,
-                CandleInterval.MIN_1,
-            )
-            return self._indicators_service.calculate(payload, fallback)
-
-        return await self._threshold_cache.get_or_load(str(command.broker_id), command.external_instrument_id, load)
 
     async def plan(
         self,

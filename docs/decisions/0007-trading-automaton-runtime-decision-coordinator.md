@@ -9,6 +9,17 @@
 broker estimate внутри этого пути не выполняется. Веха 0.8 закрепляет
 проверку стакана до cycle, net take-profit и atomic execution/cycle state.
 
+Уточнение 2026-10-06: показатели действующего Worker поступают из Analytics
+через shared contracts и используются как prepared metrics. Локальный
+`TradingDecisionPlanner.load_market_indicators` и его threshold cache удалены;
+hydration требует `prepared_metrics` и не создаёт calculator Analytics.
+Сохранённый `TradingDecisionPlanner.plan` получает готовые `MarketIndicators`;
+decision/evaluator не загружает локальную историю рынка. Описания local
+loader/cache, прежнего `process_position` и рекомендаций ниже являются
+историческим решением от 2026-08-09, а не текущим runtime-контрактом.
+Изменение и проверка callers отражены в
+[отчёте исправлений M5](../audits/layered-solid-fixes-20261006.md).
+
 ## Проблема
 
 `TradingRuntimeService` в одной итерации одновременно:

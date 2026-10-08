@@ -5,8 +5,6 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Protocol
 
-import httpx
-
 from sentinel_contracts.analytics import (
     AnalyticsInstrument,
     AnalyticsSnapshot,
@@ -15,6 +13,7 @@ from sentinel_contracts.analytics import (
 )
 from sentinel_contracts.broker_execution import OrderBookSnapshot
 from sentinel_contracts.streaming_market import MarketBatchSnapshot
+from trading_automaton.domain.errors import AnalyticsUnavailableError
 from trading_automaton.services.order_book_validation import OrderBookValidationService
 
 LOGGER = logging.getLogger(__name__)
@@ -67,7 +66,7 @@ class AnalyticsFrameService:
                 )
                 self._analytics_unavailable_since = None
             return result
-        except (httpx.HTTPError, ValueError):
+        except (AnalyticsUnavailableError, ValueError):
             if self._analytics_unavailable_since is None:
                 self._analytics_unavailable_since = self._now()
                 LOGGER.warning(

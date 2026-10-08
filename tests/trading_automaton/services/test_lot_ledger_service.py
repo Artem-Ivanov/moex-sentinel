@@ -1,11 +1,12 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import get_type_hints
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from trading_automaton.services.lot_ledger import LotLedgerMismatchError, LotLedgerService
+from trading_automaton.services.lot_ledger import LotLedgerMismatchError, LotLedgerRepositoryPort, LotLedgerService
 from trading_automaton.storage.models import Base, LotAllocationModel
 from trading_automaton.storage.repository import LocalAutomationRepository
 
@@ -133,3 +134,13 @@ def test_execution_price_rejects_missing_or_implausible_values(
             broker_price=Decimal(broker_price),
             limit_price=Decimal(limit_price),
         )
+
+
+def test_lot_service_accepts_storage_independent_capability_contract():
+
+    assert get_type_hints(LotLedgerService.__init__)["repository"] is LotLedgerRepositoryPort
+    assert {name for name in vars(LotLedgerRepositoryPort) if not name.startswith("_")} == {
+        "create_trade_lot",
+        "list_open_lots",
+        "allocate_sell_lifo",
+    }

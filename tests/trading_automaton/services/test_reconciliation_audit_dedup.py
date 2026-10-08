@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.business_audit import BusinessAuditStage
 from tests.trading_automaton.command_factory import command
+from tests.trading_automaton.services.test_position_state_hydration_service import PreparedMetrics
 from trading_automaton.domain.dtos import PositionConsistencyResult
 from trading_automaton.domain.storage_dtos import TradeLotRecord
 from trading_automaton.services.business_audit import BusinessAuditService
@@ -74,11 +75,11 @@ class Harness:
         self.service = PositionStateHydrationService(
             self.repository,
             self.portfolio,
-            None,
             self.cache,
             consistency=self.consistency,
             audit=BusinessAuditService(self.repository, now=lambda: NOW),
             now=lambda: NOW,
+            prepared_metrics=PreparedMetrics(),
         )
 
     async def hydrate(self):

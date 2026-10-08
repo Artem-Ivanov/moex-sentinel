@@ -7,6 +7,7 @@ from sqlalchemy import ColumnElement, and_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from moex_sentinel.domain.persistence_errors import RevisionConflictError
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.storage.models.automation_facts import PositionCycleModel, TradingAutomationModel
 from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
@@ -14,10 +15,6 @@ from moex_sentinel.storage.models.user_brokers import UserBrokerModel
 from moex_sentinel.storage.repositories import DuplicateRecordError, RecordNotFoundError
 from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.trading import AutomationState
-
-
-class RevisionConflictError(ValueError):
-    pass
 
 
 def _record(

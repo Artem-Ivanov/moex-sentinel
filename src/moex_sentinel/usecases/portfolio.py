@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from moex_sentinel.domain.portfolio import (
     BrokerAccountsView,
     BrokerOperationsView,
@@ -28,6 +29,8 @@ class ViewBrokerAccountsUsecase:
     async def execute(self, broker_id: str) -> BrokerAccountsView:
         try:
             return await self._service.view_broker_accounts(broker_id)
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
 

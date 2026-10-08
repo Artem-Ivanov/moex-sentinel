@@ -1748,6 +1748,12 @@ class LocalAutomationRepository:
             if len(intent_automation_ids) != len(set(intent_automation_ids)):
                 raise ValueError("Automation already has an active intent in batch.")
             if intent_automation_ids:
+                # Serialize new-intent admission with lifecycle writers before reading state.
+                # sqlite3 SELECT does not start a transaction by default.
+                connection = session.connection()
+                driver = cast(SQLiteConnection, connection.connection.driver_connection)
+                if not driver.in_transaction:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
                 active_rows = session.execute(
                     select(LocalIntentModel.automation_id, LocalIntentModel.idempotency_key).where(
                         LocalIntentModel.automation_id.in_(intent_automation_ids),
@@ -1779,7 +1785,21 @@ class LocalAutomationRepository:
                 cached = session.get(CachedAutomationModel, item.automation_id)
                 if cached is None or cached.fact_instrument_id is None:
                     raise KeyError(item.automation_id)
-                if not self._save_decision_cycle(session, item) and item.intent is not None:
+                lifecycle_current = cached.state == AutomationState.IN_WORK.value
+                if not lifecycle_current:
+                    item = item.model_copy(
+                        update={
+                            "estimated_commission": Decimal(),
+                            "decision": "WAIT",
+                            "reason_code": "AUTOMATION_STATE_CHANGED",
+                            "decision_quantity_lots": 0,
+                            "limit_price": None,
+                            "intent": None,
+                            "cycle_state": None,
+                            "position_snapshot": None,
+                        }
+                    )
+                if lifecycle_current and not self._save_decision_cycle(session, item) and item.intent is not None:
                     item = item.model_copy(
                         update={
                             "estimated_commission": Decimal(),

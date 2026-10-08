@@ -3,20 +3,20 @@
 from collections.abc import Callable
 from functools import partial
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.domain.connections import BrokerConnectionStatus
+from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
-from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.ports import UserBrokerLookupPort
 from moex_sentinel.services.sync_execution import run_sync
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 class BrokerConnectionService:
     def __init__(
         self,
-        brokers: BrokerRepositoryPort,
-        adapter_factory: Callable[[Broker], PortfolioPort],
+        brokers: UserBrokerLookupPort,
+        adapter_factory: Callable[[UserBroker], PortfolioPort],
         environment: EnvironmentStatePort | None = None,
     ) -> None:
         self._brokers = brokers
@@ -30,16 +30,16 @@ class BrokerConnectionService:
             try:
                 accounts = await adapter.list_accounts()
                 if broker.account_id and not any(account.account_id == broker.account_id for account in accounts):
-                    raise TInvestAdapterError(  # noqa: TRY301 - admission belongs before the successful result.
+                    raise BrokerOperationError(  # noqa: TRY301 - admission belongs before the successful result.
                         "BROKER_ACCOUNT_NOT_FOUND", "Выбранный счёт не найден на площадке.", retryable=False
                     )
                 return BrokerConnectionStatus(broker.id, True, len(accounts))
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 if not error.retryable or attempt == 1:
                     raise
         raise RuntimeError("Unreachable connection check state.")
 
-    def _broker(self, broker_id: str) -> Broker:
+    def _broker(self, broker_id: str) -> UserBroker:
         broker = self._brokers.get(broker_id)
         if self._environment is not None:
             active_test = self._environment.view().active_environment == "TEST"

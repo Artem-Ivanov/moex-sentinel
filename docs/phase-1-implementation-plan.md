@@ -360,6 +360,53 @@ healthy на 19.09, но не новые решения и устойчивос�
 
 ## Текущая очередь после 0.9.8
 
+06.10.2026 — **LOCAL DONE: исправления слоистой архитектуры/SOLID**.
+По принятому [аудиту](audits/layered-architecture-solid-20261006.md) и явной
+команде пользователя «тогда исправим эти замечания» закрыты I1–I3 и M1–M6.
+Scope, владельцы файлов, зависимости и критерии приёмки — в
+[плане исправлений](superpowers/plans/2026-10-06-layered-solid-fixes.md).
+Работа идёт в текущем checkout: новые ветки, включая worktree с новой веткой,
+разрешены только отдельным явным распоряжением пользователя. Коммиты делает
+пользователь; агенты не выполняют stage, commit или push. Локальные RED/GREEN
+не означают окончательную приёмку: требуется независимое ревью интеграции.
+Новый пакет не возобновляет завершённые A1/C1–C4/W4 и не включает W3/C5,
+frontend, миграции, стратегию, deploy или проверку live runtime.
+
+Локальные RED/GREEN закрыли все девять finding. Финальный independent review
+полной интеграции, трёх closeout-документов и role/model matrix: **PASS,
+Critical 0 / Important 0 / Minor 0**. Root принял эту кодовую веху. Проверка
+до запуска отдельной тестовой БД: 1825 passed, 166
+skipped, 17 warnings, exit 0; все skips обусловлены отсутствием
+`POSTGRES_TEST_DATABASE_URL`, поэтому PostgreSQL не проверен. Ruff, Black check
+и diff check прошли; reviewer подтвердил 448 source/test hashes без изменений и
+чистый HEAD diff check. Матрица и receipts — в
+[отчёте исправлений](audits/layered-solid-fixes-20261006.md). PostgreSQL,
+runtime и deployment этой проверкой не подтверждены.
+
+06.10.2026 — дополнительная проверка на отдельной Compose PostgreSQL16.15:
+**1991 passed, 0 failed, 0 skipped, 17 warnings**, exit0. PostgreSQL-набор:
+187 PASS, включая все166 ранее пропущенных сценариев и оба paired backup/restore;
+pg_dump/pg_restore16.15 совпадают с сервером. Project
+`moex-sentinel-test-20261006`, loopback127.0.0.1:55433 и literal volume
+`moex-sentinel-test-20261006-data` изолированы от рабочего Compose; запускается
+только database. Frozen448 source/test hashes не изменились. Evidence:
+`develop/reports/postgresql-compose-20261006/verification/`. Независимый `/root/postgres_compose_review`
+принял изоляцию, доказательства, документы и read-only постановку следующего
+объёма: **PASS, Critical0 / Important0 / Minor0**. Тесты исполнял root; reviewer
+независимо проверил XML, хеши и receipts. Локальная PostgreSQL-проверка
+не означает проверку production runtime или deployment.
+
+Предложение следующего объёма после свежей read-only сверки06.10
+`/root/next_development_plan`: F2.1/F3.1 уже реализованы, повторно их не включать.
+Остаточный UI-кандидат — broker editor: поздний save/error не закрывает новую
+форму и не меняет её draft. Далее W3 и C5 можно исполнять независимо:
+W3 — tracking SQLite offload с сохранением порядка intent/outbox;
+C5 — cursor cycles/page/time budgets и ограниченная остановка collector,
+без принятия неполной истории за полный snapshot. Численные бюджеты C5
+закрепить перед реализацией. W5/F4 остаются условными после CPU/I/O профиля.
+Подробная актуальность/DoD: `develop/reports/postgresql-compose-20261006/findings.md`.
+Это предложение порядка; новая реализация этим вопросом пользователя не запущена.
+
 Это кандидаты с конкретной областью проверки; приёмка отдельных пакетов указана ниже.
 ID, доказательства, риски и тесты приведены в оценке выше. Порядок строк задаёт
 ближайшую очередь; условные оптимизации выбираются только после профиля.

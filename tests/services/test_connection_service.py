@@ -7,6 +7,7 @@ from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import Broker, BrokerField
 from moex_sentinel.domain.portfolio import BrokerAccount
 from moex_sentinel.services.connections import BrokerConnectionService
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 class BrokerRepository:
@@ -69,12 +70,28 @@ def test_check_rejects_missing_selected_account_without_retry(account_ids):
     adapter = AccountsAdapter()
     service = BrokerConnectionService(BrokerRepository(record), lambda _: adapter)
 
-    with pytest.raises(TInvestAdapterError, match="Выбранный счёт не найден на площадке.") as error:
+    with pytest.raises(BrokerOperationError, match="Выбранный счёт не найден на площадке.") as error:
         asyncio.run(service.check(record.id))
 
     assert error.value.code == "BROKER_ACCOUNT_NOT_FOUND"
     assert error.value.retryable is False
     assert adapter.calls == 1
+
+
+@pytest.mark.parametrize(("retryable", "expected_calls"), [(False, 1), (True, 2)])
+def test_connection_service_retries_neutral_failures_only_when_declared(retryable, expected_calls):
+    class FailingAdapter:
+        calls = 0
+
+        async def list_accounts(self):
+            self.calls += 1
+            raise BrokerOperationError("BROKER_UNAVAILABLE", "Safe failure", retryable=retryable)
+
+    adapter = FailingAdapter()
+    service = BrokerConnectionService(BrokerRepository(broker()), lambda _: adapter)
+    with pytest.raises(BrokerOperationError):
+        asyncio.run(service.check("broker-1"))
+    assert adapter.calls == expected_calls
 
 
 def test_check_selected_account_preserves_available_count():

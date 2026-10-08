@@ -6,8 +6,8 @@ from contextlib import suppress
 from time import monotonic
 from typing import Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from sentinel_contracts.analytics import AnalyticsSnapshot, AnalyticsSnapshotRequest
+from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
 
@@ -57,7 +57,7 @@ class AnalyticsBrokerRuntime:
             delay = self._tick_seconds
             try:
                 await self.run_once()
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 if not error.retryable:
                     LOGGER.error(  # noqa: TRY400 - keep broker exception text and metadata out of logs
                         "Broker preparation paused; runtime restart required",

@@ -2,19 +2,26 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from sentinel_contracts.analytics import (
+    AdaptiveThresholds,
+    AnalyticsInstrument,
+    AnalyticsSnapshot,
+    MarketIndicators,
+)
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
-from sentinel_contracts.streaming_market import StreamOrderBook, StreamTradingStatus
+from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook, StreamTradingStatus
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
 from trading_automaton.config import StrategySettings
+from trading_automaton.domain.dtos import BatchTickResult
+from trading_automaton.domain.storage_dtos import BatchPersistResult
+from trading_automaton.runtime.analytics_broker import AnalyticsBrokerRuntime
 from trading_automaton.services.account_commission_profile import CommissionSchedule
-from trading_automaton.services.broker_runtime import BrokerRuntimeService
+from trading_automaton.services.analytics_frame import AnalyticsFrameService, AnalyticsMetricsCache
 from trading_automaton.services.decision import TradeDecision, TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
 from trading_automaton.services.decision_materialization import DecisionMaterializerService
-from trading_automaton.services.hot_market_data import HotMarketDataCacheService
-from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
@@ -23,6 +30,7 @@ from trading_automaton.services.streaming_position_decision import (
     StreamingPositionDecisionService,
 )
 from trading_automaton.storage.repository import IntentHistory, TradingCycleState
+from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
 
@@ -41,19 +49,33 @@ def hydrated(automation_id: str) -> HydratedPositionState:
     )
 
 
-class Stream:
-    def __init__(self) -> None:
-        self.queue: asyncio.Queue[object | None] = asyncio.Queue()
+class Analytics:
+    async def snapshot(self, request):
+        book = StreamOrderBook(
+            "instrument", (OrderBookLevel(Decimal("100"), 1),), (OrderBookLevel(Decimal("100.1"), 1),), NOW, True
+        )
+        return AnalyticsSnapshot(
+            snapshot_id="snapshot",
+            profile_id=request.profile_id,
+            captured_at=NOW,
+            instruments=(
+                AnalyticsInstrument(
+                    instrument_id="instrument",
+                    market=InstrumentMarketState(
+                        "instrument",
+                        order_book=book,
+                        trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, True, NOW),
+                    ),
+                    candles=(),
+                    available=True,
+                    freshness="FRESH",
+                    metrics=hydrated("unused").indicators,
+                ),
+            ),
+        )
 
-    async def replace_subscriptions(self, instrument_ids: set[str]) -> None:
+    async def close(self):
         pass
-
-    async def events(self):
-        while (event := await self.queue.get()) is not None:
-            yield event
-
-    async def close(self) -> None:
-        await self.queue.put(None)
 
 
 class States:
@@ -100,7 +122,7 @@ class Batch:
         self.items, self.requests = items, requests
         self.events.extend("sdk_dispatch" for _ in requests)
         self.called.set()
-        return "persisted"
+        return BatchTickResult(BatchPersistResult((), ()), ())
 
 
 class Preparation:
@@ -113,9 +135,9 @@ class Preparation:
         self.prepared.set()
 
 
-def test_one_order_book_event_evaluates_each_position_once_before_sdk_dispatch() -> None:
+def test_one_analytics_frame_evaluates_each_position_once_before_sdk_dispatch() -> None:
     async def scenario():
-        stream = Stream()
+        analytics = Analytics()
         states = States()
         strategy = SpyStrategy()
         batch = Batch()
@@ -134,31 +156,22 @@ def test_one_order_book_event_evaluates_each_position_once_before_sdk_dispatch()
             order_books=OrderBookValidationService(),
         )
         preparation = Preparation()
-        runtime = BrokerRuntimeService(
-            stream,
-            HotMarketDataCacheService(),
-            tick,
-            preparation=preparation,
-            now=lambda: NOW,
-            tick_seconds=0.01,
+        runtime = AnalyticsBrokerRuntime(
+            analytics,
+            RunBrokerIterationUsecase(
+                AnalyticsFrameService(analytics, now=lambda: NOW, order_books=OrderBookValidationService()),
+                tick,
+                preparation=preparation,
+                metrics=AnalyticsMetricsCache(),
+                source_id=str(command(1).broker_id),
+                fallback=AdaptiveThresholds("0.5", "0.5", "STRATEGY"),
+            ),
         )
         await runtime.replace_commands((command(1), command(2)))
-        task = asyncio.create_task(runtime.run())
-        await preparation.prepared.wait()
-        assert strategy.calls_by_automation == {}
-        await stream.queue.put(StreamTradingStatus("instrument", "NORMAL", True, True, NOW))
-        await stream.queue.put(
-            StreamOrderBook(
-                "instrument",
-                (OrderBookLevel(Decimal("100"), 1),),
-                (OrderBookLevel(Decimal("100.1"), 1),),
-                NOW,
-                True,
-            )
-        )
-        await asyncio.wait_for(batch.called.wait(), timeout=1)
+        await runtime.run_once()
+        await runtime.run_once()
+        assert preparation.calls == 2
         await runtime.close()
-        await task
         return strategy, batch
 
     strategy, batch = asyncio.run(scenario())

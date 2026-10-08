@@ -4,8 +4,8 @@ from decimal import Decimal
 
 import pytest
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import BrokerOrderState, OrderSide
+from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
 from sentinel_contracts.business_audit import BusinessAuditStage
 from trading_automaton.services.order_dispatch import (
     DispatchRequest,
@@ -55,11 +55,13 @@ class Broker:
 
     async def inspect_position(self, account_id, instrument_id):
         self.position_calls.append((account_id, instrument_id))
-        return {"quantity_lots": "2", "average_price": "100"}
+        return BrokerPosition(instrument_id, Decimal(2), Decimal(100), Decimal(101), "RUB")
 
     async def inspect_recent_operations(self, account_id, instrument_id, limit):
         self.operation_calls.append((account_id, instrument_id, limit))
-        return ({"type": "BUY", "state": "EXECUTED", "quantity": "1"},)
+        return (
+            BrokerRecoveryOperation("operation", OrderSide.BUY, True, NOW, Decimal(1), Decimal(100), Decimal(1), "RUB"),
+        )
 
 
 class Repository:
@@ -209,7 +211,7 @@ def test_sdk_failure_recovers_order_by_idempotency_key() -> None:
     ("failure", "expected_code", "expected_details"),
     [
         pytest.param(
-            TInvestAdapterError("BROKER_UNAVAILABLE", "Safe broker message", retryable=True),
+            BrokerOperationError("BROKER_UNAVAILABLE", "Safe broker message", retryable=True),
             "BROKER_UNAVAILABLE",
             "Safe broker message",
             id="typed-broker-error",
@@ -261,8 +263,14 @@ def test_ambiguous_dispatch_audit_preserves_only_safe_error_details(failure, exp
         assert failed["exception_type"] == type(failure).__name__
         assert failed["broker_error_code"] == expected_code
         assert failed["broker_error_details"] == expected_details
-        assert failed["position_snapshot"] == {"quantity_lots": "2", "average_price": "100"}
-        assert failed["recent_operations"] == [{"type": "BUY", "state": "EXECUTED", "quantity": "1"}]
+        assert failed["position_snapshot"] == BrokerPosition(
+            "instrument-1", Decimal(2), Decimal(100), Decimal(101), "RUB"
+        ).model_dump(mode="json")
+        assert failed["recent_operations"] == [
+            BrokerRecoveryOperation(
+                "operation", OrderSide.BUY, True, NOW, Decimal(1), Decimal(100), Decimal(1), "RUB"
+            ).model_dump(mode="json")
+        ]
         assert "SECRET_UNEXPECTED_DISPATCH_DETAIL" not in repr(records)
 
     asyncio.run(scenario())

@@ -6,8 +6,6 @@ from decimal import Decimal
 from functools import partial
 from typing import Any, Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
 from moex_sentinel.domain.portfolio import (
     BrokerAccount,
@@ -22,12 +20,14 @@ from moex_sentinel.domain.portfolio import (
     ExternalPosition,
     Money,
 )
+from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
-from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.ports import UserBrokerReadPort
 from moex_sentinel.services.sync_execution import run_sync
+from sentinel_contracts.broker_errors import BrokerOperationError
 
-AdapterFactory = Callable[[Broker], PortfolioPort]
+AdapterFactory = Callable[[UserBroker], PortfolioPort]
 
 
 class InstrumentCatalogLookupPort(Protocol):
@@ -61,7 +61,7 @@ EXECUTED_OPERATION_STATES = frozenset({"EXECUTED", "OPERATION_STATE_EXECUTED"})
 class PortfolioAggregationService:
     def __init__(
         self,
-        brokers: BrokerRepositoryPort,
+        brokers: UserBrokerReadPort,
         adapter_factory: AdapterFactory,
         environment: EnvironmentStatePort | None = None,
         instruments: InstrumentCatalogLookupPort | None = None,
@@ -78,7 +78,7 @@ class PortfolioAggregationService:
         broker = await run_sync(partial(self._account_broker, broker_id))
         return self._accounts_view((await self._read_accounts(broker),))
 
-    def _account_broker(self, broker_id: str) -> Broker:
+    def _account_broker(self, broker_id: str) -> UserBroker:
         broker = self._brokers.get(broker_id)
         if broker.is_test is not self._active_test():
             raise EnvironmentMismatchError("Broker belongs to inactive environment.")
@@ -106,7 +106,7 @@ class PortfolioAggregationService:
 
     async def view_operations(self, limit: int) -> BrokerOperationsView:
         async def read(
-            broker: Broker,
+            broker: UserBroker,
         ) -> tuple[tuple[BrokerOperation, ...], tuple[BrokerReadError, ...]]:
             return await self._read_operations(broker, limit)
 
@@ -130,7 +130,7 @@ class PortfolioAggregationService:
             page = await self._adapter_factory(broker).get_operations(
                 account_id, None, limit, instrument.external_instrument_id
             )
-        except (TInvestAdapterError, ValueError) as error:
+        except (BrokerOperationError, ValueError) as error:
             return BrokerOperationsView((), (self._error(broker, account_id, error),))
         items = tuple(
             BrokerOperation(broker.id, broker.display_name, item)
@@ -151,18 +151,18 @@ class PortfolioAggregationService:
         if self._instruments is None:
             raise ValueError("Position operations require an instrument catalog.")
         if broker.account_id and account_id != broker.account_id:
-            raise ValueError("Broker account does not match selected scope.")
+            raise ValueError("UserBroker account does not match selected scope.")
         instrument = self._instruments.get(broker_id, instrument_id)
         return broker, instrument
 
     async def _for_enabled_brokers(
         self,
-        reader: Callable[[Broker], Coroutine[Any, Any, tuple[tuple[Any, ...], tuple[BrokerReadError, ...]]]],
+        reader: Callable[[UserBroker], Coroutine[Any, Any, tuple[tuple[Any, ...], tuple[BrokerReadError, ...]]]],
     ) -> tuple[tuple[tuple[Any, ...], tuple[BrokerReadError, ...]], ...]:
         brokers = await run_sync(self._enabled_brokers)
         return tuple(await asyncio.gather(*(reader(broker) for broker in brokers)))
 
-    def _enabled_brokers(self) -> tuple[Broker, ...]:
+    def _enabled_brokers(self) -> tuple[UserBroker, ...]:
         active_test = self._active_test()
         return tuple(broker for broker in self._brokers.list() if broker.enabled and broker.is_test is active_test)
 
@@ -170,7 +170,9 @@ class PortfolioAggregationService:
         return self._environment is None or self._environment.view().active_environment == "TEST"
 
     @staticmethod
-    def _missing_selected_account_error(broker: Broker, accounts: tuple[BrokerAccount, ...]) -> BrokerReadError | None:
+    def _missing_selected_account_error(
+        broker: UserBroker, accounts: tuple[BrokerAccount, ...]
+    ) -> BrokerReadError | None:
         if not broker.account_id or any(account.account_id == broker.account_id for account in accounts):
             return None
         return BrokerReadError(
@@ -182,12 +184,12 @@ class PortfolioAggregationService:
         )
 
     async def _read_accounts(
-        self, broker: Broker
+        self, broker: UserBroker
     ) -> tuple[tuple[BrokerAccountSnapshot, ...], tuple[BrokerReadError, ...]]:
         try:
             adapter = self._adapter_factory(broker)
             accounts = await adapter.list_accounts()
-        except (TInvestAdapterError, ValueError) as error:
+        except (BrokerOperationError, ValueError) as error:
             return (), (self._error(broker, None, error),)
 
         if error := self._missing_selected_account_error(broker, accounts):
@@ -201,15 +203,17 @@ class PortfolioAggregationService:
             try:
                 portfolio = await adapter.get_portfolio(account.account_id)
                 snapshots.append(BrokerAccountSnapshot(broker.id, broker.display_name, account, portfolio))
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 errors.append(self._error(broker, account.account_id, error))
         return tuple(snapshots), tuple(errors)
 
-    async def _read_positions(self, broker: Broker) -> tuple[tuple[BrokerPosition, ...], tuple[BrokerReadError, ...]]:
+    async def _read_positions(
+        self, broker: UserBroker
+    ) -> tuple[tuple[BrokerPosition, ...], tuple[BrokerReadError, ...]]:
         try:
             adapter = self._adapter_factory(broker)
             accounts = await adapter.list_accounts()
-        except (TInvestAdapterError, ValueError) as error:
+        except (BrokerOperationError, ValueError) as error:
             return (), (self._error(broker, None, error),)
 
         if error := self._missing_selected_account_error(broker, accounts):
@@ -227,17 +231,17 @@ class PortfolioAggregationService:
                     for item in positions
                     if self._is_open_instrument_position(item)
                 )
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 errors.append(self._error(broker, account.account_id, error))
         return tuple(items), tuple(errors)
 
     async def _read_operations(
-        self, broker: Broker, limit: int
+        self, broker: UserBroker, limit: int
     ) -> tuple[tuple[BrokerOperation, ...], tuple[BrokerReadError, ...]]:
         try:
             adapter = self._adapter_factory(broker)
             accounts = await adapter.list_accounts()
-        except (TInvestAdapterError, ValueError) as error:
+        except (BrokerOperationError, ValueError) as error:
             return (), (self._error(broker, None, error),)
 
         if error := self._missing_selected_account_error(broker, accounts):
@@ -252,7 +256,7 @@ class PortfolioAggregationService:
             try:
                 page = await adapter.get_operations(account.account_id, None, limit)
                 items.extend(await run_sync(partial(self._operation_items, broker, page.items, instruments)))
-            except TInvestAdapterError as error:
+            except BrokerOperationError as error:
                 errors.append(self._error(broker, account.account_id, error))
         return tuple(items), tuple(errors)
 
@@ -295,11 +299,11 @@ class PortfolioAggregationService:
 
     @staticmethod
     def _error(
-        broker: Broker,
+        broker: UserBroker,
         account_id: str | None,
-        error: TInvestAdapterError | ValueError,
+        error: BrokerOperationError | ValueError,
     ) -> BrokerReadError:
-        if isinstance(error, TInvestAdapterError):
+        if isinstance(error, BrokerOperationError):
             return BrokerReadError(
                 broker_id=broker.id,
                 broker_name=broker.display_name,

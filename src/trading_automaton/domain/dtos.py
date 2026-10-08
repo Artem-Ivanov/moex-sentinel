@@ -15,6 +15,7 @@ from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
 from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfileKey,
+    BatchPersistResult,
     IntentHistory,
     TradeLotRecord,
     TradingCycleState,
@@ -240,5 +241,5 @@ class _CacheEntry(PositionalModel):
 
 class BatchTickResult(PositionalModel):
     model_config = ConfigDict(frozen=True)
-    persisted: object
+    persisted: BatchPersistResult
     sla: tuple[SlaResult, ...]

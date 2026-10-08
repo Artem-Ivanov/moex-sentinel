@@ -10,14 +10,14 @@ from moex_sentinel.domain.automations import (
     TradingAutomationDetails,
     TradingAutomationStatuses,
 )
+from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle
+from moex_sentinel.domain.persistence_errors import DuplicateRecordError, RecordNotFoundError, RevisionConflictError
 from moex_sentinel.domain.portfolio import BrokerOperation, BrokerOperationsView
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.automations import AutomationStateConflictError
 from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.services.sync_execution import run_sync
-from moex_sentinel.storage.repositories import DuplicateRecordError, RecordNotFoundError
-from moex_sentinel.storage.repositories.automations import RevisionConflictError
 from moex_sentinel.usecases.errors import UseCaseError
 
 
@@ -77,6 +77,8 @@ class CreateTradingAutomationUsecase:
             )
         except EnvironmentMismatchError as error:
             raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
         except RecordNotFoundError as error:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:

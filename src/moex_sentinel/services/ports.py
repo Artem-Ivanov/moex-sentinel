@@ -2,21 +2,20 @@
 
 from typing import Protocol
 
-from moex_sentinel.domain.brokers import Broker, BrokerAdapterDefinition, BrokerDraft
+from moex_sentinel.domain.brokers import BrokerAdapterDefinition
+from moex_sentinel.domain.user_brokers import UserBroker
 
 
-class BrokerRepositoryPort(Protocol):
-    def list(self) -> list[Broker]: ...
+class UserBrokerLookupPort(Protocol):
+    """Read one configured scope, raising BrokerRecordNotFoundError if absent."""
 
-    def get(self, broker_id: str) -> Broker: ...
+    def get(self, broker_id: str) -> UserBroker: ...
 
-    def create(self, draft: BrokerDraft) -> Broker: ...
 
-    def replace(self, broker_id: str, draft: BrokerDraft) -> Broker: ...
+class UserBrokerReadPort(UserBrokerLookupPort, Protocol):
+    """Read persisted scopes, including archived history."""
 
-    def delete(self, broker_id: str) -> bool: ...
-
-    def set_test_account_state(self, broker_id: str, account_id: str, funded: bool) -> Broker: ...
+    def list(self) -> list[UserBroker]: ...
 
 
 class BrokerRegistryPort(Protocol):

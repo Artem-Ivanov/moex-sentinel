@@ -18,6 +18,7 @@ from sentinel_contracts.streaming_market import (
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from tests.trading_automaton.services.test_position_state_hydration_service import PreparedMetrics
 from tests.trading_automaton.services.test_streaming_runtime_coordinator_service import bootstrap_command
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
@@ -345,7 +346,9 @@ def test_ready_bootstrap_is_atomic_idempotent_and_hydrates_only_after_ack(tmp_pa
         portfolio = Portfolio()
         candles = Candles()
         cache = PositionStateCacheService()
-        hydration = PositionStateHydrationService(repository, portfolio, candles, cache, now=lambda: NOW)
+        hydration = PositionStateHydrationService(
+            repository, portfolio, cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
         service = BrokerTickPreparationService(
             AdoptedBroker(),
             portfolio,

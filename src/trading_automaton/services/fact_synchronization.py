@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
-import httpx
 from pydantic import TypeAdapter
 
 from sentinel_contracts.trading_facts import (
@@ -15,6 +14,7 @@ from sentinel_contracts.trading_facts import (
     FactEnvelope,
     FactGroupFailure,
 )
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.domain.storage_dtos import FactOutboxRecord
 
 _FACT_ENVELOPE_ADAPTER: TypeAdapter[FactEnvelope] = TypeAdapter(FactEnvelope)
@@ -117,21 +117,17 @@ class FactSynchronizationService:
         while True:
             try:
                 result = self._client.publish_facts(facts)
-            except httpx.HTTPStatusError as error:
-                if error.response.status_code < 500:
+            except CoreOperationError as error:
+                if not error.retryable:
                     automation_ids = tuple(dict.fromkeys(UUID(row.automation_id) for row in rows))
                     self._reconcile(automation_ids)
                     for automation_id in automation_ids:
                         self._repository.reject_fact_outbox(
                             str(automation_id),
                             tuple(row.event_id for row in rows if row.automation_id == str(automation_id)),
-                            reason=f"HTTP_{error.response.status_code}",
+                            reason=f"HTTP_{error.status_code}",
                         )
                     return True
-                if attempt >= self._retry_limit:
-                    self._schedule_rows(rows)
-                    return False
-            except httpx.TransportError:
                 if attempt >= self._retry_limit:
                     self._schedule_rows(rows)
                     return False

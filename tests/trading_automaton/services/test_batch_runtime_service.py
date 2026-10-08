@@ -2,12 +2,12 @@ import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
-from sentinel_contracts.broker_execution import OrderSide
+from sentinel_contracts.broker_execution import BrokerOrderState, OrderSide
 from trading_automaton.domain.errors import DurableDecisionPersistenceError
+from trading_automaton.domain.storage_dtos import BatchPersistResult, LocalIntentRecord
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.batch_runtime import (
     BatchTradingRuntimeService,
@@ -29,11 +29,33 @@ class Repository:
         if self.error:
             raise self.error
         intents = tuple(
-            SimpleNamespace(automation_id=item.automation_id, idempotency_key=item.intent.idempotency_key)
+            LocalIntentRecord(
+                idempotency_key=item.intent.idempotency_key,
+                automation_id=item.automation_id,
+                kind=item.intent.kind,
+                side=item.intent.side,
+                state="PENDING",
+                quantity_lots=item.intent.quantity_lots,
+                limit_price=item.intent.limit_price,
+                broker_order_id=None,
+                requested_amount=item.intent.limit_price * item.intent.quantity_lots,
+                executed_amount=Decimal(),
+                estimated_commission=item.estimated_commission,
+                executed_commission=Decimal(),
+                executed_lots=0,
+                executed_price=Decimal(),
+                execution_currency=None,
+                executed_at=None,
+                dispatch_started_at=None,
+                broker_responded_at=None,
+                terminal_at=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
             for item in items
             if item.intent is not None
         )
-        return SimpleNamespace(decisions=(), intents=intents)
+        return BatchPersistResult(decisions=(), intents=intents)
 
 
 class Dispatcher:
@@ -45,6 +67,18 @@ class Dispatcher:
         self.calls.append(request)
         started.set_result(NOW)
         await self.release.wait()
+        return BrokerOrderState(
+            broker_order_id=request.idempotency_key,
+            idempotency_key=request.idempotency_key,
+            status="NEW",
+            requested_lots=request.quantity_lots,
+            executed_lots=0,
+            requested_amount=request.limit_price * request.quantity_lots,
+            executed_amount=Decimal(),
+            estimated_commission=Decimal(),
+            executed_commission=Decimal(),
+            currency="RUB",
+        )
 
 
 class Tracking:
@@ -180,7 +214,18 @@ def test_committed_cash_reservation_is_published_before_sdk_dispatch() -> None:
         async def dispatch(self, request, started):
             self.observed_committed = list(self.cash.committed)
             started.set_result(NOW)
-            return SimpleNamespace()
+            return BrokerOrderState(
+                broker_order_id=request.idempotency_key,
+                idempotency_key=request.idempotency_key,
+                status="NEW",
+                requested_lots=request.quantity_lots,
+                executed_lots=0,
+                requested_amount=request.limit_price * request.quantity_lots,
+                executed_amount=Decimal(),
+                estimated_commission=Decimal(),
+                executed_commission=Decimal(),
+                currency="RUB",
+            )
 
     async def scenario():
         cash = Cash()

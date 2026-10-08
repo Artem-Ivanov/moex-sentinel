@@ -4,7 +4,7 @@ from typing import Protocol
 
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
-from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.ports import UserBrokerReadPort
 from sentinel_contracts.automation_lifecycle import (
     InvalidAutomationTransition,
     TransitionOrigin,
@@ -40,7 +40,7 @@ class AutomationService:
         *,
         access_mode: str = "READ_ONLY",
         environment: EnvironmentStatePort | None = None,
-        brokers: BrokerRepositoryPort | None = None,
+        brokers: UserBrokerReadPort | None = None,
     ) -> None:
         self._repository = repository
         self._access_mode = access_mode

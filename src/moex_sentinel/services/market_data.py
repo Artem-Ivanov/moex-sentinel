@@ -12,19 +12,16 @@ from moex_sentinel.domain.market_data import (
 from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.market_data_ports import MarketDataPort
+from moex_sentinel.services.ports import UserBrokerLookupPort
 from moex_sentinel.services.sync_execution import run_sync
 
 MarketDataAdapterFactory = Callable[[UserBroker], MarketDataPort]
 
 
-class UserBrokerRepositoryPort:
-    def get(self, user_broker_id: str) -> UserBroker: ...
-
-
 class BrokerMarketDataService:
     def __init__(
         self,
-        brokers: UserBrokerRepositoryPort,
+        brokers: UserBrokerLookupPort,
         adapter_factory: MarketDataAdapterFactory,
         environment: EnvironmentStatePort | None = None,
     ) -> None:

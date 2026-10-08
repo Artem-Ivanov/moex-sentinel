@@ -2,11 +2,11 @@
 
 from typing import Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from moex_sentinel.domain.connections import BrokerConnectionStatus
 from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 class ConnectionServicePort(Protocol):
@@ -23,7 +23,7 @@ class CheckBrokerConnectionUsecase:
         """Return connection status; translate known broker, environment and configuration failures."""
         try:
             return await self._service.check(broker_id)
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error

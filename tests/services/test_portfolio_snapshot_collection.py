@@ -8,15 +8,14 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from moex_sentinel.domain.brokers import Broker, BrokerField
 from moex_sentinel.domain.portfolio import AccountPortfolio, BrokerAccount, ExternalOperation, Money, OperationsPage
-from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerState
+from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerNotFoundError, UserBrokerState
 from moex_sentinel.services.portfolio_snapshot_collection import (
     AdapterFactory,
     PortfolioSnapshotCollectionService,
     Sleep,
 )
-from moex_sentinel.services.ports import BrokerRepositoryPort
+from moex_sentinel.services.ports import UserBrokerReadPort
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.models import Base, PortfolioSnapshotModel, PortfolioSnapshotRunModel
 from moex_sentinel.storage.portfolio_snapshot_collection import PortfolioSnapshotCollectionStore
@@ -28,11 +27,17 @@ NOW = datetime(2026, 8, 15, 10, tzinfo=UTC)
 
 
 class BrokerRepository:
-    def __init__(self, records: list[Broker | UserBroker]) -> None:
+    def __init__(self, records: list[UserBroker]) -> None:
         self.records = records
 
-    def list(self) -> list[Broker | UserBroker]:
+    def list(self) -> list[UserBroker]:
         return self.records
+
+    def get(self, broker_id: str) -> UserBroker:
+        for record in self.records:
+            if record.id == broker_id:
+                return record
+        raise UserBrokerNotFoundError(broker_id)
 
 
 class PortfolioAdapter:
@@ -80,23 +85,23 @@ def database() -> Iterator[tuple[Engine, sessionmaker[Session]]]:
     engine.dispose()
 
 
-def broker(broker_id: str = "broker-1", account_id: str = "account-1") -> Broker:
-    return Broker(
+def broker(broker_id: str = "broker-1", account_id: str = "account-1") -> UserBroker:
+    return UserBroker(
         id=broker_id,
         display_name=f"Broker {broker_id}",
-        provider_code="TINVEST",
-        environment_code="SANDBOX",
-        adapter_code="TINVEST_SANDBOX",
-        enabled=True,
-        fields=(BrokerField("token", "synthetic-token"),),
+        api_slug="t_invest",
+        environment="TEST",
+        fqdn="sandbox-invest-public-api.tbank.ru:443",
+        settings={"token": "synthetic-token"},
+        state=UserBrokerState.ACTIVE,
         created_at=NOW,
         updated_at=NOW,
-        account_id=account_id,
+        external_account_id=account_id,
     )
 
 
 def build_collector(
-    brokers: BrokerRepositoryPort,
+    brokers: UserBrokerReadPort,
     adapter_factory: AdapterFactory,
     factory: sessionmaker[Session],
     engine: Engine,
@@ -481,7 +486,7 @@ def test_invalid_broker_configuration_does_not_block_other_brokers(
         session.add(user_broker_model("broker-2", "account-2"))
         session.commit()
 
-    def adapter_factory(value: Broker) -> PortfolioAdapter:
+    def adapter_factory(value: UserBroker) -> PortfolioAdapter:
         if value.id == "broker-1":
             raise ValueError("Некорректная конфигурация.")
         return PortfolioAdapter()

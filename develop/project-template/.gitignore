@@ -1,0 +1,29 @@
+# Локальный контекст и журналы
+/develop/CURRENT.md
+/develop/WORK_LOG.md
+/.planning/
+/develop/reports/
+/develop/reviews/
+
+# Generated files and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+node_modules/
+.venv/
+venv/
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Keep project instructions and Codex configuration tracked
+!/.agents/
+!/.codex/

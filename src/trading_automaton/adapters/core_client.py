@@ -18,6 +18,7 @@ from sentinel_contracts.trading_facts import (
 )
 from sentinel_contracts.version import SERVICE_VERSION
 from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
+from trading_automaton.domain.errors import CoreOperationError
 
 
 class CoreClient:
@@ -32,8 +33,7 @@ class CoreClient:
     def validate_runtime(self) -> None:
         if self._application_environment is None and self._access_mode is None:
             return
-        response = self._http.get("/internal/runtime", headers=self._headers())
-        response.raise_for_status()
+        response = self._request("GET", "/internal/runtime", headers=self._headers())
         configuration = response.json()
         if configuration.get("environment") != self._application_environment:
             raise ValueError("Worker/Core environment mismatch")
@@ -42,38 +42,39 @@ class CoreClient:
 
     def claim_commands(self, worker_id: str, limit: int) -> list[AutomationCommand]:
         self.validate_runtime()
-        response = self._http.post(
+        response = self._request(
+            "POST",
             "/internal/automation-commands",
             json={"worker_id": worker_id, "limit": limit},
             headers=self._headers(),
         )
-        response.raise_for_status()
         return [AutomationCommand.model_validate(item) for item in response.json()["commands"]]
 
     def automation_statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult:
         self.validate_runtime()
-        response = self._http.post(
+        response = self._request(
+            "POST",
             "/internal/automation-statuses",
             json={"automation_ids": [str(item) for item in automation_ids]},
             headers=self._headers(),
         )
-        response.raise_for_status()
         return AutomationStatusesResult.model_validate(response.json())
 
     def publish_facts(self, facts: list[FactEnvelope]) -> FactBatchResult:
         request = FactBatchRequest(facts=facts)
         self.validate_runtime()
-        response = self._http.post(
+        response = self._request(
+            "POST",
             "/internal/automation-facts",
             json=request.model_dump(mode="json"),
             headers=self._headers(),
         )
-        response.raise_for_status()
         return FactBatchResult.model_validate(response.json())
 
     def heartbeat(self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None) -> None:
         self.validate_runtime()
-        response = self._http.post(
+        self._request(
+            "POST",
             "/internal/automaton/heartbeats",
             json={
                 "worker_id": worker_id,
@@ -94,19 +95,27 @@ class CoreClient:
             },
             headers=self._headers(),
         )
-        response.raise_for_status()
 
     def broker_connection(self, broker_id: str) -> BrokerConnection:
         self.validate_runtime()
-        response = self._http.get(f"/internal/automaton/brokers/{broker_id}/connection", headers=self._headers())
-        response.raise_for_status()
+        response = self._request("GET", f"/internal/automaton/brokers/{broker_id}/connection", headers=self._headers())
         return BrokerConnection(**response.json())
 
     def broker_scope(self, broker_id: str) -> BrokerScope:
         self.validate_runtime()
-        response = self._http.get(f"/internal/automaton/brokers/{broker_id}/scope", headers=self._headers())
-        response.raise_for_status()
+        response = self._request("GET", f"/internal/automaton/brokers/{broker_id}/scope", headers=self._headers())
         return BrokerScope.model_validate(response.json())
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        try:
+            response = self._http.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            raise CoreOperationError(retryable=status >= 500, status_code=status) from error
+        except httpx.TransportError as error:
+            raise CoreOperationError(retryable=True) from error
 
     @staticmethod
     def _headers() -> dict[str, str]:

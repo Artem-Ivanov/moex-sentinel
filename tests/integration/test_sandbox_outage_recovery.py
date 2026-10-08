@@ -247,9 +247,15 @@ class AcceptedWithoutResponse(PersistentFills):
         assert idempotency_key == self.accepted.idempotency_key
         return self.accepted
 
-    async def inspect_position(self, account_id, instrument_id):
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition:
         self.require_available()
-        return {"quantity_lots": str(self.quantities[instrument_id]), "currency": "RUB"}
+        return BrokerPosition(
+            instrument_id=instrument_id,
+            quantity_lots=self.quantities[instrument_id],
+            average_price=Decimal("101"),
+            current_price=Decimal("100"),
+            currency="RUB",
+        )
 
     async def inspect_recent_operations(self, account_id, instrument_id, limit):
         self.require_available()

@@ -5,7 +5,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-import httpx
 import pytest
 from pydantic import TypeAdapter
 from sqlalchemy import create_engine, func, select
@@ -43,6 +42,7 @@ from tests.trading_automaton.test_analytics_runtime import FALLBACK, Source, Tic
 from tests.trading_automaton.test_analytics_runtime import NOW as MARKET_NOW
 from trading_automaton.composition import build_broker_runtime, build_worker_recovery
 from trading_automaton.config import StrategySettings
+from trading_automaton.domain.errors import AnalyticsUnavailableError
 from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
@@ -205,7 +205,7 @@ def test_unavailable_market_allows_position_adoption_but_no_tick_or_order(tmp_pa
         )
         runtime = build_analytics_runtime(
             Source(
-                httpx.ReadTimeout("offline analytics unavailable") if market_problem == "unavailable" else source_frame
+                AnalyticsUnavailableError("Analytics unavailable") if market_problem == "unavailable" else source_frame
             ),
             tick,
             preparation=preparation,
@@ -314,7 +314,7 @@ def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ac
             application_environment="PROD",
             worker_access_mode="READ_ONLY",
             session_factory=lambda _connection: broker,
-            analytics_client=Source(httpx.ReadTimeout("offline analytics")),
+            analytics_client=Source(AnalyticsUnavailableError("Analytics unavailable")),
             now=lambda: NOW,
         )
         try:

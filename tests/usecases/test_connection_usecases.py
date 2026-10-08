@@ -7,6 +7,7 @@ from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.connections import BrokerConnectionStatus
 from moex_sentinel.usecases.connections import CheckBrokerConnectionUsecase
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 @dataclass
@@ -35,3 +36,13 @@ def test_check_connection_maps_adapter_error_to_usecase_error() -> None:
 
     assert caught.value.code == "BROKER_AUTH_FAILED"
     assert "broker-1" not in caught.value.message
+
+
+def test_check_connection_maps_vendor_independent_operation_failure() -> None:
+    usecase = CheckBrokerConnectionUsecase(
+        ConnectionService(BrokerOperationError("BROKER_FORBIDDEN", "Safe failure", retryable=False))
+    )
+    with pytest.raises(UseCaseError) as caught:
+        asyncio.run(usecase.execute("broker-1"))
+    assert caught.value.code == "BROKER_FORBIDDEN"
+    assert caught.value.message == "Safe failure"

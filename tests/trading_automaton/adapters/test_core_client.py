@@ -20,6 +20,7 @@ from sentinel_contracts.version import SERVICE_VERSION
 from tests.contracts.trading_facts_helpers import all_envelopes
 from tests.services.test_runtime_versions import NOW, progress
 from trading_automaton.adapters.core_client import CoreClient
+from trading_automaton.domain.errors import CoreOperationError
 
 
 def command() -> AutomationCommand:
@@ -99,11 +100,11 @@ def test_exposes_http_conflicts_without_transport_retry() -> None:
 
     with (
         httpx.Client(transport=httpx.MockTransport(handler), base_url="http://core:8000") as http,
-        pytest.raises(httpx.HTTPStatusError) as error,
+        pytest.raises(CoreOperationError) as error,
     ):
         CoreClient(http).claim_commands("worker-1", 5)
 
-    assert error.value.response.status_code == 409
+    assert error.value.status_code == 409
     assert attempts == 1
 
 
@@ -176,3 +177,36 @@ def test_worker_diagnostics_is_additive_to_existing_identity_and_http_heartbeat(
     assert bodies[0]["worker_diagnostics"]["completed_iterations"] == 1
     assert bodies[0]["worker_diagnostics"]["outbox"]["pending_count"] == 0
     assert bodies[0]["runtime_version"]["environment"] == "TEST"
+
+
+@pytest.mark.parametrize("status", [302, 409, 503])
+def test_fact_failure_is_safe_and_neutral_with_explicit_retry_policy(status):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, json={"secret": "NEVER_PUBLIC"})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler), base_url="https://core.test") as http,
+        pytest.raises(CoreOperationError) as caught,
+    ):
+        CoreClient(http).publish_facts([all_envelopes()[0]])
+    assert caught.value.status_code == status
+    assert caught.value.retryable is (status >= 500)
+    assert str(caught.value) == "Core operation failed"
+    assert len(calls) == 1
+
+
+def test_fact_transport_failure_has_no_protocol_status():
+    def handler(request):
+        raise httpx.ConnectError("SECRET", request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler), base_url="https://core.test") as http,
+        pytest.raises(CoreOperationError) as caught,
+    ):
+        CoreClient(http).publish_facts([all_envelopes()[0]])
+    assert caught.value.retryable is True
+    assert caught.value.status_code is None
+    assert "SECRET" not in str(caught.value)

@@ -1,8 +1,12 @@
 import asyncio
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
-from moex_sentinel.domain.market_data import HistoricCandle
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
@@ -24,20 +28,12 @@ class Portfolio:
         return BrokerPosition(instrument_id, Decimal("2"), Decimal("100"), Decimal("101"), "RUB")
 
 
-class Candles:
-    async def completed(self, instrument_id):
-        return (
-            HistoricCandle(
-                instrument_id,
-                Decimal("100"),
-                Decimal("102"),
-                Decimal("99"),
-                Decimal("101"),
-                10,
-                NOW,
-                True,
-            ),
-        )
+class PreparedMetrics:
+    def __init__(self, at=NOW):
+        self.at = at
+
+    async def get(self, instrument_id):
+        return MarketIndicators(Decimal("0.5"), Decimal("0.5"), "ANALYTICS", None, None, None, self.at)
 
 
 class Repository:
@@ -76,9 +72,9 @@ def test_hydrates_all_durable_and_market_state_before_snapshot() -> None:
         service = PositionStateHydrationService(
             Repository(),
             Portfolio(),
-            Candles(),
             cache,
             now=lambda: NOW,
+            prepared_metrics=PreparedMetrics(),
         )
         await service.hydrate((command(),))
         return await cache.get(str(command().automation_id))
@@ -98,10 +94,10 @@ def test_excludes_position_from_hot_state_when_consistency_check_fails() -> None
         service = PositionStateHydrationService(
             Repository(),
             Portfolio(),
-            Candles(),
             cache,
             consistency=InconsistentPositions(),
             now=lambda: NOW,
+            prepared_metrics=PreparedMetrics(),
         )
         await service.hydrate((command(),))
         return await cache.get(str(command().automation_id))
@@ -117,11 +113,34 @@ def test_excludes_position_until_previous_core_snapshot_is_acknowledged() -> Non
         service = PositionStateHydrationService(
             repository,
             Portfolio(),
-            Candles(),
             cache,
             now=lambda: NOW,
+            prepared_metrics=PreparedMetrics(),
         )
         await service.hydrate((command(),))
         return await cache.get(str(command().automation_id))
 
     assert asyncio.run(scenario()) is None
+
+
+def test_worker_hydration_and_planner_import_without_analytics_implementation():
+
+    code = """
+import builtins
+original = builtins.__import__
+def isolated(name, *args, **kwargs):
+    if name == "market_analytics" or name.startswith("market_analytics."):
+        raise AssertionError("Worker imported Analytics implementation")
+    return original(name, *args, **kwargs)
+builtins.__import__ = isolated
+import trading_automaton.services.position_state_hydration
+import trading_automaton.services.runtime_decision_planner
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[3] / "src")},
+    )
+    assert result.returncode == 0, result.stderr

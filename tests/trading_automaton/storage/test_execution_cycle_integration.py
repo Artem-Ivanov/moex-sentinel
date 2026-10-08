@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from moex_sentinel.domain.market_data import HistoricCandle
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel, OrderSide
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook
 from sentinel_contracts.trading import DecisionKind
@@ -315,22 +315,22 @@ def test_cycle_compare_and_set_normalizes_hot_timestamp_to_database_precision(st
     assert repo.get_cycle_state(before.automation_id, now=NOW) == observed
 
 
-class CompletedCandles:
+class PreparedMetrics:
     latest = CANDLE_AT
 
-    async def completed(self, instrument_id):
-        return tuple(
-            HistoricCandle(
-                instrument_id,
-                Decimal("100"),
-                Decimal("101"),
-                Decimal("99"),
-                Decimal("100"),
-                10,
-                self.latest - timedelta(minutes=offset),
-                True,
-            )
-            for offset in reversed(range(20))
+    async def get(self, instrument_id):
+        return MarketIndicators(
+            Decimal("0.5"),
+            Decimal("0.5"),
+            "ANALYTICS",
+            Decimal(100),
+            Decimal(100),
+            Decimal(),
+            self.latest,
+            last_candle_open=Decimal(100),
+            last_candle_close=Decimal(100),
+            range_low=Decimal(99),
+            range_high=Decimal(101),
         )
 
 
@@ -362,8 +362,10 @@ def test_rehydrated_fill_blocks_same_candle_then_allows_next_candle_reversal(sto
 
     async def scenario():
         cache = PositionStateCacheService()
-        candles = CompletedCandles()
-        hydration = PositionStateHydrationService(reopened, FilledPortfolio(), candles, cache, now=lambda: NOW)
+        metrics = PreparedMetrics()
+        hydration = PositionStateHydrationService(
+            reopened, FilledPortfolio(), cache, now=lambda: NOW, prepared_metrics=metrics
+        )
         await hydration.hydrate((command,))
         assert await cache.get(before.automation_id) is None
         facts = reopened.ready_fact_outbox(100, now=NOW + timedelta(seconds=1), deadline_ms=0)
@@ -404,7 +406,7 @@ def test_rehydrated_fill_blocks_same_candle_then_allows_next_candle_reversal(sto
             PositionWorkItem(command, False, state=rebound, snapshot_at=NOW), market("99.3")
         )
         reopened.save_cycle_state(rebound.cycle)
-        candles.latest += timedelta(minutes=1)
+        metrics.latest += timedelta(minutes=1)
         await hydration.hydrate((command,))
         next_state = await cache.get(before.automation_id)
         next_candle = await evaluator.decide(

@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 
-from moex_sentinel.domain.brokers import Broker
 from moex_sentinel.domain.user_brokers import UserBroker, UserBrokerState
 from moex_sentinel.services.market_data_ports import MarketDataPort
 from moex_sentinel.services.portfolio_ports import PortfolioPort
@@ -16,7 +15,7 @@ class PortfolioAdapterFactory:
     def __init__(self, adapter_builder: Callable[[str, str], PortfolioPort]) -> None:
         self._adapter_builder = adapter_builder
 
-    def create(self, broker: Broker) -> PortfolioPort:
+    def create(self, broker: UserBroker) -> PortfolioPort:
         # Account discovery is required before a draft can become ACTIVE.
         draft = isinstance(broker, UserBroker) and broker.state is UserBrokerState.DRAFT
         if not broker.enabled and not draft:
@@ -35,7 +34,7 @@ class MarketDataAdapterFactory:
     def __init__(self, adapter_builder: Callable[[str, str], MarketDataPort]) -> None:
         self._adapter_builder = adapter_builder
 
-    def create(self, broker: Broker) -> MarketDataPort:
+    def create(self, broker: UserBroker) -> MarketDataPort:
         if not broker.enabled:
             raise ValueError("Подключение брокера отключено.")
         fields = {field.name: field.value.strip() for field in broker.fields}

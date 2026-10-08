@@ -33,7 +33,7 @@ from moex_sentinel.domain.trading_facts import (
 )
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
-from sentinel_contracts.broker_execution import BrokerOrderState
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
 from tests.domain.trading_facts_helpers import all_fact_drafts
 from tests.storage.trading_facts_helpers import instrument_model, user_broker_model
 from tests.trading_automaton.command_factory import decision_item
@@ -286,8 +286,14 @@ def test_paired_backup_restore_keeps_graph_and_reconciles_without_resubmit(
                         executed_at=NOW,
                     )
 
-                async def inspect_position(self, *args):
-                    return {"quantity_lots": Decimal("2")}
+                async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition:
+                    return BrokerPosition(
+                        instrument_id=instrument_id,
+                        quantity_lots=Decimal("2"),
+                        average_price=Decimal("100"),
+                        current_price=Decimal("100"),
+                        currency="RUB",
+                    )
 
                 async def inspect_recent_operations(self, *args):
                     return ()

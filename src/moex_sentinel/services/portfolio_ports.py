@@ -13,6 +13,8 @@ from moex_sentinel.domain.portfolio import (
 
 
 class PortfolioPort(Protocol):
+    """Read broker data; declared failures raise neutral BrokerOperationError."""
+
     async def list_accounts(self) -> tuple[BrokerAccount, ...]: ...
 
     async def get_portfolio(self, account_id: str) -> AccountPortfolio: ...

@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import suppress
 from datetime import datetime, timedelta
 from functools import partial
@@ -12,6 +12,7 @@ from uuid import UUID, uuid4, uuid5
 from moex_sentinel.services.market_recovery import MarketRecoveryPolicy, MarketSourceOperations
 from moex_sentinel.services.sync_execution import run_sync
 from sentinel_contracts.analytics import MarketSnapshotRequest, MarketSourceInstrument, MarketSourceSnapshot
+from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.market_quality import valid_market_structure
 from sentinel_contracts.streaming_market import (
     InstrumentMarketState,
@@ -24,60 +25,38 @@ from sentinel_contracts.time import utc_now_ms
 
 type MarketEvent = StreamCandle | StreamLastPrice | StreamOrderBook | StreamTradingStatus
 LOGGER = logging.getLogger(__name__)
-PERMANENT_STATUSES = {
-    "UNAUTHENTICATED",
-    "PERMISSION_DENIED",
-    "INVALID_ARGUMENT",
-    "FAILED_PRECONDITION",
-    "UNIMPLEMENTED",
-}
 
 
 class _QuietMarket(TimeoutError):
     """No fresh books observed; this does not identify a provider fault."""
 
 
-def _failure_data(error: BaseException) -> dict[str, list[str]]:
-    """Expose diagnostic codes without exception text, metadata or credentials."""
-    allowed_statuses = {
-        "CANCELLED",
-        "UNKNOWN",
-        "INVALID_ARGUMENT",
-        "DEADLINE_EXCEEDED",
-        "NOT_FOUND",
-        "ALREADY_EXISTS",
-        "PERMISSION_DENIED",
-        "RESOURCE_EXHAUSTED",
-        "FAILED_PRECONDITION",
-        "ABORTED",
-        "OUT_OF_RANGE",
-        "UNIMPLEMENTED",
-        "INTERNAL",
-        "UNAVAILABLE",
-        "DATA_LOSS",
-        "UNAUTHENTICATED",
-    }
+def _failure_leaves(error: BaseException) -> Iterator[BaseException]:
     pending = [error]
-    exception_types: set[str] = set()
-    statuses: set[str] = set()
     while pending:
         current = pending.pop()
         if isinstance(current, BaseExceptionGroup):
             pending.extend(current.exceptions)
-            continue
-        exception_types.add(type(current).__name__)
-        # Diagnostics must not interrupt recovery if an SDK accessor fails.
-        with suppress(Exception):
-            code = getattr(current, "code", None)
-            if callable(code):
-                code = code()
-            status = getattr(code, "name", None)
-            if isinstance(status, str) and status in allowed_statuses:
-                statuses.add(status)
-    return {"exception_types": sorted(exception_types), "grpc_statuses": sorted(statuses)}
+        else:
+            yield current
+
+
+def _failure_data(error: BaseException) -> dict[str, list[str]]:
+    """Expose neutral declared codes without exception text or transport accessors."""
+    failures = tuple(_failure_leaves(error))
+    return {
+        "exception_types": sorted({type(item).__name__ for item in failures}),
+        "error_codes": sorted({item.code for item in failures if isinstance(item, BrokerOperationError)}),
+    }
+
+
+def _permanent_failure(error: BaseException) -> bool:
+    return any(isinstance(item, BrokerOperationError) and not item.retryable for item in _failure_leaves(error))
 
 
 class MarketSourcePort(Protocol):
+    """Market-only source; declared broker failures raise neutral BrokerOperationError."""
+
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     async def replace_subscriptions(self, instrument_ids: set[str]) -> None: ...
@@ -138,7 +117,7 @@ class _SourceRuntime:
                 raise
             except Exception as error:
                 data = _failure_data(error)
-                permanent = bool(PERMANENT_STATUSES.intersection(data["grpc_statuses"]))
+                permanent = _permanent_failure(error)
                 if self.detected_at is None:
                     self.detected_at = asyncio.get_running_loop().time()
                 LOGGER.warning(
@@ -294,7 +273,7 @@ class _SourceRuntime:
                     # fresh quotes must remain usable for position protection.
                     data = _failure_data(error)
                     count = self.history_failures[instrument_id] = self.history_failures.get(instrument_id, 0) + 1
-                    if PERMANENT_STATUSES.intersection(data["grpc_statuses"]):
+                    if _permanent_failure(error):
                         self.history_blocked.add(instrument_id)
                         due.pop(instrument_id, None)
                         self.history_retry_due.pop(instrument_id, None)

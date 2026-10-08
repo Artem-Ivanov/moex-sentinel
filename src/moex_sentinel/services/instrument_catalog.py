@@ -24,6 +24,7 @@ from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle, Las
 from moex_sentinel.domain.user_brokers import UserBroker
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.market_data_ports import MarketDataPort
+from moex_sentinel.services.ports import UserBrokerLookupPort
 from moex_sentinel.services.sync_execution import run_sync
 
 CATEGORY_LABELS = {
@@ -68,14 +69,10 @@ class InstrumentCatalogRepositoryPort(Protocol):
     def mark_failed(self, broker_id: str, attempted_at: datetime, safe_error: str) -> None: ...
 
 
-class UserBrokerRepositoryPort(Protocol):
-    def get(self, user_broker_id: str) -> UserBroker: ...
-
-
 class InstrumentCatalogService:
     def __init__(
         self,
-        brokers: UserBrokerRepositoryPort,
+        brokers: UserBrokerLookupPort,
         catalog: InstrumentCatalogRepositoryPort,
         adapter_factory: Callable[[UserBroker], MarketDataPort],
         environment: EnvironmentStatePort | None = None,

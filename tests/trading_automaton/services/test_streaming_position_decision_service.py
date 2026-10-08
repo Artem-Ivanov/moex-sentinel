@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook
 from sentinel_contracts.trading import DecisionKind
@@ -11,7 +12,6 @@ from trading_automaton.config import StrategySettings
 from trading_automaton.services.account_commission_profile import CommissionSchedule
 from trading_automaton.services.decision import TradeDecision
 from trading_automaton.services.decision_context import DecisionContextService
-from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.position_batch_scheduler import PositionWorkItem
 from trading_automaton.services.streaming_position_decision import (
     HydratedPositionState,

@@ -11,7 +11,6 @@ from typing import Any, Literal
 from grpc import StatusCode
 from t_tech.invest import AioRequestError, AsyncClient
 from t_tech.invest.schemas import (
-    CandleInterval,
     GetOperationsByCursorRequest,
     GetOrderPriceRequest,
     OrderDirection,
@@ -22,8 +21,7 @@ from t_tech.invest.schemas import (
 
 from moex_sentinel.adapters.tinvest.converters import enum_name, execution_unit_price, quotation_to_decimal
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from moex_sentinel.domain.market_data import HistoricCandle
-from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
 from sentinel_contracts.time import floor_utc_millisecond
 from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
@@ -115,9 +113,6 @@ class BrokerSdkSession:
             deal_commission=quotation_to_decimal(response.deal_commission),
         )
 
-    def create_market_data_stream(self) -> Any:
-        return self.services.create_market_data_stream()
-
     async def get_positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
         self._validate_account(account_id)
         async with self._snapshot_lock:
@@ -188,36 +183,6 @@ class BrokerSdkSession:
         async with self._snapshot_lock:
             self._positions_cache.pop(account_id, None)
             self._money_cache.pop(account_id, None)
-
-    async def get_candles(
-        self,
-        instrument_id: str,
-        start: datetime,
-        end: datetime,
-        interval: object | None = None,
-    ) -> tuple[HistoricCandle, ...]:
-        del interval
-        response = await self._broker_request(
-            self.services.market_data.get_candles(
-                instrument_id=instrument_id,
-                from_=start,
-                to=end,
-                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
-            )
-        )
-        return tuple(
-            HistoricCandle(
-                instrument_id=instrument_id,
-                open=quotation_to_decimal(item.open),
-                high=quotation_to_decimal(item.high),
-                low=quotation_to_decimal(item.low),
-                close=quotation_to_decimal(item.close),
-                volume=item.volume,
-                started_at=item.time,
-                is_complete=item.is_complete,
-            )
-            for item in response.candles
-        )
 
     async def dispatch_limit_order(self, request: DispatchRequest) -> BrokerOrderState:
         if self._access_mode != "TRADE":
@@ -329,16 +294,11 @@ class BrokerSdkSession:
             )
             raise mapped from error
 
-    async def inspect_position(self, account_id: str, instrument_id: str) -> dict[str, object] | None:
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None:
         positions = await self.get_positions(account_id)
         for position in positions:
             if position.instrument_id == instrument_id:
-                return {
-                    "quantity_lots": str(position.quantity_lots),
-                    "average_price": str(position.average_price),
-                    "current_price": str(position.current_price),
-                    "currency": position.currency,
-                }
+                return position
         return None
 
     async def inspect_recent_operations(
@@ -346,7 +306,7 @@ class BrokerSdkSession:
         account_id: str,
         instrument_id: str,
         limit: int,
-    ) -> tuple[dict[str, object], ...]:
+    ) -> tuple[BrokerRecoveryOperation, ...]:
         self._validate_account(account_id)
         response = await self._broker_request(
             self.services.operations.get_operations_by_cursor(
@@ -358,17 +318,18 @@ class BrokerSdkSession:
             )
         )
         return tuple(
-            {
-                "operation_id": item.id,
-                "operation_type": enum_name(item.type),
-                "state": enum_name(item.state),
-                "occurred_at": item.date.isoformat(),
-                "quantity": str(item.quantity),
-                "quantity_done": str(item.quantity_done),
-                "price": str(quotation_to_decimal(item.price)),
-                "commission": str(quotation_to_decimal(item.commission)),
-                "currency": str(item.price.currency).upper(),
-            }
+            BrokerRecoveryOperation(
+                operation_id=item.id,
+                side={"OPERATION_TYPE_BUY": OrderSide.BUY, "OPERATION_TYPE_SELL": OrderSide.SELL}.get(
+                    enum_name(item.type)
+                ),
+                executed=enum_name(item.state) == "OPERATION_STATE_EXECUTED",
+                occurred_at=floor_utc_millisecond(item.date),
+                quantity_units=Decimal(item.quantity_done),
+                price=quotation_to_decimal(item.price),
+                commission=quotation_to_decimal(item.commission),
+                currency=str(item.price.currency).upper(),
+            )
             for item in response.items
         )
 

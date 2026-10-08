@@ -12,8 +12,8 @@ from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrd
 from sentinel_contracts.trading import DecisionKind
 from tests.trading_automaton.services.test_position_state_hydration_service import (
     NOW,
-    Candles,
     Portfolio,
+    PreparedMetrics,
     Repository,
     command,
 )
@@ -58,12 +58,12 @@ def test_hydration_decision_dispatch_and_durable_audit_share_process(tmp_path, k
         hydration = PositionStateHydrationService(
             Repository(),
             Portfolio(),
-            Candles(),
             cache,
             consistency=ConsistentPosition(),
             audit=audit,
             now=lambda: NOW,
             id_factory=lambda: HYDRATION_ID,
+            prepared_metrics=PreparedMetrics(),
         )
         await hydration.hydrate((command(),))
         state = await cache.get(str(command().automation_id))
@@ -144,7 +144,9 @@ async def materialize(
 def test_missing_or_invalid_hydration_process_uses_factory_fallback(process_id):
     async def scenario():
         cache = PositionStateCacheService()
-        hydration = PositionStateHydrationService(Repository(), Portfolio(), Candles(), cache, now=lambda: NOW)
+        hydration = PositionStateHydrationService(
+            Repository(), Portfolio(), cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
         await hydration.hydrate((command(),))
         state = await cache.get(str(command().automation_id))
         return await materialize(state.model_copy(update={"process_id": process_id}))
@@ -159,7 +161,9 @@ def test_missing_or_invalid_hydration_process_uses_factory_fallback(process_id):
 def test_active_intent_wait_does_not_publish_pre_execution_cycle():
     async def scenario():
         cache = PositionStateCacheService()
-        hydration = PositionStateHydrationService(Repository(), Portfolio(), Candles(), cache, now=lambda: NOW)
+        hydration = PositionStateHydrationService(
+            Repository(), Portfolio(), cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
         await hydration.hydrate((command(),))
         state = await cache.get(str(command().automation_id))
         assert state.has_active_intent
@@ -185,7 +189,9 @@ def test_intent_id_failure_does_not_reserve_pending_cash():
 
     async def scenario():
         cache = PositionStateCacheService()
-        hydration = PositionStateHydrationService(Repository(), Portfolio(), Candles(), cache, now=lambda: NOW)
+        hydration = PositionStateHydrationService(
+            Repository(), Portfolio(), cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
         await hydration.hydrate((command(),))
         state = await cache.get(str(command().automation_id))
         await materialize(

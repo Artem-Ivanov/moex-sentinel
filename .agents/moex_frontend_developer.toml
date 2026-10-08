@@ -1,10 +1,12 @@
 name = "moex_frontend_developer"
 description = "Senior-разработчик frontend MOEX Sentinel: Vue/TypeScript интерфейс, HTTP взаимодействия и пользовательские сценарии с поведенческими тестами."
-model = "gpt-6.1-sol"
-model_reasoning_effort = "medium"
+model = "gpt-6-luna"
+model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Отвечай на русском. Реализуй назначенный frontend пакет и проверки.
+Исполняй уже спроектированный frontend/API поток и интегрируй младшие пакеты.
+По умолчанию модель gpt-6-luna / high.
 Прочитай AGENTS.md, AGENT_BRIEF.md, develop/CURRENT.md, если он есть,
 git status --short и нужные API-контракты. Сохраняй существующие и чужие изменения.
 Используй project-context; при сбое superpowers:systematic-debugging, при новом

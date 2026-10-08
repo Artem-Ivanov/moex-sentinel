@@ -7,8 +7,8 @@ from uuid import UUID
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import BrokerOrderState
+from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
 from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
@@ -84,7 +84,7 @@ class Broker:
     async def inspect_position(self, account_id, instrument_id):
         if self.position_lots is None:
             return None
-        return {"quantity_lots": self.position_lots, "currency": "RUB"}
+        return BrokerPosition(instrument_id, Decimal(self.position_lots), Decimal(), Decimal(), "RUB")
 
     async def inspect_recent_operations(self, account_id, instrument_id, limit):
         return self.operations
@@ -98,17 +98,17 @@ class Cash:
         self.calls.append((intent_id, state))
 
 
-def sell_operation(*, operation_id: str = "operation") -> dict[str, object]:
-    return {
-        "operation_id": operation_id,
-        "operation_type": "OPERATION_TYPE_SELL",
-        "state": "OPERATION_STATE_EXECUTED",
-        "occurred_at": (CREATED_AT + timedelta(milliseconds=151)).isoformat(),
-        "quantity_done": "1",
-        "price": "253.08",
-        "commission": "-0.12654",
-        "currency": "RUB",
-    }
+def sell_operation(*, operation_id: str = "operation") -> BrokerRecoveryOperation:
+    return BrokerRecoveryOperation(
+        operation_id,
+        OrderSide.SELL,
+        True,
+        CREATED_AT + timedelta(milliseconds=151),
+        Decimal(1),
+        Decimal("253.08"),
+        Decimal("-0.12654"),
+        "RUB",
+    )
 
 
 def filled_order_state() -> BrokerOrderState:
@@ -266,7 +266,7 @@ def test_retryable_broker_failure_allows_later_reconciliation_attempt() -> None:
         async def inspect_recent_operations(self, account_id, instrument_id, limit):
             self.calls += 1
             if self.calls == 1:
-                raise TInvestAdapterError("BROKER_RATE_LIMITED", "Rate limited.", retryable=True)
+                raise BrokerOperationError("BROKER_RATE_LIMITED", "Rate limited.", retryable=True)
             return self.operations
 
     async def scenario():
@@ -277,7 +277,7 @@ def test_retryable_broker_failure_allows_later_reconciliation_attempt() -> None:
             broker,
             now=lambda: NOW,
         )
-        with pytest.raises(TInvestAdapterError):
+        with pytest.raises(BrokerOperationError):
             await service.reconcile((command(),))
         result = await service.reconcile((command(),))
         return broker.calls, repository, result
@@ -293,7 +293,9 @@ def test_operation_reconciliation_normalizes_broker_timestamp_to_milliseconds() 
     async def scenario():
         repository = Repository(ledger_lots=5)
         operation = sell_operation()
-        operation["occurred_at"] = (CREATED_AT + timedelta(milliseconds=151, microseconds=456)).isoformat()
+        operation = operation.model_copy(
+            update={"occurred_at": CREATED_AT + timedelta(milliseconds=151, microseconds=456)}
+        )
         service = UncertainIntentReconciliationService(
             repository,
             Broker((operation,)),
@@ -381,12 +383,12 @@ def test_recovery_process_survives_retry_and_service_restart(durable_audit):
 
     class UnavailableBroker(Broker):
         async def inspect_recent_operations(self, account_id, instrument_id, limit):
-            raise TInvestAdapterError("BROKER_RATE_LIMITED", "Rate limited.", retryable=True)
+            raise BrokerOperationError("BROKER_RATE_LIMITED", "Rate limited.", retryable=True)
 
     async def scenario():
         service = UncertainIntentReconciliationService(repository, UnavailableBroker(()), now=lambda: NOW, audit=audit)
         for _ in range(2):
-            with pytest.raises(TInvestAdapterError):
+            with pytest.raises(BrokerOperationError):
                 await service.reconcile((command(),))
         restarted = UncertainIntentReconciliationService(
             repository, Broker((sell_operation(),)), now=lambda: NOW, audit=audit
@@ -536,3 +538,17 @@ def test_delayed_fill_is_reconciled_after_cooldown_without_restart() -> None:
     assert len(repository.finalizations) == 1
     assert repository.finalizations[0][0].executed_lots == 1
     assert repository.finalizations[0][1] is False
+
+
+@pytest.mark.parametrize("quantity_units", [10, 9, 1])
+def test_recovery_matches_instrument_units_instead_of_lots(quantity_units):
+    async def scenario():
+        repository = Repository(ledger_lots=6)
+        operation = sell_operation().model_copy(update={"quantity_units": Decimal(quantity_units)})
+        service = UncertainIntentReconciliationService(repository, Broker((operation,)), now=lambda: NOW)
+        result = await service.reconcile((command().model_copy(update={"lot_size": 10}),))
+        assert result.resolved == (1 if quantity_units == 10 else 0)
+        assert len(repository.finalizations) == result.resolved
+        assert result.unresolved == (0 if quantity_units == 10 else 1)
+
+    asyncio.run(scenario())

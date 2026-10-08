@@ -6,8 +6,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import BrokerOrderState
+from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation
 from sentinel_contracts.business_audit import BusinessAuditStage
 from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.domain.ports import IntentUpdatePort, OrderStageAuditPort
@@ -18,11 +18,11 @@ class DispatchBrokerPort(Protocol):
 
     async def find_by_idempotency_key(self, account_id: str, idempotency_key: str) -> BrokerOrderState | None: ...
 
-    async def inspect_position(self, account_id: str, instrument_id: str) -> dict[str, object] | None: ...
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None: ...
 
     async def inspect_recent_operations(
         self, account_id: str, instrument_id: str, limit: int
-    ) -> tuple[dict[str, object], ...]: ...
+    ) -> tuple[BrokerRecoveryOperation, ...]: ...
 
 
 class DispatchRepositoryPort(IntentUpdatePort, Protocol):
@@ -117,9 +117,9 @@ class OrderDispatchService:
         except Exception as error:
             # Submission may have reached the broker even when local persistence fails.
             # Reconcile every ambiguous result; only declared port errors carry safe text.
-            broker_error_code = error.code if isinstance(error, TInvestAdapterError) else None
+            broker_error_code = error.code if isinstance(error, BrokerOperationError) else None
             broker_error_details = (
-                str(error) if isinstance(error, TInvestAdapterError) else "Unexpected dispatch failure"
+                str(error) if isinstance(error, BrokerOperationError) else "Unexpected dispatch failure"
             )
             reconciled, position, operations = await asyncio.gather(
                 self._broker.find_by_idempotency_key(request.account_id, request.idempotency_key),
@@ -152,8 +152,16 @@ class OrderDispatchService:
                         exception_type=type(error).__name__,
                         broker_error_code=broker_error_code,
                         broker_error_details=broker_error_details,
-                        position_snapshot=None if isinstance(position, Exception) else position,
-                        recent_operations=[] if isinstance(operations, BaseException) else list(operations),
+                        position_snapshot=(
+                            None
+                            if isinstance(position, BaseException) or position is None
+                            else position.model_dump(mode="json")
+                        ),
+                        recent_operations=(
+                            []
+                            if isinstance(operations, BaseException)
+                            else [operation.model_dump(mode="json") for operation in operations]
+                        ),
                     )
                 return reconciled
             self._repository.update_intent(
@@ -178,8 +186,16 @@ class OrderDispatchService:
                     broker_error_code=broker_error_code,
                     broker_error_details=broker_error_details,
                     reconciliation_error=(type(reconciled).__name__ if isinstance(reconciled, Exception) else None),
-                    position_snapshot=None if isinstance(position, Exception) else position,
-                    recent_operations=[] if isinstance(operations, BaseException) else list(operations),
+                    position_snapshot=(
+                        None
+                        if isinstance(position, BaseException) or position is None
+                        else position.model_dump(mode="json")
+                    ),
+                    recent_operations=(
+                        []
+                        if isinstance(operations, BaseException)
+                        else [operation.model_dump(mode="json") for operation in operations]
+                    ),
                 )
             raise
 

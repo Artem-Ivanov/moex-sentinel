@@ -1,10 +1,9 @@
 """Unit tests for runtime decision planner service."""
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
-from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle
 from sentinel_contracts.broker_execution import (
     BrokerPosition,
     LimitOrderEstimate,
@@ -15,7 +14,6 @@ from sentinel_contracts.broker_execution import (
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
-from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import MarketIndicators
 from trading_automaton.domain.storage_dtos import IntentHistory, TradeLotRecord, TradingCycleState
 from trading_automaton.services.runtime_decision_planner import (
@@ -167,44 +165,8 @@ class _SpyEstimator:
         )
 
 
-class _SpyCandleData:
-    def __init__(self, candles: tuple[HistoricCandle, ...]) -> None:
-        self.candles = candles
-        self.calls = 0
-
-    async def get_candles(
-        self,
-        instrument_id: str,
-        start: datetime,
-        end: datetime,
-        interval: CandleInterval,
-    ) -> tuple[HistoricCandle, ...]:  # noqa: ARG001
-        self.calls += 1
-        assert instrument_id == "instrument-1"
-        assert interval == CandleInterval.MIN_1
-        assert start < end
-        return self.candles
-
-
-def _build_complete_candles() -> tuple[HistoricCandle, ...]:
-    return tuple(
-        HistoricCandle(
-            instrument_id="instrument-1",
-            open=Decimal("100") + Decimal(i) / Decimal("10"),
-            high=Decimal("100") + Decimal(i) / Decimal("10"),
-            low=Decimal("100") + Decimal(i) / Decimal("10"),
-            close=Decimal("100") + Decimal(i) / Decimal("10"),
-            volume=100,
-            started_at=NOW - timedelta(minutes=16 - i),
-            is_complete=True,
-        )
-        for i in range(16)
-    )
-
-
 def test_wait_when_market_closed_does_not_call_estimate() -> None:
     planner = TradingDecisionPlanner(
-        now=lambda: NOW,
         decisions=_WaitDecision(),
     )
     estimator: DecisionEstimatePort = _SpyEstimator()
@@ -231,7 +193,7 @@ def test_wait_when_market_closed_does_not_call_estimate() -> None:
 
 def test_wait_plan_skips_estimate() -> None:
     decisions = _WaitDecision()
-    planner = TradingDecisionPlanner(now=lambda: NOW, decisions=decisions)
+    planner = TradingDecisionPlanner(decisions=decisions)
     estimator: DecisionEstimatePort = _SpyEstimator()
 
     result = _run_async(
@@ -270,7 +232,7 @@ def test_actionable_decision_is_recomputed_with_estimated_commission() -> None:
             ),
         )
     )
-    planner = TradingDecisionPlanner(now=lambda: NOW, decisions=decisions)
+    planner = TradingDecisionPlanner(decisions=decisions)
     estimator: DecisionEstimatePort = _SpyEstimator()
 
     result = _run_async(
@@ -296,33 +258,3 @@ def test_actionable_decision_is_recomputed_with_estimated_commission() -> None:
     estimated_order_amount = Decimal("1000")
     assert result.context_after_estimate.commission_schedule.buy_rate == Decimal("2.5") / estimated_order_amount
     assert result.context_after_estimate.commission_schedule.sell_rate == Decimal()
-
-
-def test_load_market_indicators_without_candle_data_returns_fallback() -> None:
-    settings = StrategySettings(
-        STRATEGY_AVERAGING_STEP_PERCENT="0.75",
-        STRATEGY_PARTIAL_TAKE_PROFIT_PERCENT="0.8",
-    )
-    planner = TradingDecisionPlanner(now=lambda: NOW, settings=settings)
-
-    result = _run_async(planner.load_market_indicators(command=_command(), candles=None))
-
-    assert result.source == "FALLBACK"
-    assert result.averaging_step_percent == Decimal("0.75")
-    assert result.minimum_net_profit_percent == Decimal("0.8")
-
-
-def test_load_market_indicators_cached_for_same_broker_instrument() -> None:
-    candles = _build_complete_candles()
-    spy = _SpyCandleData(candles)
-
-    planner = TradingDecisionPlanner(now=lambda: NOW)
-    command = _command()
-
-    first = _run_async(planner.load_market_indicators(command, spy))
-    second = _run_async(planner.load_market_indicators(command, spy))
-
-    assert spy.calls == 1
-    assert first.source == "ADAPTIVE"
-    assert second.source == "ADAPTIVE"
-    assert first.averaging_step_percent == second.averaging_step_percent

@@ -3,7 +3,6 @@
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
 from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from moex_sentinel.domain.errors import FieldError
 from moex_sentinel.domain.market_data import (
@@ -13,6 +12,7 @@ from moex_sentinel.domain.market_data import (
 )
 from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.broker_errors import BrokerOperationError
 
 
 class MarketDataServicePort(Protocol):
@@ -53,7 +53,7 @@ class SearchMarketInstrumentsUsecase:
             )
         try:
             return await self._service.search(broker_id, normalized, limit)
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
@@ -73,7 +73,7 @@ class ViewMarketInstrumentUsecase:
         """Return a snapshot by external instrument ID; translate known broker failures."""
         try:
             return await self._service.instrument(broker_id, instrument_id)
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
@@ -106,7 +106,7 @@ class ViewHistoricCandlesUsecase:
             )
         try:
             return await self._service.candles(broker_id, instrument_id, start, end, interval)
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             raise UseCaseError(error.code, str(error)) from error
         except BrokerRecordNotFoundError as error:
             raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error

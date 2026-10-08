@@ -32,7 +32,7 @@ class CachedCommissionPort(Protocol):
 
 
 class PositionDecisionPort(Protocol):
-    def decide(self, context: object) -> TradeDecision: ...
+    def decide(self, context: DecisionContext) -> TradeDecision: ...
 
 
 class DecisionCashPort(Protocol):

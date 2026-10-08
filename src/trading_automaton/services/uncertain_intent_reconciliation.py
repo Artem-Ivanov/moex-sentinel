@@ -7,8 +7,8 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
-from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import BrokerOrderState
+from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
 from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.time import floor_utc_millisecond
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -45,11 +45,11 @@ class ReconciliationBrokerPort(Protocol):
 
     async def find_by_idempotency_key(self, account_id: str, idempotency_key: str) -> BrokerOrderState | None: ...
 
-    async def inspect_position(self, account_id: str, instrument_id: str) -> dict[str, object] | None: ...
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None: ...
 
     async def inspect_recent_operations(
         self, account_id: str, instrument_id: str, limit: int
-    ) -> tuple[dict[str, object], ...]: ...
+    ) -> tuple[BrokerRecoveryOperation, ...]: ...
 
 
 class ReconciliationCashPort(Protocol):
@@ -113,7 +113,7 @@ class UncertainIntentReconciliationService:
                 self._broker.inspect_position(command.account_id, command.external_instrument_id),
                 self._broker.inspect_recent_operations(command.account_id, command.external_instrument_id, 100),
             )
-        except TInvestAdapterError as error:
+        except BrokerOperationError as error:
             if error.retryable:
                 self._attempted.discard(intent.idempotency_key)
             raise
@@ -183,7 +183,7 @@ class UncertainIntentReconciliationService:
         self,
         intent: LocalIntentRecord,
         command: AutomationCommand,
-        position: dict[str, object] | None,
+        position: BrokerPosition | None,
         state: BrokerOrderState,
         process_id: str,
     ) -> bool:
@@ -191,7 +191,7 @@ class UncertainIntentReconciliationService:
         if state.status == "FILLED":
             if state.executed_lots <= 0 or state.executed_price <= 0:
                 return False
-            broker_lots = 0 if position is None else int(Decimal(str(position.get("quantity_lots", "0"))))
+            broker_lots = 0 if position is None else int(position.quantity_lots)
             open_lots = await asyncio.to_thread(self._repository.list_open_lots, str(command.automation_id))
             ledger_lots = sum(item.remaining_lots for item in open_lots)
             if ledger_lots == broker_lots:
@@ -236,18 +236,18 @@ class UncertainIntentReconciliationService:
         self,
         intent: LocalIntentRecord,
         command: AutomationCommand,
-        operations: tuple[dict[str, object], ...],
+        operations: tuple[BrokerRecoveryOperation, ...],
     ) -> BrokerOrderState | None:
-        expected_type = f"OPERATION_TYPE_{intent.side}"
+        expected_side = OrderSide(intent.side)
         expected_units = intent.quantity_lots * command.lot_size
         matches = []
         for operation in operations:
-            occurred_at = _datetime(operation.get("occurred_at"))
-            price = _decimal(operation.get("price"))
-            quantity = _decimal(operation.get("quantity_done"))
+            occurred_at = floor_utc_millisecond(operation.occurred_at)
+            price = operation.price
+            quantity = operation.quantity_units
             if (
-                operation.get("operation_type") == expected_type
-                and operation.get("state") == "OPERATION_STATE_EXECUTED"
+                operation.side == expected_side
+                and operation.executed
                 and occurred_at is not None
                 and intent.created_at <= occurred_at <= intent.created_at + self._WINDOW
                 and quantity == expected_units
@@ -257,10 +257,10 @@ class UncertainIntentReconciliationService:
         if len(matches) != 1:
             return None
         operation, occurred_at, price = matches[0]
-        commission = abs(_decimal(operation.get("commission")))
+        commission = abs(operation.commission)
         executed_amount = price * expected_units
         return BrokerOrderState(
-            broker_order_id=str(operation.get("operation_id") or intent.idempotency_key),
+            broker_order_id=operation.operation_id or intent.idempotency_key,
             idempotency_key=intent.idempotency_key,
             status="FILLED",
             requested_lots=intent.quantity_lots,
@@ -269,7 +269,7 @@ class UncertainIntentReconciliationService:
             executed_amount=executed_amount,
             estimated_commission=intent.estimated_commission,
             executed_commission=commission,
-            currency=str(operation.get("currency") or command.currency),
+            currency=operation.currency or command.currency,
             executed_price=price,
             executed_at=occurred_at,
         )
@@ -298,22 +298,6 @@ class UncertainIntentReconciliationService:
             critical=critical,
             **data,
         )
-
-
-def _datetime(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return floor_utc_millisecond(datetime.fromisoformat(value.replace("Z", "+00:00")))
-    except ValueError:
-        return None
-
-
-def _decimal(value: object) -> Decimal:
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal()
 
 
 def _satisfies_limit(side: str, price: Decimal, limit_price: Decimal) -> bool:

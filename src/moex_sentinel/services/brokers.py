@@ -1,5 +1,7 @@
 """Business rules for broker settings."""
 
+from typing import Protocol
+
 from moex_sentinel.domain.brokers import (
     Broker,
     BrokerAdapterNotFoundError,
@@ -20,7 +22,7 @@ from moex_sentinel.domain.user_brokers import (
     UserBrokerState,
 )
 from moex_sentinel.services.environment import EnvironmentStatePort
-from moex_sentinel.services.ports import BrokerRegistryPort
+from moex_sentinel.services.ports import BrokerRegistryPort, UserBrokerReadPort
 from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 
 SANDBOX_FQDN = "sandbox-invest-public-api.tbank.ru:443"
@@ -50,10 +52,7 @@ class InvalidBrokerConfigurationError(BrokerConfigurationError):
         self.fields = fields
 
 
-class UserBrokerRepositoryPort:
-    def list(self) -> list[UserBroker]: ...
-
-    def get(self, user_broker_id: str) -> UserBroker: ...
+class UserBrokerRepositoryPort(UserBrokerReadPort, Protocol):
 
     def create(self, draft: UserBrokerDraft) -> UserBroker: ...
 

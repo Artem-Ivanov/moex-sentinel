@@ -1,9 +1,9 @@
 """Thin use cases for the typed Worker-to-Core fact boundary."""
 
+from typing import Protocol
 from uuid import UUID
 
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
-from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from sentinel_contracts.trading_facts import (
     AutomationCommand,
     AutomationStatusesResult,
@@ -12,8 +12,16 @@ from sentinel_contracts.trading_facts import (
 )
 
 
+class ClaimAutomationCommandsPort(Protocol):
+    def claim(self, limit: int) -> list[AutomationCommand]: ...
+
+
+class AutomationStatusesPort(Protocol):
+    def statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult: ...
+
+
 class ClaimAutomationCommandsUsecase:
-    def __init__(self, repository: AutomationCommandRepository) -> None:
+    def __init__(self, repository: ClaimAutomationCommandsPort) -> None:
         self._repository = repository
 
     def execute(self, limit: int) -> list[AutomationCommand]:
@@ -21,7 +29,7 @@ class ClaimAutomationCommandsUsecase:
 
 
 class ViewAutomationStatusesUsecase:
-    def __init__(self, repository: AutomationCommandRepository) -> None:
+    def __init__(self, repository: AutomationStatusesPort) -> None:
         self._repository = repository
 
     def execute(self, automation_ids: list[UUID]) -> AutomationStatusesResult:

@@ -295,3 +295,116 @@ def test_composed_empty_control_iteration_delivers_actual_worker_diagnostics_to_
                 assert repository.outbox_diagnostics().pending_count == 0
             finally:
                 http.close()
+
+
+@pytest.mark.parametrize("failure", ["read", "restore", "cancel"])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_builder_rolls_back_started_session_preserving_primary_error(monkeypatch, failure, close_fails):
+    primary = asyncio.CancelledError() if failure == "cancel" else RuntimeError("reservation failure")
+
+    class FailingSession(Session):
+        async def close(self):
+            await super().close()
+            if close_fails:
+                raise RuntimeError("close failure")
+
+    repo = repository()
+    if failure == "read":
+
+        def fail_read(*args):
+            raise primary
+
+        monkeypatch.setattr(repo, "list_active_buy_intent_reservations", fail_read)
+    else:
+
+        async def fail_restore(self, values):
+            raise primary
+
+        monkeypatch.setattr(composition.AccountCashReservationService, "restore", fail_restore)
+
+    async def scenario():
+        session = FailingSession()
+        with pytest.raises(type(primary)) as caught:
+            await build_broker_runtime(
+                BrokerConnection(
+                    "broker", "TINVEST_SANDBOX", "sandbox-invest-public-api.tbank.ru:443", "synthetic-token", True
+                ),
+                repo,
+                strategy_settings=StrategySettings(),
+                session_factory=lambda connection: session,
+                now=lambda: NOW,
+            )
+        assert caught.value is primary
+        assert session.started == session.closed == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_builder_closes_only_internally_owned_analytics_on_late_failure(monkeypatch, injected):
+    primary = RuntimeError("late construction failure")
+    clients = []
+
+    class Analytics:
+        def __init__(self, http=None):
+            self.http = http
+            self.closed = 0
+            clients.append(self)
+
+        async def close(self):
+            self.closed += 1
+            if self.http is not None:
+                await self.http.aclose()
+
+    def fail_runtime(*args, **kwargs):
+        raise primary
+
+    monkeypatch.setattr(composition, "AnalyticsClient", Analytics)
+    monkeypatch.setattr(composition, "AnalyticsBrokerRuntime", fail_runtime)
+
+    async def scenario():
+        session = Session()
+        client = Analytics() if injected else None
+        with pytest.raises(RuntimeError) as caught:
+            await build_broker_runtime(
+                BrokerConnection(
+                    "broker", "TINVEST_SANDBOX", "sandbox-invest-public-api.tbank.ru:443", "synthetic-token", True
+                ),
+                repository(),
+                strategy_settings=StrategySettings(),
+                session_factory=lambda connection: session,
+                now=lambda: NOW,
+                analytics_client=client,
+            )
+        assert caught.value is primary
+        assert session.started == session.closed == 1
+        assert clients[0].closed == (0 if injected else 1)
+
+    asyncio.run(scenario())
+
+
+def test_builder_does_not_close_session_that_failed_to_start():
+    primary = RuntimeError("session start failed")
+
+    class FailingSession(Session):
+        async def start(self):
+            await super().start()
+            raise primary
+
+    async def scenario():
+        session = FailingSession()
+        with pytest.raises(RuntimeError) as caught:
+            await build_broker_runtime(
+                BrokerConnection(
+                    "broker", "TINVEST_SANDBOX", "sandbox-invest-public-api.tbank.ru:443", "synthetic-token", True
+                ),
+                repository(),
+                strategy_settings=StrategySettings(),
+                session_factory=lambda connection: session,
+                now=lambda: NOW,
+            )
+        assert caught.value is primary
+        assert session.started == 1
+        assert session.closed == 0
+
+    asyncio.run(scenario())

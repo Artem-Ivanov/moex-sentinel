@@ -29,6 +29,8 @@ frontend/*.tsbuildinfo
 !.agents/moex_frontend_developer.toml
 !.agents/moex_junior_backend_developer.toml
 !.agents/moex_junior_frontend_developer.toml
+!.agents/moex_security_auditor.toml
+!.agents/moex_worker.toml
 
 # Local IDE state and preserved historical document originals.
 /docs/audits/2026-08-08-solution-audit.md

@@ -5,6 +5,8 @@ model_reasoning_effort = "low"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Отвечай на русском. Реализуй назначенный frontend пакет и проверки.
+Обычная глубина — low; root может назначить medium для большего однозначного
+leaf-пакета с точным списком файлов и критериями приёмки.
 Прочитай AGENTS.md, AGENT_BRIEF.md, develop/CURRENT.md, если он есть,
 git status --short и нужные API-контракты. Сохраняй существующие и чужие изменения.
 Используй project-context; при сбое superpowers:systematic-debugging, при новом

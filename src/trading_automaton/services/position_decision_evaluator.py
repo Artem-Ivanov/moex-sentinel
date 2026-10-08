@@ -45,7 +45,7 @@ class PositionDecisionEvaluator:
         planner: TradingDecisionPlanner | None = None,
         cycles: TradingCycleService | None = None,
     ) -> None:
-        self._planner = planner or TradingDecisionPlanner(now=now)
+        self._planner = planner or TradingDecisionPlanner()
         self._now = now
         self._cycles = cycles or TradingCycleService()
 

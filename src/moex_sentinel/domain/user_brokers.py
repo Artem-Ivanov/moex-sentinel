@@ -5,6 +5,7 @@ from enum import StrEnum
 
 from pydantic import ConfigDict, model_validator
 
+from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
 from sentinel_contracts.base import PositionalModel
 
 
@@ -20,7 +21,7 @@ class BrokerApiRegistryDuplicateError(ValueError):
     """More than one broker API module declares the same stable slug."""
 
 
-class UserBrokerNotFoundError(LookupError):
+class UserBrokerNotFoundError(BrokerRecordNotFoundError):
     """A configured user-broker scope does not exist."""
 
 

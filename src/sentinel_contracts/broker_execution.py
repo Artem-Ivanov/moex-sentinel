@@ -15,6 +15,20 @@ class OrderSide(str, Enum):
     SELL = "SELL"
 
 
+class BrokerRecoveryOperation(PositionalModel):
+    """Neutral recovery observation; quantity is instrument units (shares), not lots."""
+
+    model_config = ConfigDict(frozen=True)
+    operation_id: str
+    side: OrderSide | None
+    executed: bool
+    occurred_at: datetime
+    quantity_units: Decimal
+    price: Decimal
+    commission: Decimal
+    currency: str
+
+
 class OrderBookLevel(PositionalModel):
     model_config = ConfigDict(frozen=True)
     price: Decimal

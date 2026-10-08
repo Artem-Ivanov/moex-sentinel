@@ -1,7 +1,7 @@
 """Hydrate durable position state before creating the SLA market snapshot."""
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
@@ -11,10 +11,8 @@ from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.trading_facts import AutomationCommand
-from trading_automaton.config import StrategySettings
-from trading_automaton.domain.dtos import AdaptiveThresholds, HydratedPositionState, PositionConsistencyResult
+from trading_automaton.domain.dtos import HydratedPositionState, PositionConsistencyResult
 from trading_automaton.domain.storage_dtos import IntentHistory, TradeLotRecord, TradingCycleState
-from trading_automaton.services.market_indicators import MarketIndicatorsService
 
 
 class HydrationRepositoryPort(Protocol):
@@ -35,10 +33,6 @@ class HydrationRepositoryPort(Protocol):
 
 class PortfolioCachePort(Protocol):
     async def position(self, account_id: str, instrument_id: str) -> BrokerPosition | None: ...
-
-
-class CandleCachePort(Protocol):
-    async def completed(self, instrument_id: str) -> Sequence[object]: ...
 
 
 class PreparedMetricsPort(Protocol):
@@ -92,25 +86,19 @@ class PositionStateHydrationService:
         self,
         repository: HydrationRepositoryPort,
         portfolio: PortfolioCachePort,
-        candles: CandleCachePort | None,
         cache: PositionStateCacheService,
         *,
         consistency: PositionConsistencyPort | None = None,
         audit: PositionAuditPort | None = None,
-        settings: StrategySettings | None = None,
         id_factory: Callable[[], str] = lambda: str(uuid4()),
         now: Callable[[], datetime],
-        indicators: MarketIndicatorsService | None = None,
-        prepared_metrics: PreparedMetricsPort | None = None,
+        prepared_metrics: PreparedMetricsPort,
     ) -> None:
         self._repository = repository
         self._portfolio = portfolio
-        self._candles = candles
         self._cache = cache
         self._now = now
-        self._indicators = indicators or MarketIndicatorsService()
         self._prepared_metrics = prepared_metrics
-        self._settings = settings or StrategySettings()
         self._consistency = consistency
         self._audit = audit
         self._id_factory = id_factory
@@ -218,18 +206,9 @@ class PositionStateHydrationService:
                 )
                 if cycle_id is not None:
                     self._successful_reconciliations[automation_id] = fingerprint
-        fallback = AdaptiveThresholds(
-            self._settings.averaging_step_percent,
-            self._settings.partial_take_profit_percent,
-            "STRATEGY",
-        )
-        if self._prepared_metrics is not None:
-            indicators = await self._prepared_metrics.get(command.external_instrument_id)
-            if indicators is None:
-                return None
-        else:
-            candles = () if self._candles is None else await self._candles.completed(command.external_instrument_id)
-            indicators = self._indicators.calculate(candles, fallback)  # type: ignore[arg-type]
+        indicators = await self._prepared_metrics.get(command.external_instrument_id)
+        if indicators is None:
+            return None
         return HydratedPositionState(
             position=position,
             history=history,

@@ -2,7 +2,6 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-import httpx
 import pytest
 
 from sentinel_contracts.analytics import (
@@ -18,6 +17,7 @@ from sentinel_contracts.trading import DecisionKind
 from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.command_factory import command
 from trading_automaton.domain.dtos import PositionEvaluationResult, PositionWorkItem, TradeDecision
+from trading_automaton.domain.errors import AnalyticsUnavailableError
 from trading_automaton.services.analytics_frame import AnalyticsMetricsCache
 from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
 
@@ -81,7 +81,7 @@ class Tick:
     def __init__(self):
         self.calls = []
 
-    async def run_tick(self, commands, snapshot):
+    async def run_tick(self, commands, snapshot, *, is_current=None):
         self.calls.append((commands, snapshot))
 
 
@@ -137,7 +137,7 @@ def test_wall_clock_ttl_boundary(age_ms, expected):
     [
         frame(book_at=NOW - timedelta(seconds=3)),
         frame(fresh="UNAVAILABLE"),
-        httpx.ReadTimeout("synthetic timeout"),
+        AnalyticsUnavailableError("Analytics unavailable"),
         ValueError("synthetic invalid response"),
     ],
 )

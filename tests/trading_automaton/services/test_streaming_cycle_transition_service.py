@@ -3,11 +3,11 @@ from decimal import Decimal
 
 import pytest
 
+from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
-from trading_automaton.services.market_indicators import MarketIndicators
 from trading_automaton.services.order_book_validation import OrderBookValidationService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import HydratedPositionState

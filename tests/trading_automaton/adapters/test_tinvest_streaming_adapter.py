@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 from t_tech.invest.grpc.schemas import Order, OrderBook, Quotation
 
+from moex_sentinel.adapters.tinvest.streaming import TInvestStreamingAdapter
 from sentinel_contracts.streaming_market import StreamOrderBook
-from trading_automaton.adapters.tinvest_streaming import TInvestStreamingAdapter
 
 NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
 
