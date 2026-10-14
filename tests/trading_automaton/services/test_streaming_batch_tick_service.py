@@ -181,7 +181,7 @@ def intent_record(automation_id: str, idempotency_key: str) -> LocalIntentRecord
         automation_id=automation_id,
         kind="BUY",
         side="BUY",
-        state="PENDING",
+        state="CREATED",
         quantity_lots=1,
         limit_price=Decimal("100"),
         broker_order_id=None,

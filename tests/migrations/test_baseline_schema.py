@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, inspect
 from alembic import command
 from alembic.config import Config
 from moex_sentinel.storage.models import Base
-from moex_sentinel.storage.schema_revision import current_schema_revision
+from moex_sentinel.storage.schema_revision import current_schema_revision, expected_schema_revision
 
 
 def _upgrade(database_url: str) -> None:
@@ -22,7 +22,7 @@ def test_empty_database_upgrades_to_head_and_is_idempotent(tmp_path: Path) -> No
 
     engine = create_engine(database_url)
     try:
-        assert current_schema_revision(engine) == "0003_user_broker_archive"
+        assert current_schema_revision(engine) == expected_schema_revision()
         assert set(inspect(engine).get_table_names()) == {*Base.metadata.tables, "alembic_version"}
     finally:
         engine.dispose()

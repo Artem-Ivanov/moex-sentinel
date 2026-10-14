@@ -38,7 +38,9 @@ def test_blocked_database_request_does_not_block_stateless_http_and_keeps_sessio
             observed.append(("close", threading.get_ident(), current_process_id()))
             return ()
 
-        return SimpleNamespace(claim_automation_commands=SimpleNamespace(execute=claim))
+        return SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(), claim_automation_commands=SimpleNamespace(execute=claim)
+        )
 
     monkeypatch.setattr(app_module, "build_application_usecases", build)
     monkeypatch.setattr(app_module, "build_market_snapshot_gateway", lambda *_args, **_kwargs: QuietGateway())
@@ -100,7 +102,11 @@ def test_lifespan_repeated_raw_cancellation_drains_actual_jobs_before_engine_dis
         return engine
 
     monkeypatch.setattr(app_module, "create_database_engine", engine_factory)
-    monkeypatch.setattr(app_module, "build_application_usecases", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        app_module,
+        "build_application_usecases",
+        lambda *_args, **_kwargs: SimpleNamespace(daily_admission_preparation=SimpleNamespace()),
+    )
     monkeypatch.setattr(app_module, "build_market_snapshot_gateway", lambda *_args, **_kwargs: QuietGateway())
     application = app_module.create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'cancel.db'}")
 
@@ -171,7 +177,7 @@ def test_startup_failure_closes_created_pool_gateway_and_engine(tmp_path, monkey
     def build(*_args, **_kwargs):
         if stage == "build":
             raise ValueError("synthetic startup failure")
-        return SimpleNamespace()
+        return SimpleNamespace(daily_admission_preparation=SimpleNamespace())
 
     class Gateway:
         async def close(self):
@@ -245,6 +251,7 @@ def test_named_sync_http_routes_and_async_create_details_use_request_worker_cont
             raise RecordNotFoundError("Synthetic missing scope")
 
     values = {name: usecase(name) for name in names}
+    values["daily_admission_preparation"] = SimpleNamespace()
     values["create_trading_automation"] = CreateTradingAutomationUsecase(Automations())
     values["view_trading_automation_details"] = ViewTradingAutomationDetailsUsecase(Automations(), None, None)
     monkeypatch.setattr(app_module, "build_application_usecases", lambda *_args, **_kwargs: SimpleNamespace(**values))
@@ -321,7 +328,9 @@ def test_overlapping_http_jobs_keep_distinct_business_process_contexts(tmp_path,
                 observed[limit] = (current_process_id(), threading.get_ident())
             return ()
 
-        return SimpleNamespace(claim_automation_commands=SimpleNamespace(execute=claim))
+        return SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(), claim_automation_commands=SimpleNamespace(execute=claim)
+        )
 
     monkeypatch.setattr(app_module, "build_application_usecases", build)
     monkeypatch.setattr(app_module, "build_market_snapshot_gateway", lambda *_args, **_kwargs: QuietGateway())

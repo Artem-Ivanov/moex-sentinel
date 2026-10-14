@@ -41,12 +41,19 @@ class TradingAutomationModel(UuidPrimaryKeyMixin, TimestampMixin, Base):
             "AND bootstrap_invested_amount IS NULL AND bootstrap_currency IS NULL "
             "AND bootstrap_observed_at IS NULL) OR "
             "(bootstrap_position_cycle_id IS NOT NULL AND bootstrap_position_lot_id IS NOT NULL "
-            "AND bootstrap_quantity_lots > 0 AND bootstrap_average_price > 0 "
-            "AND bootstrap_invested_amount > 0 AND bootstrap_currency IS NOT NULL "
+            "AND bootstrap_quantity_lots IS NOT NULL AND bootstrap_quantity_lots > 0 "
+            "AND bootstrap_average_price IS NOT NULL AND bootstrap_average_price > 0 "
+            "AND bootstrap_invested_amount IS NOT NULL AND bootstrap_invested_amount > 0 "
+            "AND bootstrap_currency IS NOT NULL "
             "AND bootstrap_observed_at IS NOT NULL)",
             name="ck_trading_automations_complete_bootstrap_snapshot",
         ),
         CheckConstraint("revision > 0", name="ck_trading_automations_positive_revision"),
+        CheckConstraint(
+            "order_quota_percent IS NULL OR (order_quota_percent > 0 AND order_quota_percent <= 100)",
+            name="ck_trading_automations_order_quota_percent",
+        ),
+        CheckConstraint("settings_revision >= 0", name="ck_trading_automations_non_negative_settings_revision"),
         CheckConstraint("last_sequence_number >= 0", name="ck_trading_automations_non_negative_sequence"),
         CheckConstraint(
             "(closed_at IS NULL AND state != 'CLOSED') OR (closed_at IS NOT NULL AND state = 'CLOSED')",
@@ -68,6 +75,8 @@ class TradingAutomationModel(UuidPrimaryKeyMixin, TimestampMixin, Base):
     suspended_from_state: Mapped[str | None] = mapped_column(String(16))
     hold_reason: Mapped[str | None] = mapped_column(String(1000))
     revision: Mapped[int] = mapped_column(default=1, nullable=False)
+    order_quota_percent: Mapped[Decimal | None] = mapped_column(Numeric(28, 9))
+    settings_revision: Mapped[int] = mapped_column(default=0, server_default=text("0"), nullable=False)
     last_sequence_number: Mapped[int] = mapped_column(default=0, nullable=False)
     resume_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())

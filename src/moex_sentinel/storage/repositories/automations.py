@@ -33,6 +33,8 @@ def _record(
             AutomationState(automation.suspended_from_state) if automation.suspended_from_state else None
         ),
         revision=automation.revision,
+        order_quota_percent=automation.order_quota_percent,
+        settings_revision=automation.settings_revision,
         last_sequence_number=automation.last_sequence_number,
         resume_requested=automation.resume_requested,
         currency=instrument.currency,
@@ -182,6 +184,40 @@ class AutomationRepository:
                 .returning(TradingAutomationModel.id)
             )
             if result.scalar_one_or_none() is None:
+                raise RevisionConflictError("Automation revision has changed.")
+            session.refresh(model)
+            return self._record_for_model(session, model)
+
+    def update_settings(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord:
+        with self._factory.begin() as session:
+            model = self._get_model(session, automation_id)
+            now = utc_now_ms()
+            result = session.execute(
+                update(TradingAutomationModel)
+                .where(
+                    TradingAutomationModel.id == automation_id,
+                    TradingAutomationModel.revision == expected_revision,
+                    TradingAutomationModel.settings_revision == expected_settings_revision,
+                    TradingAutomationModel.closed_at.is_(None),
+                    TradingAutomationModel.state != AutomationState.CLOSED.value,
+                )
+                .values(
+                    order_quota_percent=order_quota_percent,
+                    settings_revision=expected_settings_revision + 1,
+                    updated_at=now,
+                )
+                .returning(TradingAutomationModel.id)
+            )
+            if result.scalar_one_or_none() is None:
+                if model.closed_at is not None:
+                    raise RevisionConflictError("Closed automation settings cannot be changed.")
                 raise RevisionConflictError("Automation revision has changed.")
             session.refresh(model)
             return self._record_for_model(session, model)

@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from typing import Protocol
 
@@ -29,6 +30,14 @@ class AutomationServicePort(Protocol):
     def hold(self, automation_id: str, reason: str) -> AutomationRecord: ...
     def resume(self, automation_id: str) -> AutomationRecord: ...
     def close(self, automation_id: str) -> AutomationRecord: ...
+    def update_settings(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord: ...
 
 
 class PositionOperationsServicePort(Protocol):
@@ -83,6 +92,35 @@ class CreateTradingAutomationUsecase:
             raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except DuplicateRecordError as error:
             raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class UpdateTradingAutomationSettingsUsecase:
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord:
+        try:
+            return self._service.update_settings(
+                automation_id,
+                expected_revision=expected_revision,
+                expected_settings_revision=expected_settings_revision,
+                order_quota_percent=order_quota_percent,
+            )
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
         except RevisionConflictError as error:
             raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
         except AutomationStateConflictError as error:

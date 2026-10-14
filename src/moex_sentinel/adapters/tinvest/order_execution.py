@@ -265,7 +265,7 @@ def _order_state(response: Any, *, order_state: bool = False) -> BrokerOrderStat
     return BrokerOrderState(
         broker_order_id=response.order_id,
         idempotency_key=response.order_request_id,
-        status=statuses.get(status_name, status_name),
+        status=statuses.get(status_name, "UNCERTAIN"),
         requested_lots=response.lots_requested,
         executed_lots=response.lots_executed,
         requested_amount=_amount(initial),

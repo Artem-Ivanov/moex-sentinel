@@ -1,0 +1,17 @@
+# Свежие доказательства и гипотезы
+
+- Исторический после-rollout STOP_REQUIRED и recovery_only — первичная гипотеза, live status пока неизвестен.
+- Общий PG/collector в TEST Compose project обслуживает PROD; нельзя оценивать stopped TEST apps как недоступность всей shared infrastructure.
+- Shared PG и private Worker SQLite — две разные БД, ERD должна разделять ownership и отличать настоящие FK от protocol IDs.
+- CI/CD manual trigger выбран ранее; сейчас CI/CD implementation не запрашивается.
+
+## Fresh ресурсы — 19:00:53–19:00:57 МСК
+6 running app/shared containers, all OOMfalse/restarts0; 4 TEST apps stopped. RAM Docker sum ~542.3MiB / limits1184MiB; CPU sum~15.82% одногоvCPU в этой выборке. Host4vCPU/1.92GiB, MemAvailable773MiB, swapused94.5MiB; root available8.32GiB/55.99GiB, used44.81GiB. SharedPG logical 8603843607bytes, physicalPGDATA 8712089600bytes inclWAL83894272bytes. Head0005; live24tables =23ORM+alembic_version, FK45. Largest automation_events5950906368bytes (~4.76m estimatedrows), trade_audit_events1874198528, trade_decisions736837632. PG+indices/catalogue logical and volume/WAL overlap, do notsum. PRODsqlite159744bytes main +82432WAL +32768SHM; volume282624bytes. RetiredTESTsqlite volume2669928448bytes. Another stoppedPROD PG volume49434624bytes; Docker reports6volumes27.9GB whereas currentlyknown4sum11.4GB, investigate remainingretainedvolumes/disk directories. Evidence resources.json.
+
+## Disk и fresh торговый status — 19:04–19:05 МСК
+Retained restore test volumes7724814336+8741507072bytes (~16.47GB), backups13607931904bytes (~13.61GB), retiredTESTsqlite2669928448bytes (~2.67GB), activePG8.71GB. No deletion. Appdockerimages1.291GB/cache0.474GB, containerlogs/category0.189GB, source/releases~0.66GB.
+APIprotectedcertpinPASS; onlyGETbusiness, transientauthsessionloggedout. Current owner5e36/gen3/rev5 STOP_REQUIRED/recovery_onlytrue, leasefresh atcapture, effective_can_submitfalse reasonsDISARMED/STOP_REQUIRED/RECONCILIATION_REQUIRED; limitsnull/reconciliationnull/baseline10.10present; outstanding0/unresolved0. AutomationGOLDIN_WORK18lots/rev2/seq18/settings0/percentNULL/bootstrapfalse. Workerheartbeat2.5s/15037completediterations/resultCOMPLETED/outbox0failed0pending, CoreOK. SessionstatusCLOSED1/open0. NoARM/reconcile. Why no trading: persistent post-transfer admission guard is sufficient blocker; currentlyclosedmarket additional observed blocker. Pending independent SQLite/log corroboration and finalreview. api.json/disk.json.
+
+## Retention design / read-only 23Core+10Worker — 10.10
+Architect quota_core проверил currentmodels/consumers. automation_events — accepted envelopes/sequence dedup, не disposablelogs; broker_intents+submitreservations persistentidempotency; factoutbox pending exactretry/ACK-only. Financialfacts/config/owner/currentrisk anchorsretain. Minimaldeletable: noncritical trade_audit_events/business_audit_events (Worker protect active/unfinalizedintents); old valuation/portfolio snapshots preserve latestper scope. Admissionsecurityevents retained pendingexplicitpolicy. Root presented boundeddesign defaultdryrun/explicitapply/calendarmonthUTC/isolatedtests, awaitinguserdesignanswer per brainstorming. No implementation/liveSQLDELETE yet.
+Copyinventory proves exactly2stoppedrestorecontainerswithonly2restorevolumes, backupfilesregular/no symlinks/no container bind refs. Exactmanifest23dataarchivefiles; metadata/configreceipts retained. Mutationreview requested cleanup_ops_review beforeexecution.

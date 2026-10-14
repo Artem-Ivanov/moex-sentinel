@@ -2,16 +2,22 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from moex_sentinel.domain.trading_facts import (
     AutomationEnvelopeDraft,
+    BrokerOrderStatus,
     TradingAutomationDraft,
     TradingFactErrorCode,
     TradingFactPersistenceError,
 )
 from moex_sentinel.services.trading_fact_mapping import TradingFactMapper
-from moex_sentinel.services.trading_fact_ports import TradingFactsUnitOfWorkPort
+from moex_sentinel.services.trading_fact_ports import (
+    FactRuntimeAuthorization,
+    FactSubmitReservation,
+    TradingFactsUnitOfWorkPort,
+)
 from sentinel_contracts.automation_lifecycle import (
     InvalidAutomationTransition,
     TransitionOrigin,
@@ -21,6 +27,7 @@ from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationStateChangedEnvelope,
+    BrokerOrderStateChangedEnvelope,
     FactBatchResult,
     FactEnvelope,
     FactGroupAcknowledgement,
@@ -44,8 +51,9 @@ PERSISTENCE_ERROR_CODES = {
 
 
 class _FactGroupRejected(RuntimeError):
-    def __init__(self, code: FactIngressErrorCode) -> None:
+    def __init__(self, code: FactIngressErrorCode, *, retryable: bool = False) -> None:
         self.code = code
+        self.retryable = retryable
         super().__init__(code.value)
 
 
@@ -63,7 +71,13 @@ class TradingFactIngressService:
         self._now = now
         self._environment = environment
 
-    def publish(self, facts: list[FactEnvelope]) -> FactBatchResult:
+    def publish(
+        self,
+        facts: list[FactEnvelope],
+        *,
+        runtime_instance_id: UUID | None = None,
+        generation: int | None = None,
+    ) -> FactBatchResult:
         groups: dict[UUID, list[FactEnvelope]] = {}
         for fact in facts:
             groups.setdefault(fact.automation_id, []).append(fact)
@@ -72,9 +86,14 @@ class TradingFactIngressService:
         for automation_id, group in groups.items():
             ordered = sorted(group, key=lambda item: (item.sequence_number, str(item.event_id)))
             try:
-                acknowledgement = self._publish_group(automation_id, ordered)
+                acknowledgement = self._publish_group(
+                    automation_id,
+                    ordered,
+                    runtime_instance_id=runtime_instance_id,
+                    generation=generation,
+                )
             except _FactGroupRejected as error:
-                failures.append(self._failure(automation_id, ordered, error.code, retryable=False))
+                failures.append(self._failure(automation_id, ordered, error.code, retryable=error.retryable))
             except TradingFactPersistenceError as error:
                 code = PERSISTENCE_ERROR_CODES.get(error.code, FactIngressErrorCode.FACT_LINEAGE_CONFLICT)
                 failures.append(self._failure(automation_id, ordered, code, retryable=False))
@@ -95,6 +114,9 @@ class TradingFactIngressService:
         self,
         automation_id: UUID,
         facts: list[FactEnvelope],
+        *,
+        runtime_instance_id: UUID | None,
+        generation: int | None,
     ) -> FactGroupAcknowledgement:
         if len({fact.user_broker_id for fact in facts}) != 1:
             raise _FactGroupRejected(FactIngressErrorCode.CROSS_SCOPE_RELATION)
@@ -103,6 +125,18 @@ class TradingFactIngressService:
         with self._uow_factory() as uow:
             if self._environment is not None and not uow.scope_matches_environment(scope_id, self._environment):
                 raise _FactGroupRejected(FactIngressErrorCode.CROSS_SCOPE_RELATION)
+            runtime_authorization = None
+            if self._environment == "PROD":
+                if runtime_instance_id is None or generation is None:
+                    raise _FactGroupRejected(FactIngressErrorCode.TEMPORARY_CORE_FAILURE, retryable=True)
+                runtime_authorization = uow.authorize_fact_runtime(
+                    scope_id,
+                    str(runtime_instance_id),
+                    generation,
+                    environment=self._environment,
+                )
+                if runtime_authorization is None:
+                    raise _FactGroupRejected(FactIngressErrorCode.TEMPORARY_CORE_FAILURE, retryable=True)
             try:
                 current = uow.automations.get(scope_id, str(automation_id))
             except TradingFactPersistenceError as error:
@@ -150,7 +184,23 @@ class TradingFactIngressService:
                     if not changed:
                         raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
                     self._validate_state_metadata(current, fact)
+                reservation_key = self._validate_pre_rpc_abort(
+                    uow,
+                    fact,
+                    scope_id=scope_id,
+                    automation_id=automation_id,
+                    runtime_instance_id=runtime_instance_id,
+                    generation=generation,
+                    runtime_authorization=runtime_authorization,
+                    automation_instrument_id=current.instrument_id,
+                )
                 self._mapper.apply(uow, fact)
+                if reservation_key is not None and not uow.confirm_submit_not_sent(
+                    scope_id,
+                    reservation_key,
+                    now=self._now(),
+                ):
+                    raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
                 uow.audit.append_envelope(scope_id, incoming)
                 if isinstance(fact, AutomationStateChangedEnvelope):
                     current = uow.automations.accept_state_fact(
@@ -179,6 +229,136 @@ class TradingFactIngressService:
             current_revision=current.revision,
             accepted_event_ids=tuple(accepted),
         )
+
+    @classmethod
+    def _validate_pre_rpc_abort(
+        cls,
+        uow: TradingFactsUnitOfWorkPort,
+        fact: FactEnvelope,
+        *,
+        scope_id: str,
+        automation_id: UUID,
+        runtime_instance_id: UUID | None,
+        generation: int | None,
+        runtime_authorization: FactRuntimeAuthorization | None,
+        automation_instrument_id: str,
+    ) -> str | None:
+        if not isinstance(fact, BrokerOrderStateChangedEnvelope):
+            return None
+        payload = fact.payload
+        proof = payload.pre_rpc_abort_proof
+        if proof is None:
+            return None
+        reservation = uow.get_fact_submit_reservation(scope_id, str(proof.idempotency_key))
+        if not cls._proof_matches_reservation(
+            proof,
+            payload,
+            reservation,
+            automation_id=str(automation_id),
+            runtime_instance_id=runtime_instance_id,
+            generation=generation,
+            runtime_authorization=runtime_authorization,
+        ):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        order = uow.orders.get_order(scope_id, str(payload.broker_order_id))
+        if (
+            order.user_broker_id != scope_id
+            or order.automation_id != str(automation_id)
+            or order.instrument_id != automation_instrument_id
+            or order.instrument_id != str(payload.instrument_id)
+            or order.idempotency_key != reservation.idempotency_key
+            or order.side.value != reservation.side
+            or payload.side.value != reservation.side
+            or order.quantity_lots != reservation.quantity_lots
+            or payload.quantity_lots != reservation.quantity_lots
+            or order.limit_price != reservation.limit_price
+            or payload.limit_price != reservation.limit_price
+            or order.requested_amount != reservation.requested_amount
+            or payload.requested_amount != reservation.requested_amount
+            or order.order_type.value != "LIMIT"
+            or order.state not in {BrokerOrderStatus.DISPATCH_PENDING, BrokerOrderStatus.SUBMITTING}
+            or payload.from_state is None
+            or payload.from_state.value != order.state.value
+            or order.external_order_id is not None
+            or order.broker_responded_at is not None
+            or order.executed_at is not None
+            or order.terminal_at is not None
+            or order.executed_amount != 0
+            or order.executed_commission != 0
+            or uow.orders.list_executions(scope_id, order.id)
+        ):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        return reservation.idempotency_key
+
+    @staticmethod
+    def _proof_matches_reservation(
+        proof,
+        payload,
+        reservation: FactSubmitReservation | None,
+        *,
+        automation_id: str,
+        runtime_instance_id: UUID | None,
+        generation: int | None,
+        runtime_authorization: FactRuntimeAuthorization | None,
+    ) -> bool:
+        if (
+            reservation is None
+            or runtime_instance_id is None
+            or generation is None
+            or runtime_authorization is None
+            or reservation.automation_id != automation_id
+            or reservation.idempotency_key != str(proof.idempotency_key)
+            or reservation.permit_id != str(proof.permit_id)
+            or reservation.request_fingerprint != proof.request_fingerprint
+            or reservation.runtime_instance_id != str(proof.runtime_instance_id)
+            or reservation.generation != proof.generation
+            or reservation.configuration_fingerprint != proof.configuration_fingerprint
+            or reservation.state not in {"IN_FLIGHT", "UNKNOWN"}
+            or payload.idempotency_key != reservation.idempotency_key
+            or payload.quantity_lots != reservation.quantity_lots
+            or payload.requested_amount != reservation.requested_amount
+            or payload.state.value != "CANCELLED"
+            or payload.to_state.value != "CANCELLED"
+            or payload.external_order_id is not None
+            or payload.broker_responded_at is not None
+            or payload.executed_amount != 0
+            or payload.executed_commission != 0
+            or payload.executed_at is not None
+            or not TradingFactIngressService._reservation_has_no_attributable_fill(reservation)
+        ):
+            return False
+        origin_is_current = (
+            reservation.runtime_instance_id == str(runtime_instance_id) and reservation.generation == generation
+        )
+        origin_is_retired = reservation.origin_registration_status == "RETIRED"
+        if origin_is_retired:
+            return runtime_authorization.recovery_only
+        return origin_is_current and reservation.origin_registration_status == "OWNER"
+
+    @staticmethod
+    def _reservation_has_no_attributable_fill(reservation: FactSubmitReservation) -> bool:
+        payload = reservation.payload
+        executed_lots = payload.get("executed_lots")
+        anchor_lots = payload.get("anchor_executed_lots")
+        if (
+            not isinstance(executed_lots, int)
+            or isinstance(executed_lots, bool)
+            or executed_lots != 0
+            or not isinstance(anchor_lots, int)
+            or isinstance(anchor_lots, bool)
+            or anchor_lots != 0
+            or payload.get("broker_order_id") not in {None, ""}
+            or payload.get("last_reconciled_order_state") is not None
+        ):
+            return False
+        for field in ("executed_amount", "executed_commission"):
+            try:
+                amount = Decimal(str(payload[field]))
+            except (KeyError, InvalidOperation):
+                return False
+            if not amount.is_finite() or amount != 0:
+                return False
+        return True
 
     @staticmethod
     def _validate_state_metadata(current: TradingAutomationDraft, fact: AutomationStateChangedEnvelope) -> None:

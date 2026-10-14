@@ -46,7 +46,11 @@ def repository() -> tuple[AutomationCommandRepository, sessionmaker]:
 
 
 def test_claim_reads_strategy_free_command_directly_from_baseline_tables() -> None:
-    repo, _factory = repository()
+    repo, factory = repository()
+    with factory.begin() as session:
+        automation = session.get_one(TradingAutomationModel, AUTOMATION_ID)
+        automation.settings_revision = 3
+        automation.order_quota_percent = Decimal("12.5")
 
     command = repo.claim(10)[0]
 
@@ -56,17 +60,25 @@ def test_claim_reads_strategy_free_command_directly_from_baseline_tables() -> No
     assert command.instrument_id == UUID(INSTRUMENT_ID)
     assert command.currency == "RUB"
     assert command.account_id == "synthetic-account"
+    assert command.settings_revision == 3
+    assert command.order_quota_percent == Decimal("12.5")
     assert not hasattr(command, "strategy")
 
 
 def test_statuses_preserve_request_order_and_report_missing_ids() -> None:
-    repo, _factory = repository()
+    repo, factory = repository()
     missing = UUID("00000000-0000-4000-8000-000000000199")
+    with factory.begin() as session:
+        automation = session.get_one(TradingAutomationModel, AUTOMATION_ID)
+        automation.settings_revision = 2
+        automation.order_quota_percent = Decimal("10")
 
     result = repo.statuses([missing, UUID(AUTOMATION_ID)])
 
     assert [item.automation_id for item in result.automations] == [UUID(AUTOMATION_ID)]
     assert result.missing_automation_ids == (missing,)
+    assert result.automations[0].settings_revision == 2
+    assert result.automations[0].order_quota_percent == Decimal("10")
 
 
 def test_hold_automation_is_claimable_for_bootstrap_or_resume() -> None:

@@ -20,6 +20,7 @@ from moex_sentinel.domain.trading_facts import (
     TradingFactPersistenceError,
 )
 from moex_sentinel.services.trading_fact_ports import TradingFactsUnitOfWorkPort
+from sentinel_contracts.broker_order_policy import LEGACY_TERMINAL_STATES, validate_order_transition
 from sentinel_contracts.trading_facts import (
     AutomationStateChangedEnvelope,
     BrokerOrderRecordedEnvelope,
@@ -182,24 +183,21 @@ class TradingFactMapper:
             )
         current = uow.orders.get_order(scope_id, str(payload.broker_order_id))
         from_state = BrokerOrderStatus(payload.from_state.value) if payload.from_state else None
-        terminal_states = {
-            BrokerOrderStatus.FILLED,
-            BrokerOrderStatus.CANCELLED,
-            BrokerOrderStatus.REJECTED,
-            BrokerOrderStatus.EXPIRED,
-            BrokerOrderStatus.FAILED,
-        }
         to_state = BrokerOrderStatus(payload.to_state.value)
         terminal_repair = (
-            from_state is BrokerOrderStatus.UNCERTAIN and current.state in terminal_states and to_state is current.state
+            from_state is BrokerOrderStatus.UNCERTAIN
+            and current.state in LEGACY_TERMINAL_STATES
+            and to_state is current.state
         )
-        if (from_state is not current.state and not terminal_repair) or (
-            current.state in terminal_states and to_state is not current.state
-        ):
+        if from_state is not current.state and not terminal_repair:
+            raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order_event")
+        try:
+            validate_order_transition(current.state, to_state, finalized=current.terminal_at is not None)
+        except ValueError as error:
             raise TradingFactPersistenceError(
                 TradingFactErrorCode.INVALID_STATE,
                 entity_type="broker_order_event",
-            )
+            ) from error
         replacement = BrokerOrderDraft(
             id=current.id,
             fact_id=current.fact_id,
@@ -228,6 +226,10 @@ class TradingFactMapper:
             terminal_at=payload.terminal_at,
             updated_at=payload.updated_at,
         )
+        if current.terminal_at is not None:
+            if current.model_dump(exclude={"updated_at"}) != replacement.model_dump(exclude={"updated_at"}):
+                raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order_event")
+            return
         uow.orders.replace_order_aggregate(scope_id, replacement)
         if not terminal_repair:
             uow.orders.append_order_event(

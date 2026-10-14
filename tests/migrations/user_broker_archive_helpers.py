@@ -2,11 +2,10 @@
 
 from decimal import Decimal
 
-from sqlalchemy import MetaData, Table, select
+from sqlalchemy import MetaData, Table, inspect, select
 
 from moex_sentinel.storage.models import (
     AutomationEventModel,
-    Base,
     BrokerAccountFeeProfileModel,
     BrokerOrderEventModel,
     InstrumentSyncStateModel,
@@ -156,15 +155,20 @@ def seed_archive_graph(engine) -> None:
         for row in rows:
             table = Table(row.__tablename__, metadata, autoload_with=connection, extend_existing=True)
             values = {column.name: getattr(row, column.name) for column in table.columns}
+            if "settings_revision" in values:
+                values["settings_revision"] = 0
             connection.execute(table.insert().values(**values))
 
 
-def archive_graph_snapshot(engine, *, include_archive: bool = True) -> dict[str, list[dict]]:
+def archive_graph_snapshot(
+    engine, *, include_archive: bool = True, table_names: tuple[str, ...] | None = None
+) -> dict[str, list[dict]]:
     """Compare complete row contents, including every table in the referenced graph."""
     metadata = MetaData()
     result = {}
+    tables = table_names or tuple(name for name in inspect(engine).get_table_names() if name != "alembic_version")
     with engine.connect() as connection:
-        for name in Base.metadata.tables:
+        for name in tables:
             table = Table(name, metadata, autoload_with=connection)
             columns = [column for column in table.columns if include_archive or column.name != "archived_at"]
             result[name] = [

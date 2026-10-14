@@ -105,6 +105,8 @@ def test_archive_lock_prevents_stale_mutation(isolated_postgresql_database_url, 
 
 
 def test_downgrade_locks_broker_table_before_archive_check(isolated_postgresql_database_url) -> None:
+    config = migration_config(isolated_postgresql_database_url)
+    command.downgrade(config, REVISION)
     engine = create_database_engine(isolated_postgresql_database_url)
     repository = UserBrokerRepository(create_session_factory(engine))
     created = repository.create(draft())
@@ -112,7 +114,7 @@ def test_downgrade_locks_broker_table_before_archive_check(isolated_postgresql_d
 
     def downgrade():
         try:
-            command.downgrade(migration_config(isolated_postgresql_database_url), PREVIOUS)
+            command.downgrade(config, PREVIOUS)
         except Exception as error:
             failures.append(error)
 

@@ -11,7 +11,7 @@ class AutomationLifecycleRepositoryPort(Protocol):
         self,
         *,
         automation_id: str,
-        state: str,
+        state: AutomationState,
         safe_message: str,
         occurred_at: datetime,
     ) -> bool: ...

@@ -252,6 +252,9 @@ def test_two_contours_share_host_but_reject_each_others_origin_and_csrf(tmp_path
     monkeypatch.setenv("APPLICATION_ENVIRONMENT", "PROD")
     monkeypatch.setenv("AUTH_ALLOWED_ORIGIN", "https://example.com:8443")
     monkeypatch.setenv("AUTH_SESSION_COOKIE_NAME", "__Host-moex-prod-session")
+    monkeypatch.setenv("INTERNAL_WORKER_ID", "test-prod-auth-worker")
+    monkeypatch.setenv("INTERNAL_WORKER_BROKER_ID", "00000000-0000-4000-8000-000000000001")
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "a" * 64)
     prod_app = create_app(database_url=f"sqlite:///{tmp_path / 'prod.db'}")
     with (
         TestClient(sandbox_app, base_url="https://example.com") as sandbox,

@@ -25,6 +25,7 @@ from trading_automaton.domain.storage_dtos import (
 )
 from trading_automaton.services.decision import TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
+from trading_automaton.services.order_quota import apply_order_quota
 
 
 class DecisionEstimatePort(Protocol):
@@ -84,6 +85,8 @@ class TradingDecisionPlanner:
         indicators: MarketIndicators,
         session_open: bool,
         estimator: DecisionEstimatePort | None,
+        available_free_cash: Decimal = Decimal(),
+        positive_position_count: int | None = None,
     ) -> DecisionPlan:
         if not session_open:
             context = self._contexts.build(
@@ -97,6 +100,8 @@ class TradingDecisionPlanner:
                 lots=lots,
                 cycle=cycle,
                 indicators=indicators,
+                free_cash=available_free_cash,
+                positive_position_count=positive_position_count,
             )
             return DecisionPlan(
                 indicators=indicators,
@@ -119,8 +124,17 @@ class TradingDecisionPlanner:
             lots=lots,
             cycle=cycle,
             indicators=indicators,
+            free_cash=available_free_cash,
+            positive_position_count=positive_position_count,
         )
-        decision = self._decisions.decide(context)
+        decision = apply_order_quota(
+            self._decisions.decide(context),
+            command,
+            available_free_cash=available_free_cash,
+            positive_position_count=positive_position_count,
+            best_bid=order_book.best_bid.price,
+            best_ask=order_book.best_ask.price,
+        )
         if estimator is None or decision.kind not in {
             DecisionKind.BUY_MORE,
             DecisionKind.SELL_PART,
@@ -152,8 +166,17 @@ class TradingDecisionPlanner:
             lots=lots,
             cycle=cycle,
             indicators=indicators,
+            free_cash=available_free_cash,
+            positive_position_count=positive_position_count,
         )
-        estimated_decision = self._decisions.decide(estimated_context)
+        estimated_decision = apply_order_quota(
+            self._decisions.decide(estimated_context),
+            command,
+            available_free_cash=available_free_cash,
+            positive_position_count=positive_position_count,
+            best_bid=order_book.best_bid.price,
+            best_ask=order_book.best_ask.price,
+        )
         return DecisionPlan(
             indicators=indicators,
             context=context,

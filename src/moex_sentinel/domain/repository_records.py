@@ -69,6 +69,8 @@ class AutomationRecord(PositionalModel):
     ticker: str = ""
     instrument_name: str = ""
     bootstrap_pending: bool = False
+    order_quota_percent: Decimal | None = None
+    settings_revision: int = 0
 
 
 class HeartbeatRecord(PositionalModel):

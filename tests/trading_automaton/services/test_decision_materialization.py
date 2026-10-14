@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -10,6 +11,7 @@ from sentinel_contracts.broker_execution import OrderBookLevel
 from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook
 from sentinel_contracts.trading import DecisionKind
+from sentinel_contracts.trading_admission import SubmitDenialReason
 from tests.trading_automaton.services.test_position_state_hydration_service import (
     NOW,
     Portfolio,
@@ -91,12 +93,11 @@ def test_hydration_decision_dispatch_and_durable_audit_share_process(tmp_path, k
             assert result.request.limit_price == Decimal("101")
         assert {fact.payload["process_id"] for fact in facts} == {HYDRATION_ID}
         stages = [fact.payload["stage"] for fact in facts]
-        assert stages[:2] == [
+        assert stages == [
             BusinessAuditStage.POSITION_RECONCILIATION_STARTED.value,
             BusinessAuditStage.POSITION_RECONCILED.value,
+            BusinessAuditStage.STRATEGY_DECISION_MADE.value,
         ]
-        assert BusinessAuditStage.MARKET_DATA_RECEIVED.value in stages
-        assert BusinessAuditStage.STRATEGY_DECISION_MADE.value in stages
         assert all(datetime.fromisoformat(fact.payload["occurred_at"]) == NOW for fact in facts)
     finally:
         engine.dispose()
@@ -110,6 +111,7 @@ async def materialize(
     pending_cash=None,
     id_factory=lambda: FALLBACK_ID,
     intent_id=INTENT_ID,
+    admission=None,
 ):
     actionable = kind is not DecisionKind.WAIT
     prepared = PreparedDecision(
@@ -128,7 +130,9 @@ async def materialize(
             "instrument", (OrderBookLevel(Decimal("100"), 10),), (OrderBookLevel(Decimal("101"), 10),), NOW, True
         ),
     )
-    return await DecisionMaterializerService(id_factory=id_factory, settings=StrategySettings()).materialize(
+    return await DecisionMaterializerService(
+        id_factory=id_factory, settings=StrategySettings(), admission=admission
+    ).materialize(
         prepared,
         PositionWorkItem(command(), False),
         market,
@@ -138,6 +142,58 @@ async def materialize(
         snapshot_at=NOW,
         intent_id=intent_id,
     )
+
+
+def test_prod_admission_denial_becomes_wait_without_persistable_intent():
+    class Admission:
+        async def prepare(self, instrument_uid):
+            assert instrument_uid == "instrument"
+            return SubmitDenialReason.DISARMED
+
+    async def scenario():
+        cache = PositionStateCacheService()
+        hydration = PositionStateHydrationService(
+            Repository(), Portfolio(), cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
+        await hydration.hydrate((command(),))
+        state = await cache.get(str(command().automation_id))
+        return await materialize(state, admission=Admission())
+
+    result = asyncio.run(scenario())
+    assert result.item.decision == DecisionKind.WAIT.value
+    assert result.item.reason_code == SubmitDenialReason.DISARMED.value
+    assert result.item.decision_quantity_lots == 0
+    assert result.request is None
+    assert result.item.intent is None
+
+
+def test_admission_origin_persists_original_economic_and_fact_instrument_identity():
+    class Admission:
+        async def prepare(self, instrument_uid):
+            assert instrument_uid == command().external_instrument_id
+            return SimpleNamespace(
+                owner_runtime_instance_id=UUID("00000000-0000-4000-8000-000000000701"),
+                owner_generation=3,
+                revision=8,
+                configuration_fingerprint="d" * 64,
+            )
+
+    async def scenario():
+        cache = PositionStateCacheService()
+        hydration = PositionStateHydrationService(
+            Repository(), Portfolio(), cache, now=lambda: NOW, prepared_metrics=PreparedMetrics()
+        )
+        await hydration.hydrate((command(),))
+        state = await cache.get(str(command().automation_id))
+        return await materialize(state, admission=Admission())
+
+    result = asyncio.run(scenario())
+    origin = result.item.strategy_snapshot["admission_origin"]
+
+    assert origin["lot_size"] == command().lot_size
+    assert origin["currency"] == command().currency
+    assert origin["instrument_uid"] == command().external_instrument_id
+    assert origin["fact_instrument_id"] == str(command().instrument_id)
 
 
 @pytest.mark.parametrize("process_id", [None, "", "invalid-uuid"])

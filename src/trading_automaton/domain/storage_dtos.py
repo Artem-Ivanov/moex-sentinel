@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
 
 from pydantic import ConfigDict, Field
 
 from sentinel_contracts.base import PositionalModel
+from sentinel_contracts.broker_execution import BrokerOrderStatus
+from sentinel_contracts.trading import AutomationState
+
+
+class OutboxDeliveryState(StrEnum):
+    PENDING = "PENDING"
+    FAILED = "FAILED"
 
 
 class AccountCommissionProfileKey(PositionalModel):
@@ -34,7 +42,7 @@ class AccountCommissionProfile(PositionalModel):
 class LocalAutomationRecord(PositionalModel):
     model_config = ConfigDict(frozen=True)
     automation_id: str
-    state: str
+    state: AutomationState
     revision: int
     last_sequence_number: int
 
@@ -50,7 +58,7 @@ class FactOutboxRecord(PositionalModel):
     payload: dict[str, object]
     safe_message: str
     occurred_at: datetime
-    delivery_state: str
+    delivery_state: OutboxDeliveryState
     retry_count: int
     next_retry_at: datetime | None
     created_at: datetime
@@ -63,7 +71,7 @@ class LocalIntentRecord(PositionalModel):
     automation_id: str
     kind: str
     side: str
-    state: str
+    state: BrokerOrderStatus
     quantity_lots: int
     limit_price: Decimal
     broker_order_id: str | None
@@ -80,6 +88,7 @@ class LocalIntentRecord(PositionalModel):
     terminal_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    strategy_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActiveBuyIntentReservation(PositionalModel):
@@ -90,7 +99,7 @@ class ActiveBuyIntentReservation(PositionalModel):
     currency: str
     amount: Decimal
     side: str
-    state: str
+    state: BrokerOrderStatus
 
 
 class DecisionRecord(PositionalModel):
@@ -184,7 +193,7 @@ class ExecutionFinalization(PositionalModel):
     quantity_lots: int
     requested_price: Decimal
     currency: str
-    state: str
+    state: BrokerOrderStatus
     occurred_at: datetime
     broker_order_id: str | None
     requested_amount: Decimal

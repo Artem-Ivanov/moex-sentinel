@@ -37,6 +37,7 @@ def test_closed_automation_command_returns_http_409(monkeypatch, tmp_path, comma
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
         lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             hold_automation=HoldAutomationUsecase(service),
             resume_automation=ResumeAutomationUsecase(service),
             close_automation=CloseAutomationUsecase(service),
@@ -67,6 +68,7 @@ def test_foreign_contour_automation_returns_stable_error(monkeypatch, tmp_path, 
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
         lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             view_trading_automation=ViewTradingAutomationUsecase(service),
             hold_automation=HoldAutomationUsecase(service),
             resume_automation=ResumeAutomationUsecase(service),

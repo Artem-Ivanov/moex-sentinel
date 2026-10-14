@@ -34,7 +34,7 @@ class Repository:
                 automation_id=item.automation_id,
                 kind=item.intent.kind,
                 side=item.intent.side,
-                state="PENDING",
+                state="DISPATCH_PENDING",
                 quantity_lots=item.intent.quantity_lots,
                 limit_price=item.intent.limit_price,
                 broker_order_id=None,
@@ -70,7 +70,7 @@ class Dispatcher:
         return BrokerOrderState(
             broker_order_id=request.idempotency_key,
             idempotency_key=request.idempotency_key,
-            status="NEW",
+            status="ACCEPTED",
             requested_lots=request.quantity_lots,
             executed_lots=0,
             requested_amount=request.limit_price * request.quantity_lots,
@@ -217,7 +217,7 @@ def test_committed_cash_reservation_is_published_before_sdk_dispatch() -> None:
             return BrokerOrderState(
                 broker_order_id=request.idempotency_key,
                 idempotency_key=request.idempotency_key,
-                status="NEW",
+                status="ACCEPTED",
                 requested_lots=request.quantity_lots,
                 executed_lots=0,
                 requested_amount=request.limit_price * request.quantity_lots,

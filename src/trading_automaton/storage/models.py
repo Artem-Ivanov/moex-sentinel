@@ -4,11 +4,16 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, CheckConstraint, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import DateTime, TypeDecorator
 
+from sentinel_contracts.broker_execution import BrokerOrderStatus
 from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
+from sentinel_contracts.trading import AutomationState
+from trading_automaton.domain.storage_dtos import OutboxDeliveryState
+from trading_automaton.storage.state_schema import STATE_CHECKS, state_check_sql
 
 
 class UTCDateTime(TypeDecorator[datetime]):
@@ -44,6 +49,9 @@ class TimestampMixin:
 
 class CachedAutomationModel(Base, TimestampMixin):
     __tablename__ = "cached_automations"
+    __table_args__ = (
+        CheckConstraint(state_check_sql("cached_automations"), name=STATE_CHECKS["cached_automations"][1]),
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now_ms, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
@@ -62,9 +70,13 @@ class CachedAutomationModel(Base, TimestampMixin):
     position_cycle_id: Mapped[str | None] = mapped_column(String(36))
     lot_size: Mapped[int | None] = mapped_column(Integer)
     min_price_increment: Mapped[Decimal | None] = mapped_column(Numeric(28, 9))
-    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[AutomationState] = mapped_column(
+        SAEnum(AutomationState, native_enum=False, validate_strings=True), nullable=False
+    )
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     last_sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    settings_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    order_quota_percent: Mapped[Decimal | None] = mapped_column(Numeric(28, 9))
     resume_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     bootstrap_position_cycle_id: Mapped[str | None] = mapped_column(String(36))
     bootstrap_position_lot_id: Mapped[str | None] = mapped_column(String(36))
@@ -78,6 +90,7 @@ class CachedAutomationModel(Base, TimestampMixin):
 class FactOutboxModel(Base, TimestampMixin):
     __tablename__ = "fact_outbox"
     __table_args__ = (
+        CheckConstraint(state_check_sql("fact_outbox"), name=STATE_CHECKS["fact_outbox"][1]),
         UniqueConstraint("automation_id", "sequence_number", name="uq_fact_outbox_sequence"),
         Index("ix_fact_outbox_retry", "delivery_state", "next_retry_at"),
     )
@@ -91,7 +104,11 @@ class FactOutboxModel(Base, TimestampMixin):
     payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     safe_message: Mapped[str] = mapped_column(String(1000), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-    delivery_state: Mapped[str] = mapped_column(String(16), default="PENDING", nullable=False)
+    delivery_state: Mapped[OutboxDeliveryState] = mapped_column(
+        SAEnum(OutboxDeliveryState, native_enum=False, validate_strings=True),
+        default=OutboxDeliveryState.PENDING,
+        nullable=False,
+    )
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     next_retry_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
@@ -147,6 +164,7 @@ class BusinessAuditEventModel(Base):
 
 class LocalIntentModel(Base):
     __tablename__ = "broker_intents"
+    __table_args__ = (CheckConstraint(state_check_sql("broker_intents"), name=STATE_CHECKS["broker_intents"][1]),)
 
     idempotency_key: Mapped[str] = mapped_column(String(36), primary_key=True)
     fact_execution_id: Mapped[str | None] = mapped_column(String(36))
@@ -154,7 +172,9 @@ class LocalIntentModel(Base):
     automation_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
-    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    state: Mapped[BrokerOrderStatus] = mapped_column(
+        SAEnum(BrokerOrderStatus, native_enum=False, validate_strings=True), nullable=False
+    )
     quantity_lots: Mapped[int] = mapped_column(Integer, nullable=False)
     limit_price: Mapped[Decimal] = mapped_column(Numeric(28, 9), nullable=False)
     broker_order_id: Mapped[str | None] = mapped_column(String(128))

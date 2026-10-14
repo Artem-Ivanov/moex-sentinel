@@ -13,6 +13,7 @@ from moex_sentinel.domain.brokers import BrokerDraft, BrokerField
 from moex_sentinel.domain.portfolio import BrokerAccount, BrokerReadError
 from moex_sentinel.domain.trading_summary import PortfolioSnapshotRunValue, PortfolioSnapshotValue
 from moex_sentinel.domain.user_brokers import UserBrokerDraft, UserBrokerNotFoundError
+from moex_sentinel.services.trading_admission import TradingAdmissionService
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
 from moex_sentinel.services.trading_fact_mapping import TradingFactMapper
 from moex_sentinel.services.trading_summary import TradingSummaryService
@@ -20,9 +21,11 @@ from moex_sentinel.storage.database import create_database_engine, create_sessio
 from moex_sentinel.storage.models import Base, TradingAutomationModel, UserBrokerModel
 from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from moex_sentinel.storage.repositories.portfolio_snapshots import PortfolioSnapshotRepository
+from moex_sentinel.storage.repositories.trading_admission import TradingAdmissionRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.trading_admission import RuntimeRegistrationRequest, RuntimeRegistrationStatus
 from sentinel_contracts.trading_facts import FactIngressErrorCode
 from tests.services.test_portfolio_snapshot_collection import PortfolioAdapter
 from tests.services.test_trading_fact_ingress import state_fact
@@ -133,13 +136,30 @@ def test_foreign_fact_rejected_before_replay_ack_and_sequence_change(shared_data
     fact = state_fact(UUID(automation_id), event_id=uuid4()).model_copy(update={"user_broker_id": UUID(broker_id)})
     prod = TradingFactIngressService(lambda: TradingFactsUnitOfWork(factory), TradingFactMapper(), environment="PROD")
     test = TradingFactIngressService(lambda: TradingFactsUnitOfWork(factory), TradingFactMapper(), environment="TEST")
+    runtime = TradingAdmissionService(TradingAdmissionRepository(factory), clock=lambda: NOW).register_runtime(
+        RuntimeRegistrationRequest(
+            worker_id="contour-prod-worker",
+            runtime_instance_id=uuid4(),
+            broker_id=UUID(broker_id),
+            application_environment="PROD",
+            access_mode="READ_ONLY",
+            strategy_enabled=False,
+        ),
+        "c" * 64,
+    )
+    assert runtime.registration_status is RuntimeRegistrationStatus.OWNER
     rejected = test.publish([fact])
     assert rejected.results == ()
     assert rejected.failures[0].code == FactIngressErrorCode.CROSS_SCOPE_RELATION
     assert rejected.failures[0].retryable is False
+    unauthenticated = prod.publish([fact])
+    assert unauthenticated.results == ()
+    assert unauthenticated.failures[0].code == FactIngressErrorCode.TEMPORARY_CORE_FAILURE
+    assert unauthenticated.failures[0].retryable is True
     with factory() as session:
         assert session.get(TradingAutomationModel, automation_id).last_sequence_number == 0
-    assert len(prod.publish([fact]).results) == 1
+    accepted = prod.publish([fact], runtime_instance_id=runtime.runtime_instance_id, generation=runtime.generation)
+    assert len(accepted.results) == 1
     replay = test.publish([fact])
     assert replay.results == ()
     assert replay.failures[0].code == FactIngressErrorCode.CROSS_SCOPE_RELATION
@@ -288,6 +308,9 @@ def test_backend_rejects_foreign_put_and_delete(shared_database, state, environm
         application_environment=environment,
         auth_allowed_origin="https://example.test:8443",
         auth_session_cookie_name="__Host-prod-session",
+        internal_worker_id="contour-worker",
+        internal_worker_broker_id=scopes[environment][0],
+        internal_worker_token="a" * 64,
     )
     application = build_application_usecases(factory, settings=settings)
     adapter = application.view_broker_settings.execute().adapters[0]

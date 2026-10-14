@@ -61,7 +61,7 @@ class AdaptiveScalpingStrategy:
             return TradeDecision(DecisionKind.WAIT, 0, None, "ENTRY_REVERSAL_WAIT")
         return TradeDecision(
             kind=DecisionKind.BUY_MORE,
-            quantity_lots=context.settings.buy_order_lots,
+            quantity_lots=self._buy_order_lots(context),
             limit_price=context.best_ask,
             reason_code="ENTRY_REVERSAL_CONFIRMED",
         )
@@ -181,10 +181,14 @@ class AdaptiveScalpingStrategy:
             )
         return TradeDecision(
             kind=DecisionKind.BUY_MORE,
-            quantity_lots=context.settings.buy_order_lots,
+            quantity_lots=self._buy_order_lots(context),
             limit_price=context.best_ask,
             reason_code="AVERAGING_LEVEL",
         )
+
+    @staticmethod
+    def _buy_order_lots(context: DecisionContext) -> int:
+        return context.settings.buy_order_lots if context.requested_buy_lots is None else context.requested_buy_lots
 
     @staticmethod
     def _buy_market_guard(context: DecisionContext) -> TradeDecision | None:

@@ -7,7 +7,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
-from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerOrderStatus, BrokerPosition
+from sentinel_contracts.broker_order_policy import BROKER_TERMINAL_STATES
 from sentinel_contracts.business_audit import BusinessAuditStage
 from trading_automaton.domain.dtos import DispatchRequest, PostCommitCleanupContext
 from trading_automaton.domain.ports import IntentUpdatePort, OrderStageAuditPort
@@ -51,7 +52,7 @@ class TrackingPortfolioPort(Protocol):
 
 
 class TrackingCashPort(Protocol):
-    async def complete(self, intent_id: str, state: str) -> None: ...
+    async def complete(self, intent_id: str, state: BrokerOrderStatus) -> None: ...
 
 
 class PostCommitCleanupError(RuntimeError):
@@ -190,7 +191,9 @@ class OrderTrackingService:
         if terminal_response is None:
             return
         response = terminal_response
-        if response.status == "FILLED" and (response.executed_lots <= 0 or response.executed_price <= 0):
+        if (response.status == "FILLED" and response.executed_lots <= 0) or (
+            response.status in BROKER_TERMINAL_STATES and response.executed_lots > 0 and response.executed_price <= 0
+        ):
             self._repository.update_intent(
                 intent_id,
                 state="UNCERTAIN",
@@ -203,7 +206,7 @@ class OrderTrackingService:
                 process_id=None if request is None else request.process_id,
             )
             self._repository.hold_active(
-                "Broker returned FILLED without an executed quantity or price",
+                f"Broker returned {response.status} without an executed quantity or price",
                 request.automation_id if request is not None else None,
             )
             if self._cash is not None:
@@ -211,16 +214,16 @@ class OrderTrackingService:
             await self._audit_stage(
                 request,
                 BusinessAuditStage.TRADING_STEP_FAILED,
-                "Broker returned an inconsistent FILLED state",
+                f"Broker returned an inconsistent {response.status} state",
                 critical=True,
                 broker_order_state="UNCERTAIN",
-                reason_code="FILLED_EXECUTION_DATA_MISSING",
+                reason_code=f"{response.status}_EXECUTION_DATA_MISSING",
             )
             return
         timestamp_source = "BROKER_EXECUTION_TIME"
         if response.executed_lots > 0 and response.executed_at is None:
             timestamp_source = "LOCAL_CONFIRMATION_TIME"
-        if response.status not in {"FILLED", "REJECTED", "CANCELLED"}:
+        if response.status not in BROKER_TERMINAL_STATES:
             self._repository.update_intent(
                 intent_id,
                 state=response.status,
@@ -338,7 +341,7 @@ class OrderTrackingService:
         response: BrokerOrderState,
         request: DispatchRequest | None,
     ) -> BrokerOrderState | None:
-        terminal = {"FILLED", "REJECTED", "CANCELLED"}
+        terminal = BROKER_TERMINAL_STATES
         if response.status in terminal or self._broker is None or request is None:
             return response
         for _attempt in range(self._poll_limit):

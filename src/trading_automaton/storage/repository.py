@@ -2,6 +2,7 @@
 
 from bisect import insort
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timedelta
 from decimal import Decimal
 from sqlite3 import Connection as SQLiteConnection
@@ -19,11 +20,17 @@ from sentinel_contracts.automation_lifecycle import (
     TransitionOrigin,
     validate_automation_transition,
 )
-from sentinel_contracts.broker_execution import OrderSide
+from sentinel_contracts.broker_execution import BrokerOrderStatus, OrderSide
+from sentinel_contracts.broker_order_policy import BROKER_TERMINAL_STATES, validate_order_transition
 from sentinel_contracts.business_audit import BusinessAuditEvent
 from sentinel_contracts.strategy import STRATEGY_CODE, STRATEGY_VERSION
 from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
 from sentinel_contracts.trading import AutomationState, DecisionKind
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAuthorizationRequest,
+    submit_request_fingerprint,
+)
 from sentinel_contracts.trading_facts import (
     AutomationCommand as TypedAutomationCommand,
 )
@@ -107,27 +114,38 @@ class LocalAutomationRepository:
         factory: sessionmaker[Session],
         *,
         fact_writer: FactOutboxWriter | None = None,
+        environment: str = "TEST",
     ) -> None:
+        if environment not in {"TEST", "PROD"}:
+            raise ValueError("Invalid repository environment")
         self._factory = factory
         self._fact_writer = fact_writer or FactOutboxWriter()
+        self._environment = environment
         # Serializes finalizations inside the supported single worker process.
         # Multiple worker processes sharing one SQLite file remain unsupported.
         self._finalize_lock = Lock()
 
-    @staticmethod
-    def _active_intent_predicate() -> ColumnElement[bool]:
+    def _active_intent_predicate(self) -> ColumnElement[bool]:
+        active = LocalIntentModel.state.in_(
+            (
+                "CREATED",
+                "DISPATCH_PENDING",
+                "SUBMITTING",
+                "SUBMITTED",
+                "ACCEPTED",
+                "PARTIALLY_FILLED",
+                "UNCERTAIN",
+            )
+        )
+        active = or_(active, and_(LocalIntentModel.state == "FAILED", LocalIntentModel.terminal_at.is_(None)))
+        terminal_unfinalized = and_(
+            LocalIntentModel.state.in_(("FILLED", "REJECTED", "CANCELLED", "EXPIRED")),
+            LocalIntentModel.terminal_at.is_(None),
+        )
+        if self._environment == "PROD":
+            return or_(active, terminal_unfinalized)
         return or_(
-            LocalIntentModel.state.in_(
-                (
-                    "CREATED",
-                    "DISPATCH_PENDING",
-                    "SUBMITTING",
-                    "SUBMITTED",
-                    "ACCEPTED",
-                    "PARTIALLY_FILLED",
-                    "UNCERTAIN",
-                )
-            ),
+            active,
             and_(
                 LocalIntentModel.state == "FILLED",
                 LocalIntentModel.execution_facts_emitted_at.is_(None),
@@ -263,7 +281,7 @@ class LocalAutomationRepository:
         self,
         *,
         automation_id: str,
-        state: str,
+        state: AutomationState,
         safe_message: str,
         occurred_at: datetime,
     ) -> bool:
@@ -310,7 +328,7 @@ class LocalAutomationRepository:
             cached = session.get(CachedAutomationModel, finalization.automation_id)
             if cached is None:
                 raise KeyError(finalization.automation_id)
-            self._validate_finalization_source(intent, cached, finalization)
+            proof_origin = self._validate_finalization_source(intent, cached, finalization)
             if intent.terminal_at is not None:
                 self._validate_execution_replay(intent, finalization)
                 return ExecutionFinalizationResult(
@@ -319,6 +337,7 @@ class LocalAutomationRepository:
                     None,
                 )
 
+            validate_order_transition(intent.state, finalization.state, finalized=False)
             from_state = intent.state
             opens_position_cycle = (
                 finalization.executed_lots > 0 and intent.side == "BUY" and cached.position_cycle_id is None
@@ -333,7 +352,7 @@ class LocalAutomationRepository:
                 intent.position_cycle_id = cached.position_cycle_id
             intent.state = finalization.state
             intent.updated_at = finalization.occurred_at
-            intent.broker_order_id = finalization.broker_order_id
+            intent.broker_order_id = self._normalize_broker_order_id(finalization.broker_order_id)
             intent.requested_amount = finalization.requested_amount
             intent.executed_amount = finalization.executed_amount
             intent.estimated_commission = finalization.estimated_commission
@@ -350,6 +369,7 @@ class LocalAutomationRepository:
                 from_state=from_state,
                 occurred_at=finalization.occurred_at,
                 include_position_cycle=not opens_position_cycle,
+                fact_instrument_id=(None if proof_origin is None else proof_origin["fact_instrument_id"]),
             )
 
             if finalization.executed_lots > 0:
@@ -593,16 +613,23 @@ class LocalAutomationRepository:
             occurred_at=occurred_at,
         )
 
-    @staticmethod
     def _validate_finalization_source(
+        self,
         intent: LocalIntentModel,
         cached: CachedAutomationModel,
         finalization: ExecutionFinalization,
-    ) -> None:
-        if finalization.state not in {"FILLED", "REJECTED", "CANCELLED"}:
+    ) -> dict[str, object] | None:
+        if finalization.state not in BROKER_TERMINAL_STATES:
             raise ValueError("Execution finalization requires a terminal state.")
         if finalization.side not in {"BUY", "SELL"} or intent.side not in {"BUY", "SELL"}:
             raise ValueError("Execution finalization side is invalid.")
+        proof_origin = self._pre_rpc_abort_origin(intent, cached, finalization)
+        if (
+            self._environment == "PROD"
+            and intent.strategy_snapshot.get("_pre_rpc_abort_proof") is not None
+            and proof_origin is None
+        ):
+            raise ValueError("Persisted pre-RPC proof conflicts with its immutable order source.")
         expected = (
             (intent.automation_id, finalization.automation_id, "automation_id"),
             (intent.side, finalization.side, "side"),
@@ -610,8 +637,12 @@ class LocalAutomationRepository:
             (intent.limit_price, finalization.requested_price, "requested_price"),
             (cached.broker_id, finalization.broker_id, "broker_id"),
             (cached.account_id, finalization.account_id, "account_id"),
-            (cached.instrument_id, finalization.instrument_id, "instrument_id"),
-            (cached.lot_size, finalization.lot_size, "lot_size"),
+            (
+                cached.instrument_id if proof_origin is None else proof_origin["instrument_uid"],
+                finalization.instrument_id,
+                "instrument_id",
+            ),
+            (cached.lot_size if proof_origin is None else proof_origin["lot_size"], finalization.lot_size, "lot_size"),
         )
         mismatch = next((name for actual, provided, name in expected if actual != provided), None)
         if mismatch is not None:
@@ -620,6 +651,106 @@ class LocalAutomationRepository:
             raise ValueError("Execution finalization executed_lots is invalid.")
         if finalization.state == "FILLED" and finalization.executed_lots <= 0:
             raise ValueError("FILLED execution must contain executed lots.")
+        if proof_origin is not None and finalization.currency != proof_origin["currency"]:
+            raise ValueError("Execution finalization currency conflicts with its immutable pre-RPC source.")
+        return proof_origin
+
+    def _pre_rpc_abort_origin(
+        self,
+        intent: LocalIntentModel,
+        cached: CachedAutomationModel,
+        finalization: ExecutionFinalization,
+    ) -> dict[str, object] | None:
+        if self._environment != "PROD":
+            return None
+        proof_data = intent.strategy_snapshot.get("_pre_rpc_abort_proof")
+        origin = intent.strategy_snapshot.get("admission_origin")
+        if not isinstance(proof_data, dict) or not isinstance(origin, dict):
+            return None
+        try:
+            proof = PreRpcAbortProof.model_validate(proof_data)
+            runtime_instance_id = UUID(origin["runtime_instance_id"])
+            generation = origin["generation"]
+            revision = origin["revision"]
+            configuration_fingerprint = origin["configuration_fingerprint"]
+            lot_size = origin["lot_size"]
+            currency = origin["currency"]
+            instrument_uid = origin["instrument_uid"]
+            fact_instrument_id = UUID(origin["fact_instrument_id"])
+            if (
+                type(generation) is not int
+                or generation <= 0
+                or type(revision) is not int
+                or revision <= 0
+                or type(lot_size) is not int
+                or lot_size <= 0
+                or currency != "RUB"
+                or not isinstance(instrument_uid, str)
+                or not instrument_uid
+            ):
+                return None
+            authorization = SubmitAuthorizationRequest(
+                broker_id=UUID(finalization.broker_id),
+                account_id=finalization.account_id,
+                automation_id=UUID(intent.automation_id),
+                idempotency_key=UUID(intent.idempotency_key),
+                generation=generation,
+                revision=revision,
+                configuration_fingerprint=configuration_fingerprint,
+                instrument_uid=instrument_uid,
+                lot_size=lot_size,
+                currency=currency,
+                side=intent.side,
+                quantity_lots=intent.quantity_lots,
+                limit_price=intent.limit_price,
+                market_valid_until=proof.aborted_at,
+                submit_deadline=proof.aborted_at,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        requested_amount = intent.limit_price * intent.quantity_lots * lot_size
+        if (
+            finalization.state != "CANCELLED"
+            or finalization.executed_lots != 0
+            or finalization.executed_amount != 0
+            or finalization.executed_commission != 0
+            or finalization.estimated_commission != 0
+            or finalization.executed_price != 0
+            or finalization.executed_at is not None
+            or self._normalize_broker_order_id(finalization.broker_order_id) is not None
+            or intent.state != "CANCELLED"
+            or intent.executed_lots != 0
+            or intent.executed_amount != 0
+            or intent.executed_commission != 0
+            or intent.estimated_commission != 0
+            or intent.executed_price != 0
+            or self._normalize_broker_order_id(intent.broker_order_id) is not None
+            or intent.requested_amount != requested_amount
+            or finalization.requested_amount != requested_amount
+            or finalization.currency != currency
+            or finalization.lot_size != lot_size
+            or finalization.instrument_id != instrument_uid
+            or finalization.broker_id != cached.broker_id
+            or finalization.account_id != cached.account_id
+            or finalization.automation_id != intent.automation_id
+            or proof.idempotency_key != authorization.idempotency_key
+            or proof.runtime_instance_id != runtime_instance_id
+            or proof.generation != generation
+            or proof.configuration_fingerprint != configuration_fingerprint
+            or proof.request_fingerprint != submit_request_fingerprint(authorization)
+        ):
+            return None
+        return {
+            "lot_size": lot_size,
+            "currency": currency,
+            "instrument_uid": instrument_uid,
+            "fact_instrument_id": str(fact_instrument_id),
+        }
+
+    @staticmethod
+    def _normalize_broker_order_id(broker_order_id: str | None) -> str | None:
+        return broker_order_id or None
 
     @staticmethod
     def _validate_execution_replay(
@@ -628,7 +759,10 @@ class LocalAutomationRepository:
     ) -> None:
         facts = (
             (intent.state, finalization.state),
-            (intent.broker_order_id, finalization.broker_order_id),
+            (
+                LocalAutomationRepository._normalize_broker_order_id(intent.broker_order_id),
+                LocalAutomationRepository._normalize_broker_order_id(finalization.broker_order_id),
+            ),
             (intent.requested_amount, finalization.requested_amount),
             (intent.executed_amount, finalization.executed_amount),
             (intent.estimated_commission, finalization.estimated_commission),
@@ -890,6 +1024,9 @@ class LocalAutomationRepository:
                 previous_sequence if previous_sequence is not None else 0,
             )
             model.resume_requested = command.resume_requested
+            if command.settings_revision > (model.settings_revision or 0):
+                model.settings_revision = command.settings_revision
+                model.order_quota_percent = command.order_quota_percent
             snapshot = command.bootstrap
             model.bootstrap_position_cycle_id = None if snapshot is None else str(snapshot.position_cycle_id)
             model.bootstrap_position_lot_id = None if snapshot is None else str(snapshot.position_lot_id)
@@ -1184,20 +1321,25 @@ class LocalAutomationRepository:
         self,
         automation_id: str,
         *,
-        state: str,
+        state: AutomationState,
         revision: int,
         last_sequence_number: int | None,
+        settings_revision: int = 0,
+        order_quota_percent: Decimal | None = None,
     ) -> TypedAutomationCommand:
         with self._factory.begin() as session:
             model = session.get(CachedAutomationModel, automation_id)
             if model is None:
                 raise KeyError(automation_id)
+            if settings_revision > (model.settings_revision or 0):
+                model.settings_revision = settings_revision
+                model.order_quota_percent = order_quota_percent
             pending_fact = session.scalar(
                 select(FactOutboxModel.event_id).where(FactOutboxModel.automation_id == automation_id).limit(1)
             )
             if pending_fact is not None:
                 return self._command(model)
-            model.state = state
+            model.state = AutomationState(state)
             model.revision = revision
             if last_sequence_number is not None:
                 model.last_sequence_number = max(model.last_sequence_number, last_sequence_number)
@@ -1509,17 +1651,22 @@ class LocalAutomationRepository:
         self,
         automation_id: str,
         *,
-        state: str,
+        state: AutomationState,
         revision: int,
         last_sequence_number: int,
+        settings_revision: int = 0,
+        order_quota_percent: Decimal | None = None,
     ) -> None:
         with self._factory.begin() as session:
             cached = session.get(CachedAutomationModel, automation_id)
             if cached is None:
                 raise KeyError(automation_id)
-            cached.state = state
+            cached.state = AutomationState(state)
             cached.revision = revision
             cached.last_sequence_number = last_sequence_number
+            if settings_revision > (cached.settings_revision or 0):
+                cached.settings_revision = settings_revision
+                cached.order_quota_percent = order_quota_percent
 
     def begin_run(self, worker_id: str) -> bool:
         with self._factory.begin() as session:
@@ -1570,7 +1717,7 @@ class LocalAutomationRepository:
         self,
         idempotency_key: str,
         *,
-        state: str,
+        state: BrokerOrderStatus,
         occurred_at: datetime,
         broker_order_id: str | None = None,
         requested_amount: Decimal | None = None,
@@ -1584,12 +1731,74 @@ class LocalAutomationRepository:
         broker_responded_at: datetime | None = None,
         terminal_at: datetime | None = None,
         process_id: str | None = None,
+        pre_rpc_abort_proof: PreRpcAbortProof | None = None,
     ) -> LocalIntentRecord:
         with self._factory.begin() as session:
             model = session.get(LocalIntentModel, idempotency_key)
             if model is None:
                 raise KeyError(idempotency_key)
             from_state = model.state
+            stored_proof_data = model.strategy_snapshot.get("_pre_rpc_abort_proof")
+            if pre_rpc_abort_proof is not None and stored_proof_data is not None:
+                stored_proof = PreRpcAbortProof.model_validate(stored_proof_data)
+                if stored_proof != pre_rpc_abort_proof:
+                    raise ValueError("Pre-RPC abort proof conflicts with the persisted proof result.")
+                expected = {
+                    "state": model.state,
+                    "broker_order_id": self._normalize_broker_order_id(model.broker_order_id),
+                    "requested_amount": model.requested_amount,
+                    "executed_amount": model.executed_amount,
+                    "estimated_commission": model.estimated_commission,
+                    "executed_commission": model.executed_commission,
+                    "executed_lots": model.executed_lots,
+                    "executed_price": model.executed_price,
+                    "executed_at": model.executed_at,
+                    "dispatch_started_at": model.dispatch_started_at,
+                    "broker_responded_at": model.broker_responded_at,
+                    "terminal_at": model.terminal_at,
+                }
+                provided = {
+                    "state": state,
+                    "broker_order_id": (
+                        self._normalize_broker_order_id(broker_order_id) if broker_order_id is not None else None
+                    ),
+                    "requested_amount": requested_amount,
+                    "executed_amount": executed_amount,
+                    "estimated_commission": estimated_commission,
+                    "executed_commission": executed_commission,
+                    "executed_lots": executed_lots,
+                    "executed_price": executed_price,
+                    "executed_at": executed_at,
+                    "dispatch_started_at": dispatch_started_at,
+                    "broker_responded_at": broker_responded_at,
+                    "terminal_at": terminal_at,
+                }
+                if any(value is not None and value != expected[name] for name, value in provided.items()):
+                    raise ValueError("Pre-RPC abort proof retry conflicts with the persisted result.")
+                return self._intent_record(model)
+            state = BrokerOrderStatus(state)
+            if model.terminal_at is not None:
+                if state != from_state:
+                    return self._intent_record(model)
+                for name, value in (
+                    ("broker_order_id", broker_order_id),
+                    ("requested_amount", requested_amount),
+                    ("executed_amount", executed_amount),
+                    ("estimated_commission", estimated_commission),
+                    ("executed_commission", executed_commission),
+                    ("executed_lots", executed_lots),
+                    ("executed_price", executed_price),
+                    ("executed_at", executed_at),
+                    ("dispatch_started_at", dispatch_started_at),
+                    ("broker_responded_at", broker_responded_at),
+                    ("terminal_at", terminal_at),
+                ):
+                    if value is not None and value != getattr(model, name):
+                        raise ValueError("Order update conflicts with the persisted terminal result.")
+                return self._intent_record(model)
+            if pre_rpc_abort_proof is not None and (from_state != "SUBMITTING" or state != "CANCELLED"):
+                raise ValueError("Pre-RPC abort proof requires the first SUBMITTING-to-CANCELLED transition.")
+            validate_order_transition(from_state, state, finalized=model.terminal_at is not None)
             model.state = state
             model.updated_at = occurred_at
             if broker_order_id is not None:
@@ -1608,8 +1817,32 @@ class LocalAutomationRepository:
             ):
                 if value is not None:
                     setattr(model, name, value)
+            if pre_rpc_abort_proof is not None:
+                if state != "CANCELLED" or broker_order_id not in {None, ""}:
+                    raise ValueError("Pre-RPC abort proof can only accompany a local zero-fill cancellation.")
+                if any(
+                    value != 0
+                    for value in (
+                        model.executed_amount,
+                        model.executed_commission,
+                        model.executed_lots,
+                        model.executed_price,
+                        model.estimated_commission,
+                    )
+                ):
+                    raise ValueError("Pre-RPC abort proof requires a zero-execution result.")
+                model.strategy_snapshot = {
+                    **model.strategy_snapshot,
+                    "_pre_rpc_abort_proof": pre_rpc_abort_proof.model_dump(mode="json"),
+                }
             session.flush()
-            self._append_order_state_fact(session, model, from_state=from_state, occurred_at=occurred_at)
+            self._append_order_state_fact(
+                session,
+                model,
+                from_state=from_state,
+                occurred_at=occurred_at,
+                pre_rpc_abort_proof=pre_rpc_abort_proof,
+            )
             return self._intent_record(model)
 
     def _append_order_state_fact(
@@ -1617,9 +1850,11 @@ class LocalAutomationRepository:
         session: Session,
         intent: LocalIntentModel,
         *,
-        from_state: str,
+        from_state: BrokerOrderStatus,
         occurred_at: datetime,
         include_position_cycle: bool = True,
+        fact_instrument_id: str | None = None,
+        pre_rpc_abort_proof: PreRpcAbortProof | None = None,
     ) -> None:
         cached = session.get(CachedAutomationModel, intent.automation_id)
         decision = session.scalar(
@@ -1638,7 +1873,7 @@ class LocalAutomationRepository:
                 position_cycle_id=(
                     UUID(intent.position_cycle_id) if include_position_cycle and intent.position_cycle_id else None
                 ),
-                instrument_id=UUID(cached.fact_instrument_id),
+                instrument_id=UUID(fact_instrument_id or cached.fact_instrument_id),
                 idempotency_key=intent.idempotency_key,
                 external_order_id=intent.broker_order_id,
                 intent_kind=FactOrderIntentKind(intent.kind),
@@ -1665,6 +1900,7 @@ class LocalAutomationRepository:
                 safe_message="Broker order state changed",
                 occurred_at=occurred_at,
                 created_at=intent.created_at,
+                pre_rpc_abort_proof=pre_rpc_abort_proof,
             ),
             safe_message="Broker order state changed",
             occurred_at=occurred_at,
@@ -2196,7 +2432,9 @@ class LocalAutomationRepository:
             state=AutomationState(model.state),
             revision=model.revision,
             last_sequence_number=model.last_sequence_number,
+            settings_revision=model.settings_revision,
             resume_requested=model.resume_requested,
+            order_quota_percent=model.order_quota_percent,
             bootstrap=bootstrap,
         )
 
@@ -2224,6 +2462,7 @@ class LocalAutomationRepository:
             terminal_at=model.terminal_at,
             created_at=model.created_at,
             updated_at=model.updated_at,
+            strategy_snapshot=deepcopy(model.strategy_snapshot),
         )
 
     @staticmethod

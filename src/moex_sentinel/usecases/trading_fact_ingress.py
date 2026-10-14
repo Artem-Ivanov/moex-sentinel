@@ -13,32 +13,44 @@ from sentinel_contracts.trading_facts import (
 
 
 class ClaimAutomationCommandsPort(Protocol):
-    def claim(self, limit: int) -> list[AutomationCommand]: ...
+    def claim(self, limit: int, *, broker_id: UUID | None = None) -> list[AutomationCommand]: ...
 
 
 class AutomationStatusesPort(Protocol):
-    def statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult: ...
+    def statuses(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult: ...
 
 
 class ClaimAutomationCommandsUsecase:
     def __init__(self, repository: ClaimAutomationCommandsPort) -> None:
         self._repository = repository
 
-    def execute(self, limit: int) -> list[AutomationCommand]:
-        return self._repository.claim(limit)
+    def execute(self, limit: int, *, broker_id: UUID | None = None) -> list[AutomationCommand]:
+        return (
+            self._repository.claim(limit) if broker_id is None else self._repository.claim(limit, broker_id=broker_id)
+        )
 
 
 class ViewAutomationStatusesUsecase:
     def __init__(self, repository: AutomationStatusesPort) -> None:
         self._repository = repository
 
-    def execute(self, automation_ids: list[UUID]) -> AutomationStatusesResult:
-        return self._repository.statuses(automation_ids)
+    def execute(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult:
+        return (
+            self._repository.statuses(automation_ids)
+            if broker_id is None
+            else self._repository.statuses(automation_ids, broker_id=broker_id)
+        )
 
 
 class PublishTradingFactsUsecase:
     def __init__(self, service: TradingFactIngressService) -> None:
         self._service = service
 
-    def execute(self, facts: list[FactEnvelope]) -> FactBatchResult:
-        return self._service.publish(facts)
+    def execute(
+        self,
+        facts: list[FactEnvelope],
+        *,
+        runtime_instance_id: UUID | None = None,
+        generation: int | None = None,
+    ) -> FactBatchResult:
+        return self._service.publish(facts, runtime_instance_id=runtime_instance_id, generation=generation)

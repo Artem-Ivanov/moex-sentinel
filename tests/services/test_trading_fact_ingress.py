@@ -1,7 +1,7 @@
 """Per-automation transactional acceptance of typed trading facts."""
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TypeVar
@@ -29,14 +29,23 @@ from moex_sentinel.storage.models import (
     TradeExecutionModel,
     TradingAutomationModel,
 )
+from moex_sentinel.storage.models.trading_admission import (
+    TradingAccountAdmissionModel,
+    TradingSubmitReservationModel,
+    WorkerRuntimeInstanceModel,
+)
+from moex_sentinel.storage.models.user_brokers import UserBrokerModel
+from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from sentinel_contracts.broker_execution import OrderSide
 from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.trading_admission import PreRpcAbortProof
 from sentinel_contracts.trading_facts import (
     AutomationStateChangedEnvelope,
     AutomationStateChangedPayload,
     BrokerOrderRecordedEnvelope,
     BrokerOrderStateChangedEnvelope,
+    BrokerOrderStateChangedPayload,
     ExecutionLotAllocatedEnvelope,
     FactBrokerOrderStatus,
     FactEnvelope,
@@ -48,7 +57,7 @@ from sentinel_contracts.trading_facts import (
     TradeDecisionRecordedEnvelope,
     TradeExecutionRecordedEnvelope,
 )
-from tests.contracts.trading_facts_helpers import all_envelopes
+from tests.contracts.trading_facts_helpers import CYCLE_ID, ORDER_ID, all_envelopes, order_payload_values
 from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
 
 NOW = datetime(2026, 8, 13, 12, 0, 0, 123000, tzinfo=UTC)
@@ -57,6 +66,12 @@ AUTOMATION_A = UUID("00000000-0000-4000-8000-000000000202")
 AUTOMATION_B = UUID("00000000-0000-4000-8000-000000000203")
 INSTRUMENT_A = UUID("00000000-0000-4000-8000-000000000204")
 INSTRUMENT_B = UUID("00000000-0000-4000-8000-000000000205")
+RUNTIME_A = UUID("00000000-0000-4000-8000-000000000291")
+RUNTIME_B = UUID("00000000-0000-4000-8000-000000000292")
+SUBMIT_KEY = UUID("00000000-0000-4000-8000-000000000293")
+PERMIT_ID = UUID("00000000-0000-4000-8000-000000000294")
+REQUEST_FINGERPRINT = "a" * 64
+CONFIGURATION_FINGERPRINT = "b" * 64
 EnvelopeT = TypeVar(
     "EnvelopeT",
     AutomationStateChangedEnvelope,
@@ -135,6 +150,572 @@ def service(factory: sessionmaker[Session]) -> TradingFactIngressService:
         TradingFactMapper(),
         now=lambda: NOW,
     )
+
+
+def production_fact_service(factory: sessionmaker[Session]) -> TradingFactIngressService:
+    return TradingFactIngressService(
+        lambda: TradingFactsUnitOfWork(factory),
+        TradingFactMapper(),
+        now=lambda: NOW,
+        environment="PROD",
+    )
+
+
+def seed_fact_submit_reservation(
+    factory: sessionmaker[Session],
+    *,
+    state: str = "IN_FLIGHT",
+    runtime_id: UUID = RUNTIME_A,
+    generation: int = 1,
+    recovery_only: bool = False,
+    reservation_payload: dict[str, object] | None = None,
+) -> None:
+    with factory.begin() as session:
+        broker = session.get_one(UserBrokerModel, str(SCOPE_ID))
+        broker.environment = "PROD"
+        broker.fqdn = "invest-public-api.tbank.ru:443"
+
+        def runtime_model(runtime: UUID, status: str, runtime_generation: int) -> WorkerRuntimeInstanceModel:
+            return WorkerRuntimeInstanceModel(
+                runtime_instance_id=str(runtime),
+                user_broker_id=str(SCOPE_ID),
+                worker_id="worker-prod",
+                environment="PROD",
+                access_mode="TRADE",
+                strategy_enabled=True,
+                secret_digest="c" * 64,
+                registration_status=status,
+                generation=runtime_generation,
+                registered_at=NOW,
+                last_seen_at=NOW,
+                lease_expires_at=NOW - timedelta(seconds=1) if status == "OWNER" else None,
+                retired_at=NOW if status == "RETIRED" else None,
+            )
+
+        if runtime_id != RUNTIME_A:
+            session.add(runtime_model(RUNTIME_A, "RETIRED", 1))
+        session.add(runtime_model(runtime_id, "OWNER", generation))
+        session.flush()
+        session.add(
+            TradingAccountAdmissionModel(
+                user_broker_id=str(SCOPE_ID),
+                revision=1,
+                owner_runtime_instance_id=str(runtime_id),
+                owner_generation=generation,
+                recovery_runtime_instance_id=str(runtime_id) if recovery_only else None,
+                admission_status="STOP_REQUIRED" if recovery_only else "DISARMED",
+                recovery_only=recovery_only,
+                lease_expires_at=NOW - timedelta(seconds=1),
+                arm_revision=None,
+                arm_expires_at=None,
+                limits=None,
+                configuration_fingerprint=None,
+                baseline_id=None,
+                reconciliation_id=None,
+            )
+        )
+        session.add(
+            TradingSubmitReservationModel(
+                reservation_id=str(PERMIT_ID),
+                user_broker_id=str(SCOPE_ID),
+                automation_id=str(AUTOMATION_A),
+                idempotency_key=str(SUBMIT_KEY),
+                request_fingerprint=REQUEST_FINGERPRINT,
+                state=state,
+                runtime_instance_id=str(RUNTIME_A),
+                generation=1,
+                configuration_fingerprint=CONFIGURATION_FINGERPRINT,
+                permit_id=str(PERMIT_ID),
+                side="BUY",
+                instrument_uid="external-canary",
+                quantity_lots=1,
+                limit_price=Decimal("100"),
+                requested_amount=Decimal("1000"),
+                reserved_cash=Decimal("1001"),
+                reserved_position_units=Decimal(0),
+                payload=reservation_payload
+                or {
+                    "executed_lots": 0,
+                    "executed_amount": "0",
+                    "executed_commission": "0",
+                    "anchor_executed_lots": 0,
+                },
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+
+def proof_fact(*, proof: PreRpcAbortProof | None = None) -> BrokerOrderStateChangedEnvelope:
+    order = order_payload_values()
+    order.update(
+        {
+            "idempotency_key": str(SUBMIT_KEY),
+            "instrument_id": INSTRUMENT_A,
+            "state": FactBrokerOrderStatus.CANCELLED,
+            "quantity_lots": 1,
+            "requested_amount": Decimal("1000"),
+            "executed_amount": Decimal("0"),
+            "estimated_commission": Decimal("1"),
+            "executed_commission": Decimal("0"),
+            "updated_at": NOW + timedelta(seconds=2),
+            "terminal_at": NOW + timedelta(seconds=2),
+        }
+    )
+    return BrokerOrderStateChangedEnvelope(
+        event_id=UUID("00000000-0000-4000-8000-000000000295"),
+        user_broker_id=SCOPE_ID,
+        automation_id=AUTOMATION_A,
+        sequence_number=5,
+        expected_revision=1,
+        safe_message="Synthetic pre-RPC abort",
+        occurred_at=NOW + timedelta(seconds=2),
+        fact_kind=FactKind.BROKER_ORDER_STATE_CHANGED,
+        payload=BrokerOrderStateChangedPayload(
+            **{key: value for key, value in order.items() if key != "created_at"},
+            order_event_id=UUID("00000000-0000-4000-8000-000000000296"),
+            broker_order_id=ORDER_ID,
+            from_state=FactBrokerOrderStatus.SUBMITTING,
+            to_state=FactBrokerOrderStatus.CANCELLED,
+            safe_reason="PERMIT_EXPIRED_BEFORE_POST",
+            safe_message="Broker order was not sent",
+            occurred_at=NOW + timedelta(seconds=2),
+            created_at=NOW + timedelta(seconds=2),
+            pre_rpc_abort_proof=proof,
+        ),
+    )
+
+
+def admit_order_prefix(factory: sessionmaker[Session], runtime_id: UUID = RUNTIME_A, generation: int = 1) -> None:
+    facts = complete_fact_sequence()[:4]
+    order = facts[2].payload.model_copy(update={"idempotency_key": str(SUBMIT_KEY)})
+    facts[2] = facts[2].model_copy(update={"payload": order})
+    changed = facts[3].payload.model_copy(update={"idempotency_key": str(SUBMIT_KEY)})
+    facts[3] = facts[3].model_copy(update={"payload": changed})
+    accepted = production_fact_service(factory).publish(
+        facts[:3], runtime_instance_id=runtime_id, generation=generation
+    )
+    assert accepted.failures == ()
+    accepted_state = production_fact_service(factory).publish(
+        [facts[3]], runtime_instance_id=runtime_id, generation=generation
+    )
+    assert accepted_state.failures == ()
+
+
+def valid_abort_proof(**changes: object) -> PreRpcAbortProof:
+    values: dict[str, object] = {
+        "permit_id": PERMIT_ID,
+        "idempotency_key": SUBMIT_KEY,
+        "request_fingerprint": REQUEST_FINGERPRINT,
+        "runtime_instance_id": RUNTIME_A,
+        "generation": 1,
+        "configuration_fingerprint": CONFIGURATION_FINGERPRINT,
+        "aborted_at": NOW + timedelta(seconds=2),
+        "reason": "PERMIT_EXPIRED_BEFORE_POST",
+    }
+    values.update(changes)
+    return PreRpcAbortProof(**values)
+
+
+def test_prod_fact_ingress_requires_the_authenticated_runtime(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    fact = state_fact(AUTOMATION_A, event_id=UUID("00000000-0000-4000-8000-000000000299"))
+
+    result = production_fact_service(factory).publish([fact])
+
+    assert result.results == ()
+    assert result.failures[0].code is FactIngressErrorCode.TEMPORARY_CORE_FAILURE
+    assert result.failures[0].retryable is True
+    with factory() as session:
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+        assert automation.last_sequence_number == 0
+        assert automation.revision == 1
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 0
+
+
+@pytest.mark.parametrize(
+    ("reservation_state", "reservation_payload"),
+    [
+        ("IN_FLIGHT", None),
+        (
+            "UNKNOWN",
+            {"executed_lots": 0, "executed_amount": "0", "executed_commission": "0", "anchor_executed_lots": 0},
+        ),
+    ],
+)
+def test_exact_pre_rpc_proof_consumes_reservation_and_is_idempotent(
+    database, reservation_state, reservation_payload
+) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory, state=reservation_state, reservation_payload=reservation_payload)
+    admit_order_prefix(factory)
+    fact = proof_fact(proof=valid_abort_proof())
+    adapter = production_fact_service(factory)
+
+    accepted = adapter.publish([fact], runtime_instance_id=RUNTIME_A, generation=1)
+    replay = adapter.publish([fact], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert accepted.failures == replay.failures == ()
+    assert accepted.results[0].accepted_through_sequence == 5
+    assert replay.results[0].accepted_event_ids == (fact.event_id,)
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+        assert reservation.state == "CONFIRMED_NOT_SENT"
+        assert reservation.reserved_cash == reservation.reserved_position_units == 0
+        assert automation.last_sequence_number == 5
+        assert automation.revision == 1
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 5
+
+
+def test_pre_rpc_proof_rejects_attribution_created_earlier_in_same_group_and_rolls_back(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    response = proof_fact().model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000297"),
+            "sequence_number": 5,
+            "payload": proof_fact().payload.model_copy(
+                update={
+                    "state": FactBrokerOrderStatus.ACCEPTED,
+                    "to_state": FactBrokerOrderStatus.ACCEPTED,
+                    "broker_responded_at": NOW + timedelta(seconds=1),
+                    "updated_at": NOW + timedelta(seconds=1),
+                    "terminal_at": None,
+                    "order_event_id": UUID("00000000-0000-4000-8000-000000000298"),
+                    "safe_reason": "BROKER_ACCEPTED",
+                }
+            ),
+        }
+    )
+    abort = proof_fact(proof=valid_abort_proof()).model_copy(
+        update={
+            "sequence_number": 6,
+            "payload": proof_fact(proof=valid_abort_proof()).payload.model_copy(
+                update={"from_state": FactBrokerOrderStatus.ACCEPTED}
+            ),
+        }
+    )
+
+    result = production_fact_service(factory).publish([response, abort], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert result.results == ()
+    assert result.failures[0].code is FactIngressErrorCode.INVALID_FACT_STATE
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+        assert reservation.state == "IN_FLIGHT"
+        assert reservation.reserved_cash == Decimal("1001")
+        assert (order.state, order.broker_responded_at, order.executed_amount) == (
+            "SUBMITTING",
+            None,
+            Decimal(0),
+        )
+        assert (automation.last_sequence_number, automation.revision) == (4, 1)
+        assert session.scalar(select(func.count()).select_from(BrokerOrderEventModel)) == 1
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 4
+
+
+@pytest.mark.parametrize(
+    "order_changes",
+    [
+        {"external_order_id": "broker-order-123"},
+        {"executed_amount": Decimal("100"), "executed_commission": Decimal("1")},
+        {"executed_commission": Decimal("1")},
+        {"executed_at": NOW + timedelta(seconds=1)},
+        {"broker_responded_at": NOW + timedelta(seconds=1)},
+    ],
+)
+def test_pre_rpc_proof_rejects_existing_attributed_core_order(database, order_changes) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    with factory.begin() as session:
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        for name, value in order_changes.items():
+            setattr(order, name, value)
+
+    result = production_fact_service(factory).publish(
+        [proof_fact(proof=valid_abort_proof())], runtime_instance_id=RUNTIME_A, generation=1
+    )
+
+    assert result.results == ()
+    assert result.failures[0].code is FactIngressErrorCode.INVALID_FACT_STATE
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "IN_FLIGHT"
+        assert reservation.reserved_cash == Decimal("1001")
+        assert session.get_one(TradingAutomationModel, str(AUTOMATION_A)).last_sequence_number == 4
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 4
+
+
+def test_pre_rpc_proof_rejects_any_existing_core_execution(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    with factory.begin() as session:
+        session.add(
+            TradeExecutionModel(
+                id="00000000-0000-4000-8000-000000000008",
+                fact_id="pre-existing-execution",
+                user_broker_id=str(SCOPE_ID),
+                automation_id=str(AUTOMATION_A),
+                broker_order_id=str(ORDER_ID),
+                position_cycle_id=str(CYCLE_ID),
+                instrument_id=str(INSTRUMENT_A),
+                external_execution_id="broker-execution-123",
+                side="BUY",
+                executed_lots=1,
+                price=Decimal("100"),
+                value=Decimal("1000"),
+                broker_commission=Decimal("1"),
+                other_fees=Decimal(0),
+                currency="RUB",
+                source="BROKER_FILL",
+                executed_at=NOW,
+                created_at=NOW,
+            )
+        )
+
+    result = production_fact_service(factory).publish(
+        [proof_fact(proof=valid_abort_proof())], runtime_instance_id=RUNTIME_A, generation=1
+    )
+
+    assert result.results == ()
+    assert result.failures[0].code is FactIngressErrorCode.INVALID_FACT_STATE
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "IN_FLIGHT"
+        assert reservation.reserved_cash == Decimal("1001")
+        assert session.get_one(TradingAutomationModel, str(AUTOMATION_A)).last_sequence_number == 4
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 4
+
+
+@pytest.mark.parametrize(
+    "order_changes",
+    [
+        {"side": "SELL"},
+        {"limit_price": Decimal("101")},
+        {"requested_amount": Decimal("1001")},
+    ],
+)
+def test_pre_rpc_proof_rejects_core_order_economic_identity_mismatch(database, order_changes) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    with factory.begin() as session:
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        for name, value in order_changes.items():
+            setattr(order, name, value)
+
+    result = production_fact_service(factory).publish(
+        [proof_fact(proof=valid_abort_proof())], runtime_instance_id=RUNTIME_A, generation=1
+    )
+
+    assert result.results == ()
+    assert result.failures[0].code is FactIngressErrorCode.INVALID_FACT_STATE
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "IN_FLIGHT"
+        assert session.get_one(TradingAutomationModel, str(AUTOMATION_A)).last_sequence_number == 4
+
+
+@pytest.mark.parametrize(
+    ("proof_changes", "reservation_state", "reservation_payload"),
+    [
+        ({"permit_id": UUID("00000000-0000-4000-8000-000000000297")}, "IN_FLIGHT", None),
+        ({"request_fingerprint": "d" * 64}, "IN_FLIGHT", None),
+        ({"runtime_instance_id": RUNTIME_B}, "IN_FLIGHT", None),
+        ({"generation": 2}, "IN_FLIGHT", None),
+        ({"configuration_fingerprint": "e" * 64}, "IN_FLIGHT", None),
+        ({}, "BROKER_ACTIVE", None),
+        ({}, "UNKNOWN", {"executed_lots": 1, "executed_amount": "100", "executed_commission": "1"}),
+        (
+            {},
+            "UNKNOWN",
+            {
+                "executed_lots": 0,
+                "executed_amount": "0",
+                "executed_commission": "0",
+                "last_reconciled_order_state": "NEW",
+            },
+        ),
+    ],
+)
+def test_invalid_abort_proof_never_releases_reservation_or_partially_applies_group(
+    database, proof_changes, reservation_state, reservation_payload
+) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(
+        factory,
+        state=reservation_state,
+        reservation_payload=reservation_payload,
+    )
+    admit_order_prefix(factory)
+    before = complete_fact_sequence()[8].model_copy(
+        update={"event_id": UUID("00000000-0000-4000-8000-000000000298"), "sequence_number": 5}
+    )
+    proof = proof_fact(proof=valid_abort_proof(**proof_changes))
+    proof = proof.model_copy(update={"sequence_number": 6})
+
+    result = production_fact_service(factory).publish([before, proof], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert result.results == ()
+    assert result.failures[0].retryable is False
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+        assert reservation.state == reservation_state
+        assert reservation.reserved_cash == Decimal("1001")
+        assert automation.last_sequence_number == 4
+        assert automation.revision == 1
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 4
+
+
+def test_generic_cancelled_fact_does_not_settle_a_submit_reservation(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    fact = proof_fact()
+
+    result = production_fact_service(factory).publish([fact], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert result.failures == ()
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "IN_FLIGHT"
+        assert reservation.reserved_cash == Decimal("1001")
+
+
+def test_recovery_owner_can_accept_original_retired_runtime_proof(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory, runtime_id=RUNTIME_B, generation=2, recovery_only=True)
+    admit_order_prefix(factory, runtime_id=RUNTIME_B, generation=2)
+
+    result = production_fact_service(factory).publish(
+        [proof_fact(proof=valid_abort_proof())],
+        runtime_instance_id=RUNTIME_B,
+        generation=2,
+    )
+
+    assert result.failures == ()
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "CONFIRMED_NOT_SENT"
+        assert reservation.reserved_cash == 0
+
+
+def test_retired_runtime_cannot_publish_even_an_exact_proof_replay(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    fact = proof_fact(proof=valid_abort_proof())
+    service_value = production_fact_service(factory)
+    accepted = service_value.publish([fact], runtime_instance_id=RUNTIME_A, generation=1)
+    assert accepted.failures == ()
+
+    with factory.begin() as session:
+        old_owner = session.get_one(WorkerRuntimeInstanceModel, str(RUNTIME_A))
+        old_owner.registration_status = "RETIRED"
+        old_owner.retired_at = NOW + timedelta(seconds=3)
+        old_owner.lease_expires_at = None
+        session.add(
+            WorkerRuntimeInstanceModel(
+                runtime_instance_id=str(RUNTIME_B),
+                user_broker_id=str(SCOPE_ID),
+                worker_id="worker-prod",
+                environment="PROD",
+                access_mode="TRADE",
+                strategy_enabled=True,
+                secret_digest="d" * 64,
+                registration_status="OWNER",
+                generation=2,
+                registered_at=NOW,
+                last_seen_at=NOW,
+                lease_expires_at=NOW + timedelta(seconds=30),
+                retired_at=None,
+            )
+        )
+        admission = session.get_one(TradingAccountAdmissionModel, str(SCOPE_ID))
+        admission.owner_runtime_instance_id = str(RUNTIME_B)
+        admission.owner_generation = 2
+        admission.recovery_runtime_instance_id = str(RUNTIME_B)
+        admission.recovery_only = True
+        admission.admission_status = "STOP_REQUIRED"
+
+    replay = service_value.publish([fact], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert replay.results == ()
+    assert replay.failures[0].code is FactIngressErrorCode.TEMPORARY_CORE_FAILURE
+    assert replay.failures[0].retryable is True
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "CONFIRMED_NOT_SENT"
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 5
+
+
+def test_confirmed_not_sent_rejects_a_new_event_for_the_consumed_permanent_key(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    service_value = production_fact_service(factory)
+    first = proof_fact(proof=valid_abort_proof())
+    assert service_value.publish([first], runtime_instance_id=RUNTIME_A, generation=1).failures == ()
+    new_event = proof_fact(proof=valid_abort_proof()).model_copy(
+        update={"event_id": UUID("00000000-0000-4000-8000-000000000297"), "sequence_number": 6}
+    )
+
+    result = service_value.publish([new_event], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert result.results == ()
+    assert result.failures[0].retryable is False
+    with factory() as session:
+        reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+            )
+        )
+        assert reservation.state == "CONFIRMED_NOT_SENT"
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 5
 
 
 @pytest.mark.parametrize("initial_state", [AutomationState.CLOSED, AutomationState.HOLD])
@@ -311,6 +892,29 @@ def test_publish_accepts_state_fact_and_exact_retry_once(database: tuple[Engine,
         assert automation.revision == 2
         assert automation.last_sequence_number == 1
         assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 1
+
+
+def test_settings_update_preserves_execution_revision_for_pending_facts(
+    database: tuple[Engine, sessionmaker[Session]],
+) -> None:
+    _, factory = database
+    AutomationRepository(factory).update_settings(
+        str(AUTOMATION_A),
+        expected_revision=1,
+        expected_settings_revision=0,
+        order_quota_percent=Decimal("10"),
+    )
+    pending_fact = state_fact(AUTOMATION_A, event_id=UUID("00000000-0000-4000-8000-000000000216"))
+
+    result = service(factory).publish([pending_fact])
+
+    assert result.failures == ()
+    assert result.results[0].current_revision == 2
+    with factory() as session:
+        automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+        assert automation.revision == 2
+        assert automation.settings_revision == 1
+        assert automation.order_quota_percent == Decimal("10")
 
 
 def test_failed_group_does_not_rollback_successful_peer(database: tuple[Engine, sessionmaker[Session]]) -> None:

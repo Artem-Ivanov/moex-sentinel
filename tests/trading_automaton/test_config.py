@@ -42,6 +42,62 @@ def test_settings_reject_postgresql_for_worker_storage() -> None:
         AutomatonSettings(AUTOMATON_DATABASE_URL="postgresql+psycopg://database/worker")
 
 
+def test_prod_trade_requires_a_valid_core_worker_credential_tuple() -> None:
+    with pytest.raises(ValidationError, match="PROD requires Core worker credentials"):
+        AutomatonSettings(
+            APPLICATION_ENVIRONMENT="PROD",
+            BROKER_ACCESS_MODE="TRADE",
+            AUTOMATON_WORKER_ID="worker-a",
+            INTERNAL_WORKER_ID="worker-b",
+            INTERNAL_WORKER_BROKER_ID="00000000-0000-4000-8000-000000000001",
+            INTERNAL_WORKER_TOKEN="a" * 64,
+        )
+
+
+def test_test_settings_allow_empty_production_identity_values() -> None:
+    settings = AutomatonSettings(
+        APPLICATION_ENVIRONMENT="TEST",
+        BROKER_ACCESS_MODE="READ_ONLY",
+        INTERNAL_WORKER_ID="",
+        INTERNAL_WORKER_BROKER_ID="",
+        INTERNAL_WORKER_TOKEN="",
+    )
+    assert settings.internal_worker_id is None
+    assert settings.internal_worker_broker_id is None
+    assert settings.internal_worker_token is None
+
+
+def test_prod_modes_require_authenticated_runtime_identity() -> None:
+    with pytest.raises(ValidationError, match="PROD requires Core worker credentials"):
+        AutomatonSettings(APPLICATION_ENVIRONMENT="PROD", BROKER_ACCESS_MODE="READ_ONLY")
+
+    settings = AutomatonSettings(
+        APPLICATION_ENVIRONMENT="PROD",
+        BROKER_ACCESS_MODE="READ_ONLY",
+        AUTOMATON_WORKER_ID="worker-a",
+        INTERNAL_WORKER_ID="worker-a",
+        INTERNAL_WORKER_BROKER_ID="00000000-0000-4000-8000-000000000001",
+        INTERNAL_WORKER_TOKEN="a" * 64,
+    )
+    assert settings.internal_worker_id == "worker-a"
+    assert settings.internal_worker_token is not None
+    assert "a" * 64 not in repr(settings)
+
+
+def test_prod_validation_errors_hide_runtime_credentials() -> None:
+    secret = "f" * 64
+    with pytest.raises(ValidationError) as error:
+        AutomatonSettings(
+            APPLICATION_ENVIRONMENT="PROD",
+            BROKER_ACCESS_MODE="TRADE",
+            AUTOMATON_WORKER_ID="worker-a",
+            INTERNAL_WORKER_ID="worker-a",
+            INTERNAL_WORKER_BROKER_ID="not-a-uuid",
+            INTERNAL_WORKER_TOKEN=secret,
+        )
+    assert secret not in str(error.value)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

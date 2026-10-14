@@ -19,11 +19,18 @@ from sqlalchemy.engine import URL
 
 from moex_sentinel import __version__
 from moex_sentinel.adapters.analytics_version import AnalyticsVersionClient
+from moex_sentinel.adapters.telegram_alerts import create_telegram_alert_transport
 from moex_sentinel.api.auth import OperatorAuth
 from moex_sentinel.api.sync_execution import SyncExecutor
+from moex_sentinel.api.worker_auth import WorkerAuthenticationError, WorkerAuthenticator
 from moex_sentinel.config import Settings
+from moex_sentinel.domain.daily_admission_preparation import (
+    DailyAdmissionPreparationReason,
+    DailyAdmissionPreparationStatus,
+)
 from moex_sentinel.services.runtime_versions import WorkerVersionStore
-from moex_sentinel.services.sync_execution import bind_sync_runner
+from moex_sentinel.services.sync_execution import bind_sync_runner, run_sync
+from moex_sentinel.services.trading_readiness_alerts import ReadinessObservation, TradingReadinessAlertService
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
 from moex_sentinel.usecases.diagnostics import GetDiagnosticsStatusUsecase
@@ -38,17 +45,106 @@ from moex_sentinel.views.health import router as health_router
 from moex_sentinel.views.instruments import router as instrument_router
 from moex_sentinel.views.internal_automaton import router as internal_automaton_router
 from moex_sentinel.views.internal_market import router as internal_market_router
+from moex_sentinel.views.internal_trading_admission import router as internal_trading_admission_router
 from moex_sentinel.views.internal_trading_facts import router as internal_trading_facts_router
 from moex_sentinel.views.market_data import router as market_data_router
 from moex_sentinel.views.portfolio import router as portfolio_router
+from moex_sentinel.views.trading_admission import router as trading_admission_router
 from moex_sentinel.views.trading_summary import router as trading_summary_router
 from sentinel_contracts.audit import (
     audit_event,
     business_process,
     configure_logging,
 )
+from sentinel_contracts.time import utc_now_ms
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _preparation_alert_fields(preparation):
+    if preparation.status is DailyAdmissionPreparationStatus.PREPARED:
+        return "READY", "ARM_REQUIRED"
+    if preparation.status in {
+        DailyAdmissionPreparationStatus.DISABLED,
+        DailyAdmissionPreparationStatus.WAITING,
+    }:
+        reason = preparation.reason
+        return "UNKNOWN", "NOT_OBSERVED" if reason is DailyAdmissionPreparationReason.NOT_OBSERVED else "UNKNOWN"
+    reason_map = {
+        DailyAdmissionPreparationReason.OWNER_MISSING: "OWNER_MISSING",
+        DailyAdmissionPreparationReason.OWNER_MISMATCH: "OWNER_MISMATCH",
+        DailyAdmissionPreparationReason.LEASE_EXPIRED: "LEASE_EXPIRED",
+        DailyAdmissionPreparationReason.BASELINE_REQUIRED: "BASELINE_MISSING",
+        DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED: "RECONCILIATION_REQUIRED",
+        DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED: "RECONCILIATION_REQUIRED",
+        DailyAdmissionPreparationReason.ARM_REQUIRED: "ARM_REQUIRED",
+        DailyAdmissionPreparationReason.CORE_UNAVAILABLE: "CORE_UNAVAILABLE",
+        DailyAdmissionPreparationReason.SNAPSHOT_INVALID: "MARKET_STALE",
+        DailyAdmissionPreparationReason.SNAPSHOT_EXPIRED: "MARKET_STALE",
+        DailyAdmissionPreparationReason.MOSCOW_DAY_CHANGED: "BASELINE_MISSING",
+        DailyAdmissionPreparationReason.RISK_DATA_UNKNOWN: "MARKET_STALE",
+    }
+    if preparation.reason is DailyAdmissionPreparationReason.RECOVERY_REQUIRED:
+        return "PENDING", "ARM_REQUIRED"
+    if preparation.reason is DailyAdmissionPreparationReason.SCOPE_UNAVAILABLE:
+        return "UNKNOWN", "UNKNOWN"
+    reason = reason_map.get(preparation.reason, "UNKNOWN")
+    return ("FAILED", reason) if reason != "UNKNOWN" else ("UNKNOWN", reason)
+
+
+def _build_readiness_observer(usecases, worker_versions, broker_id: str | None):
+    async def observe() -> ReadinessObservation:
+        _, worker = worker_versions.diagnostics_snapshot()
+        now = utc_now_ms()
+        if broker_id is None:
+            return ReadinessObservation(
+                captured_at=now,
+                worker=worker,
+                account_status="UNKNOWN",
+                account_effective_can_submit=None,
+                recovery_only=False,
+                preparation_status="UNKNOWN",
+                preparation_reason="OWNER_MISSING",
+            )
+        try:
+            account = await run_sync(partial(usecases.trading_admission.view, broker_id))
+        except Exception:
+            account = None
+        try:
+            preparation = await usecases.daily_admission_preparation.snapshot(broker_id)
+        except Exception:
+            preparation = None
+        if account is None:
+            account_status = "UNKNOWN"
+            effective = None
+            recovery_only = False
+        else:
+            account_status = account.admission_status.value
+            effective = account.effective_can_submit
+            recovery_only = account.recovery_only
+        if preparation is None:
+            prep_status, prep_reason = "FAILED", "CORE_UNAVAILABLE"
+        else:
+            prep_status, prep_reason = _preparation_alert_fields(preparation)
+            if (
+                account is not None
+                and account.admission_status.value == "ARMED"
+                and account.effective_can_submit is True
+                and preparation.reason is DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED
+            ):
+                prep_status, prep_reason = "PENDING", "ARM_REQUIRED"
+        return ReadinessObservation(
+            captured_at=now,
+            worker=worker,
+            account_status=account_status,
+            account_effective_can_submit=effective,
+            recovery_only=recovery_only,
+            preparation_status=prep_status,
+            preparation_reason=prep_reason,
+        )
+
+    return observe
+
 
 if TYPE_CHECKING:
     from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
@@ -112,12 +208,19 @@ def create_app(
         executor = None
         market_gateway = None
         analytics_http = None
+        background_tasks: list[asyncio.Task[None]] = []
+        readiness_alert_service = None
         try:
             executor = SyncExecutor(capacity=4)
             application.state.sync_executor = executor
             application.state.session_factory = create_session_factory(engine)
             application.state.usecases = build_application_usecases(
                 application.state.session_factory, settings=settings
+            )
+            application.state.worker_authenticator = getattr(
+                application.state.usecases,
+                "worker_authenticator",
+                WorkerAuthenticator(settings, lambda _runtime_id: None),
             )
             market_gateway = build_market_snapshot_gateway(
                 application.state.session_factory, retry_limit=settings.sandbox_retry_limit, settings=settings
@@ -137,6 +240,39 @@ def create_app(
                 settings.broker_access_mode,
                 worker_observations=application.state.worker_versions.diagnostics_snapshot,
             )
+            application.state.daily_admission_preparation = application.state.usecases.daily_admission_preparation
+            alert_transport = (
+                create_telegram_alert_transport(
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    run_sync=executor.run,
+                )
+                if settings.telegram_alerts_enabled
+                else None
+            )
+            readiness_alert_service = TradingReadinessAlertService(
+                _build_readiness_observer(
+                    application.state.usecases,
+                    application.state.worker_versions,
+                    None if settings.internal_worker_broker_id is None else str(settings.internal_worker_broker_id),
+                ),
+                alert_transport,
+                environment=settings.application_environment,
+                enabled=settings.telegram_alerts_enabled,
+            )
+            application.state.trading_readiness_alert_service = readiness_alert_service
+            with bind_sync_runner(executor.run):
+                if settings.daily_admission_preparation_enabled:
+                    background_tasks.append(
+                        asyncio.create_task(
+                            application.state.daily_admission_preparation.run(),
+                            name="daily-admission-preparation",
+                        )
+                    )
+                if settings.telegram_alerts_enabled:
+                    background_tasks.append(
+                        asyncio.create_task(readiness_alert_service.run(), name="trading-readiness-alerts")
+                    )
             with business_process():
                 audit_event(LOGGER, "APPLICATION_STARTED", "Backend application started")
             yield
@@ -144,20 +280,28 @@ def create_app(
 
             async def cleanup() -> None:
                 try:
-                    if executor is not None:
-                        await executor.aclose()
+                    for task in background_tasks:
+                        task.cancel()
+                    if readiness_alert_service is not None:
+                        await readiness_alert_service.close()
+                    if background_tasks:
+                        await asyncio.gather(*background_tasks, return_exceptions=True)
                 finally:
                     try:
-                        if analytics_http is not None:
-                            await analytics_http.aclose()
+                        if executor is not None:
+                            await executor.aclose()
                     finally:
                         try:
-                            if market_gateway is not None:
-                                await market_gateway.close()
+                            if analytics_http is not None:
+                                await analytics_http.aclose()
                         finally:
-                            with business_process():
-                                audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")
-                            engine.dispose()
+                            try:
+                                if market_gateway is not None:
+                                    await market_gateway.close()
+                            finally:
+                                with business_process():
+                                    audit_event(LOGGER, "APPLICATION_STOPPED", "Backend application stopped")
+                                engine.dispose()
 
             cleanup_task = asyncio.create_task(cleanup())
             cancelled = False
@@ -175,6 +319,7 @@ def create_app(
         version=__version__,
         lifespan=lifespan,
     )
+    application.state.settings = settings
 
     class LoginBody(BaseModel):
         username: str = Field(max_length=64)
@@ -216,6 +361,51 @@ def create_app(
         if path != "/api/health":
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @application.middleware("http")
+    async def protect_internal_worker_api(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        path = request.url.path
+        if settings.application_environment != "PROD" or not (
+            path == "/internal/automaton/heartbeats"
+            or path.startswith(
+                (
+                    "/internal/automaton/brokers/",
+                    "/internal/automaton/runtime-instances",
+                    "/internal/trading-admission/",
+                )
+            )
+            or path
+            in {
+                "/internal/automation-commands",
+                "/internal/automation-statuses",
+                "/internal/automation-facts",
+            }
+        ):
+            return await call_next(request)
+
+        authenticator = request.app.state.worker_authenticator
+        authorization = request.headers.get("Authorization")
+        try:
+            if path == "/internal/automaton/runtime-instances" and request.method == "POST":
+                authenticator.verify_enrollment(authorization)
+            else:
+                request.state.worker_principal = await request.app.state.sync_executor.run(
+                    partial(
+                        authenticator.authenticate,
+                        authorization=authorization,
+                        runtime_instance_header=request.headers.get("X-Runtime-Instance-ID"),
+                        runtime_secret=request.headers.get("X-Runtime-Secret"),
+                    )
+                )
+        except WorkerAuthenticationError:
+            return JSONResponse(
+                {"detail": "Worker authentication required"},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        return await call_next(request)
 
     @application.post("/api/auth/login")
     async def login(body: LoginBody, request: Request) -> Response:
@@ -319,11 +509,13 @@ def create_app(
     application.include_router(broker_router, prefix="/api")
     application.include_router(portfolio_router, prefix="/api")
     application.include_router(trading_summary_router, prefix="/api")
+    application.include_router(trading_admission_router, prefix="/api")
     application.include_router(market_data_router, prefix="/api")
     application.include_router(instrument_router, prefix="/api")
     application.include_router(automation_router, prefix="/api")
     application.include_router(internal_automaton_router)
     application.include_router(internal_trading_facts_router)
+    application.include_router(internal_trading_admission_router)
     application.include_router(internal_market_router)
     return application
 

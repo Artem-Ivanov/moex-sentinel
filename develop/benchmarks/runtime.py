@@ -24,9 +24,11 @@ from moex_sentinel.storage.models import BrokerInstrumentModel, TradingAutomatio
 from moex_sentinel.storage.models import TradeDecisionModel as CoreDecisionModel
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from sentinel_contracts.broker_execution import BrokerConnection
+from sentinel_contracts.tinvest import TINVEST_TARGETS
 from trading_automaton.adapters.analytics_client import AnalyticsClient
 from trading_automaton.composition import build_broker_runtime
 from trading_automaton.config import StrategySettings
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.domain.storage_dtos import TradingCycleState
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.storage.database import create_worker_engine
@@ -82,7 +84,7 @@ class CoreDelivery:
         require(not result.failures, "Core rejected synthetic facts")
         if self.lose_ack:
             self.pending_replay = {fact.event_id: fact.model_dump(mode="json") for fact in facts}
-            raise httpx.ReadTimeout("Synthetic response loss after commit")
+            raise CoreOperationError(retryable=True) from httpx.ReadTimeout("Synthetic response loss after commit")
         for fact in facts:
             original = self.pending_replay.pop(fact.event_id, None)
             if original is not None:
@@ -123,7 +125,7 @@ class Harness:
                     api_slug="t_invest",
                     display_name="Synthetic benchmark",
                     environment="TEST",
-                    fqdn="unused.invalid",
+                    fqdn=TINVEST_TARGETS["TEST"],
                     settings={},
                     external_account_id=first.account_id,
                     state="ACTIVE",
@@ -189,9 +191,18 @@ class Harness:
             base_url="http://analytics.invalid",
         )
         self.bundle = await build_broker_runtime(
-            BrokerConnection(str(self.values[0].broker_id), "TINVEST_SANDBOX", "unused.invalid", "synthetic", True),
+            BrokerConnection(
+                str(self.values[0].broker_id),
+                "TINVEST_SANDBOX",
+                TINVEST_TARGETS["TEST"],
+                "synthetic",
+                True,
+                environment="TEST",
+                access_mode="TRADE",
+            ),
             self.repository,
             strategy_settings=strategy_settings(),
+            worker_access_mode="TRADE",
             session_factory=lambda _: self.broker,
             now=lambda: self.market.now,
             analytics_client=AnalyticsClient(self.client),

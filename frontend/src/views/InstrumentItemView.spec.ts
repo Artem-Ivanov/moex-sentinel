@@ -280,6 +280,7 @@ it("keeps one candle request in flight and does not resume polling after unmount
 })
 
 it("creates trading automation for a user-selected account", async () => {
+  runtime.value = { environment: "PROD", access_mode: "TRADE" }
   const fetchMock = vi.fn()
     .mockResolvedValueOnce(Response.json(details))
     .mockResolvedValueOnce(Response.json(candles))

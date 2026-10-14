@@ -56,6 +56,8 @@ def _history() -> IntentHistory:
 class _SpyPlanner:
     def __init__(self) -> None:
         self.last_cycle = None
+        self.last_available_free_cash = None
+        self.last_positive_position_count = None
 
     async def plan(
         self,
@@ -69,8 +71,12 @@ class _SpyPlanner:
         indicators,
         session_open: bool,
         estimator,
+        available_free_cash: Decimal = Decimal(),
+        positive_position_count: int | None = None,
     ):
         self.last_cycle = cycle
+        self.last_available_free_cash = available_free_cash
+        self.last_positive_position_count = positive_position_count
         context = DecisionContext(
             core_available=True,
             has_active_intent=False,
@@ -152,6 +158,8 @@ def test_evaluator_updates_cycle_on_flat_entry() -> None:
             indicators=_indicators(),
             session_open=True,
             estimator=None,
+            available_free_cash=Decimal("321.50"),
+            positive_position_count=4,
         )
     )
 
@@ -160,6 +168,8 @@ def test_evaluator_updates_cycle_on_flat_entry() -> None:
     assert bundle.cycle.last_sell_price == Decimal("102")
     assert isinstance(planner, _SpyPlanner)
     assert planner.last_cycle == bundle.cycle
+    assert planner.last_available_free_cash == Decimal("321.50")
+    assert planner.last_positive_position_count == 4
 
 
 def test_evaluator_rearms_cycle_and_observes_low_for_open_position() -> None:

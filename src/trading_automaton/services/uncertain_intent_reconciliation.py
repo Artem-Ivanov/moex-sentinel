@@ -5,14 +5,28 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sentinel_contracts.broker_errors import BrokerOperationError
-from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
+from sentinel_contracts.broker_execution import (
+    BrokerOrderState,
+    BrokerOrderStatus,
+    BrokerPosition,
+    BrokerRecoveryOperation,
+    OrderSide,
+)
+from sentinel_contracts.broker_order_policy import BROKER_TERMINAL_STATES
 from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.time import floor_utc_millisecond
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAttemptView,
+    SubmitAuthorizationRequest,
+    submit_request_fingerprint,
+)
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.domain.dtos import ReconciliationResult
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.domain.ports import OrderStageAuditPort
 from trading_automaton.domain.storage_dtos import (
     ExecutionFinalization,
@@ -23,6 +37,7 @@ from trading_automaton.domain.storage_dtos import (
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 
 _RECOVERY_NAMESPACE = uuid5(NAMESPACE_URL, "urn:moex-sentinel:worker:uncertain-intent-recovery")
+_BROKER_ONLY_RECOVERY_STATES = {"FAILED", "ACCEPTED", "PARTIALLY_FILLED"}
 
 
 class ReconciliationRepositoryPort(Protocol):
@@ -53,7 +68,17 @@ class ReconciliationBrokerPort(Protocol):
 
 
 class ReconciliationCashPort(Protocol):
-    async def complete(self, intent_id: str, state: str) -> None: ...
+    async def complete(self, intent_id: str, state: BrokerOrderStatus) -> None: ...
+
+
+class ReconciliationAdmissionPort(Protocol):
+    async def submit_attempt(
+        self,
+        idempotency_key: str,
+        *,
+        origin_runtime_instance_id: UUID | None,
+        origin_generation: int | None,
+    ) -> SubmitAttemptView: ...
 
 
 class UncertainIntentReconciliationService:
@@ -68,6 +93,8 @@ class UncertainIntentReconciliationService:
         audit: OrderStageAuditPort | None = None,
         active_intents: ActiveIntentGateService | None = None,
         cash: ReconciliationCashPort | None = None,
+        environment: str = "TEST",
+        admission: ReconciliationAdmissionPort | None = None,
     ) -> None:
         self._repository = repository
         self._broker = broker
@@ -75,6 +102,10 @@ class UncertainIntentReconciliationService:
         self._audit = audit
         self._active_intents = active_intents
         self._cash = cash
+        if environment not in {"TEST", "PROD"}:
+            raise ValueError("Invalid broker environment")
+        self._environment = environment
+        self._admission = admission
         self._attempted: set[str] = set()
         self._retry_after: dict[str, datetime] = {}
 
@@ -88,8 +119,25 @@ class UncertainIntentReconciliationService:
     async def _reconcile_one(self, command: AutomationCommand) -> str:
         automation_id = str(command.automation_id)
         intent = await asyncio.to_thread(self._repository.get_active_intent, automation_id)
-        if intent is None or intent.state != "UNCERTAIN" or intent.idempotency_key in self._attempted:
+        recoverable_states = {"UNCERTAIN", *_BROKER_ONLY_RECOVERY_STATES}
+        if self._environment == "PROD":
+            recoverable_states.update(
+                {
+                    "CREATED",
+                    "DISPATCH_PENDING",
+                    "SUBMITTING",
+                    "SUBMITTED",
+                    "ACCEPTED",
+                    "PARTIALLY_FILLED",
+                    "FILLED",
+                    "REJECTED",
+                    "CANCELLED",
+                    "EXPIRED",
+                }
+            )
+        if intent is None or intent.state not in recoverable_states or intent.idempotency_key in self._attempted:
             return "SKIPPED"
+        broker_only = self._environment == "PROD" or intent.state in _BROKER_ONLY_RECOVERY_STATES
         retry_after = self._retry_after.get(intent.idempotency_key)
         if retry_after is not None and self._now() < retry_after:
             return "SKIPPED"
@@ -108,18 +156,57 @@ class UncertainIntentReconciliationService:
             self._attempted.discard(intent.idempotency_key)
             raise
         try:
-            broker_state, position, operations = await asyncio.gather(
-                self._lookup_broker_state(command, intent),
-                self._broker.inspect_position(command.account_id, command.external_instrument_id),
-                self._broker.inspect_recent_operations(command.account_id, command.external_instrument_id, 100),
-            )
-        except BrokerOperationError as error:
+            if await self._finalize_persisted_pre_rpc_abort(intent, command, process_id):
+                return "RESOLVED"
+            if intent.state != "FAILED" and await self._cancel_if_proven_not_granted(intent, command, process_id):
+                return "RESOLVED"
+            if broker_only:
+                broker_state, position = await asyncio.gather(
+                    self._lookup_broker_state(command, intent),
+                    self._broker.inspect_position(command.account_id, command.external_instrument_id),
+                )
+                operations = ()
+            else:
+                broker_state, position, operations = await asyncio.gather(
+                    self._lookup_broker_state(command, intent),
+                    self._broker.inspect_position(command.account_id, command.external_instrument_id),
+                    self._broker.inspect_recent_operations(command.account_id, command.external_instrument_id, 100),
+                )
+        except (BrokerOperationError, CoreOperationError) as error:
             if error.retryable:
                 self._attempted.discard(intent.idempotency_key)
             raise
         reconciled: BrokerOrderState | None = broker_state
-        if reconciled is None or reconciled.status not in {"FILLED", "REJECTED", "CANCELLED"}:
+        if (
+            broker_only
+            and reconciled is not None
+            and reconciled.status
+            in {
+                "ACCEPTED",
+                "PARTIALLY_FILLED",
+            }
+        ):
+            await asyncio.to_thread(
+                self._repository.update_intent,
+                intent.idempotency_key,
+                state=reconciled.status,
+                occurred_at=self._now(),
+                broker_order_id=reconciled.broker_order_id,
+                requested_amount=reconciled.requested_amount,
+                executed_amount=reconciled.executed_amount,
+                estimated_commission=reconciled.estimated_commission,
+                executed_commission=reconciled.executed_commission,
+                executed_lots=reconciled.executed_lots,
+                executed_price=reconciled.executed_price,
+                executed_at=reconciled.executed_at,
+            )
+            self._retry_after[intent.idempotency_key] = self._now() + timedelta(seconds=10)
+            self._attempted.discard(intent.idempotency_key)
+            return "PENDING"
+        if not broker_only and (reconciled is None or reconciled.status not in BROKER_TERMINAL_STATES):
             reconciled = self._state_from_operations(intent, command, operations)
+        elif reconciled is not None and reconciled.status not in BROKER_TERMINAL_STATES:
+            reconciled = None
         if reconciled is None or not await self._persist_if_consistent(
             intent, command, position, reconciled, process_id
         ):
@@ -165,12 +252,193 @@ class UncertainIntentReconciliationService:
         )
         return "RESOLVED"
 
+    async def _cancel_if_proven_not_granted(
+        self,
+        intent: LocalIntentRecord,
+        command: AutomationCommand,
+        process_id: str,
+    ) -> bool:
+        if self._environment != "PROD" or self._admission is None:
+            return False
+        origin = getattr(intent, "strategy_snapshot", {}).get("admission_origin", {})
+        try:
+            origin_instance_id = UUID(origin["runtime_instance_id"])
+            origin_generation = origin["generation"]
+            if type(origin_generation) is not int or origin_generation <= 0:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        attempt = await self._admission.submit_attempt(
+            intent.idempotency_key,
+            origin_runtime_instance_id=origin_instance_id,
+            origin_generation=origin_generation,
+        )
+        if (
+            not attempt.proven_not_granted
+            or getattr(intent, "executed_lots", 0)
+            or getattr(intent, "broker_order_id", None)
+        ):
+            return False
+        occurred_at = self._now()
+        await asyncio.to_thread(
+            self._repository.update_intent,
+            intent.idempotency_key,
+            state="CANCELLED",
+            occurred_at=occurred_at,
+            requested_amount=intent.requested_amount,
+            terminal_at=occurred_at,
+            process_id=process_id,
+        )
+        if self._cash is not None:
+            await self._cash.complete(intent.idempotency_key, "CANCELLED")
+        if self._active_intents is not None:
+            self._active_intents.clear(str(command.automation_id), intent.idempotency_key)
+        await self._audit_stage(
+            command,
+            process_id,
+            BusinessAuditStage.BROKER_ORDER_TERMINAL_STATE,
+            "Unsent broker intent confirmed by retired Core generation",
+            broker_order_state="CANCELLED",
+            reason_code="SUBMIT_NOT_GRANTED",
+        )
+        await self._audit_stage(
+            command,
+            process_id,
+            BusinessAuditStage.WORKER_RECOVERY_COMPLETED,
+            "Unsent broker intent recovery completed",
+            broker_order_state="CANCELLED",
+            reason_code="SUBMIT_NOT_GRANTED",
+        )
+        return True
+
+    async def _finalize_persisted_pre_rpc_abort(
+        self,
+        intent: LocalIntentRecord,
+        command: AutomationCommand,
+        process_id: str,
+    ) -> bool:
+        if self._environment != "PROD":
+            return False
+        snapshot = getattr(intent, "strategy_snapshot", {})
+        proof_data = snapshot.get("_pre_rpc_abort_proof")
+        origin = snapshot.get("admission_origin")
+        if not isinstance(proof_data, dict) or not isinstance(origin, dict):
+            return False
+        try:
+            proof = PreRpcAbortProof.model_validate(proof_data)
+            runtime_id = UUID(origin["runtime_instance_id"])
+            generation = origin["generation"]
+            revision = origin["revision"]
+            fingerprint = origin["configuration_fingerprint"]
+            lot_size = origin["lot_size"]
+            currency = origin["currency"]
+            instrument_uid = origin["instrument_uid"]
+            fact_instrument_id = UUID(origin["fact_instrument_id"])
+            if (
+                type(generation) is not int
+                or generation <= 0
+                or type(revision) is not int
+                or revision <= 0
+                or type(lot_size) is not int
+                or lot_size <= 0
+                or currency != "RUB"
+                or not isinstance(instrument_uid, str)
+                or not instrument_uid
+            ):
+                return False
+            requested_amount = intent.limit_price * intent.quantity_lots * lot_size
+            if (
+                intent.requested_amount != requested_amount
+                or intent.estimated_commission != 0
+                or intent.executed_amount != 0
+                or intent.executed_commission != 0
+                or intent.executed_price != 0
+            ):
+                return False
+            captured_at = floor_utc_millisecond(self._now())
+            authorization = SubmitAuthorizationRequest(
+                broker_id=command.broker_id,
+                account_id=command.account_id,
+                automation_id=command.automation_id,
+                idempotency_key=UUID(intent.idempotency_key),
+                generation=generation,
+                revision=revision,
+                configuration_fingerprint=fingerprint,
+                instrument_uid=instrument_uid,
+                lot_size=lot_size,
+                currency=currency,
+                side=intent.side,
+                quantity_lots=intent.quantity_lots,
+                limit_price=intent.limit_price,
+                market_valid_until=captured_at,
+                submit_deadline=captured_at,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            proof.idempotency_key != authorization.idempotency_key
+            or proof.runtime_instance_id != runtime_id
+            or proof.generation != generation
+            or proof.configuration_fingerprint != fingerprint
+            or proof.request_fingerprint != submit_request_fingerprint(authorization)
+            or intent.state != "CANCELLED"
+            or intent.broker_order_id not in {None, ""}
+            or intent.executed_lots != 0
+            or proof.reason not in {"PERMIT_EXPIRED_BEFORE_POST", "MARKET_EXPIRED_BEFORE_POST"}
+        ):
+            return False
+        local_state = BrokerOrderState(
+            broker_order_id="",
+            idempotency_key=intent.idempotency_key,
+            status="CANCELLED",
+            requested_lots=intent.quantity_lots,
+            executed_lots=0,
+            requested_amount=intent.requested_amount,
+            executed_amount=Decimal(),
+            estimated_commission=intent.estimated_commission,
+            executed_commission=Decimal(),
+            currency=currency,
+        )
+        source_command = command.model_copy(
+            update={
+                "lot_size": lot_size,
+                "currency": currency,
+                "external_instrument_id": instrument_uid,
+                "instrument_id": fact_instrument_id,
+            }
+        )
+        if not await self._persist_if_consistent(intent, source_command, None, local_state, process_id):
+            return False
+        if self._cash is not None:
+            await self._cash.complete(intent.idempotency_key, "CANCELLED")
+        if self._active_intents is not None:
+            self._active_intents.clear(str(command.automation_id), intent.idempotency_key)
+        await self._audit_stage(
+            command,
+            process_id,
+            BusinessAuditStage.BROKER_ORDER_TERMINAL_STATE,
+            "Persisted pre-RPC proof completed after Worker restart",
+            broker_order_state="CANCELLED",
+            reason_code="PRE_RPC_ABORT_PROOF_RECOVERED",
+        )
+        await self._audit_stage(
+            command,
+            process_id,
+            BusinessAuditStage.WORKER_RECOVERY_COMPLETED,
+            "Pre-RPC abort recovery completed",
+            broker_order_state="CANCELLED",
+            reason_code="PRE_RPC_ABORT_PROOF_RECOVERED",
+        )
+        return True
+
     async def _lookup_broker_state(
         self,
         command: AutomationCommand,
         intent: LocalIntentRecord,
     ) -> BrokerOrderState | None:
         if intent.broker_order_id is not None:
+            if self._environment == "PROD" or intent.state in _BROKER_ONLY_RECOVERY_STATES:
+                return await self._broker.find_by_idempotency_key(command.account_id, intent.idempotency_key)
             try:
                 state = await self._broker.get_order_state(command.account_id, intent.broker_order_id)
             except Exception:
@@ -188,8 +456,10 @@ class UncertainIntentReconciliationService:
         process_id: str,
     ) -> bool:
         ledger_already_applied = False
-        if state.status == "FILLED":
-            if state.executed_lots <= 0 or state.executed_price <= 0:
+        if state.status == "FILLED" and state.executed_lots <= 0:
+            return False
+        if state.executed_lots > 0:
+            if state.executed_price <= 0:
                 return False
             broker_lots = 0 if position is None else int(position.quantity_lots)
             open_lots = await asyncio.to_thread(self._repository.list_open_lots, str(command.automation_id))

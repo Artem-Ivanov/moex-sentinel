@@ -105,68 +105,17 @@ class BusinessAuditService:
             "occurred_at": self._now(),
             "critical": False,
         }
-        events = [
-            BusinessAuditEvent(
-                event_id=self._id_factory(),
-                stage=BusinessAuditStage.MARKET_DATA_RECEIVED,
-                message="Fresh market data received",
-                data={},
-                **common,
-            ),
-            BusinessAuditEvent(
-                event_id=self._id_factory(),
-                stage=BusinessAuditStage.TRADING_CYCLE_UPDATED,
-                message="Trading cycle updated",
-                data={
-                    key: safe_data[key]
-                    for key in ("cycle_pending_low_before", "cycle_pending_low_after")
-                    if key in safe_data
-                },
-                **common,
-            ),
-            BusinessAuditEvent(
-                event_id=self._id_factory(),
-                stage=BusinessAuditStage.POSITION_SNAPSHOT_RECEIVED,
-                message="Position snapshot received",
-                data={},
-                **common,
-            ),
-            BusinessAuditEvent(
-                event_id=self._id_factory(),
-                stage=BusinessAuditStage.STRATEGY_CALCULATION_STARTED,
-                message="Strategy calculation started",
-                data={},
-                **common,
-            ),
-            BusinessAuditEvent(
-                event_id=self._id_factory(),
-                stage=BusinessAuditStage.STRATEGY_DECISION_MADE,
-                message="Strategy decision calculated",
-                data=safe_data,
-                **common,
-            ),
-        ]
-        if safe_data.get("decision") in {"BUY_MORE", "SELL_PART", "SELL_ALL"}:
-            events.append(
+        self._repository.append_audit_events(
+            [
                 BusinessAuditEvent(
                     event_id=self._id_factory(),
-                    stage=BusinessAuditStage.BROKER_INTENT_CREATED,
-                    message="Broker intent created",
-                    data={"decision": safe_data["decision"]},
+                    stage=BusinessAuditStage.STRATEGY_DECISION_MADE,
+                    message="Strategy decision calculated",
+                    data=safe_data,
                     **common,
                 )
-            )
-        else:
-            events.append(
-                BusinessAuditEvent(
-                    event_id=self._id_factory(),
-                    stage=BusinessAuditStage.TRADING_STEP_COMPLETED,
-                    message="Trading step completed",
-                    data={},
-                    **common,
-                )
-            )
-        self._repository.append_audit_events(events)
+            ]
+        )
 
     def record_order_stage(
         self,

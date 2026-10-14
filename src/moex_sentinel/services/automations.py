@@ -1,5 +1,6 @@
 """Business lifecycle for baseline trading automations owned by Core."""
 
+from decimal import Decimal
 from typing import Protocol
 
 from moex_sentinel.domain.repository_records import AutomationRecord
@@ -31,6 +32,14 @@ class AutomationRepositoryPort(Protocol):
         hold_reason: str | None = None,
     ) -> AutomationRecord: ...
     def resume_to_queue(self, automation_id: str, *, expected_revision: int) -> AutomationRecord: ...
+    def update_settings(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord: ...
 
 
 class AutomationService:
@@ -108,6 +117,24 @@ class AutomationService:
             automation_id,
             AutomationState.CLOSED,
             expected_revision=current.revision,
+        )
+
+    def update_settings(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord:
+        current = self.get(automation_id)
+        if current.state is AutomationState.CLOSED:
+            raise AutomationStateConflictError("Closed automation settings cannot be changed.")
+        return self._repository.update_settings(
+            automation_id,
+            expected_revision=expected_revision,
+            expected_settings_revision=expected_settings_revision,
+            order_quota_percent=order_quota_percent,
         )
 
     def _in_environment(self, value: AutomationRecord) -> bool:

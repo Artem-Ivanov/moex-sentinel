@@ -63,11 +63,24 @@ def test_resolver_rejects_mismatched_adapter_target():
             resolve_tinvest_endpoint(environment, adapter, target)
 
 
-def test_core_settings_requires_mode_and_rejects_prod_trade(monkeypatch):
+def test_core_settings_requires_mode_and_accepts_scoped_prod_trade(monkeypatch):
     monkeypatch.delenv("BROKER_ACCESS_MODE", raising=False)
     with pytest.raises(ValueError, match="environment|adapter|target|broker_access_mode|PROD|pinned|inactive"):
         Settings(_env_file=None)
-    with pytest.raises(ValueError, match="environment|adapter|target|broker_access_mode|PROD|pinned|inactive"):
+
+    settings = Settings(
+        _env_file=None,
+        application_environment="PROD",
+        broker_access_mode="TRADE",
+        auth_allowed_origin="https://operator.example.test",
+        auth_session_cookie_name="__Host-prod-operator",
+        internal_worker_id="worker-prod-1",
+        internal_worker_broker_id="00000000-0000-4000-8000-000000000001",
+        internal_worker_token="a" * 64,
+    )
+
+    assert settings.broker_access_mode == "TRADE"
+    with pytest.raises(ValueError, match="PROD requires"):
         Settings(_env_file=None, application_environment="PROD", broker_access_mode="TRADE")
 
 

@@ -2,12 +2,28 @@
 
 from datetime import datetime
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
+from sentinel_contracts.trading_admission import ConfigurationFingerprint, PreRpcAbortProof
+
+
+class BrokerOrderStatus(StrEnum):
+    CREATED = "CREATED"
+    DISPATCH_PENDING = "DISPATCH_PENDING"
+    SUBMITTING = "SUBMITTING"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    UNCERTAIN = "UNCERTAIN"
+    FAILED = "FAILED"
 
 
 class OrderSide(str, Enum):
@@ -61,7 +77,7 @@ class BrokerOrderState(PositionalModel):
     model_config = ConfigDict(frozen=True)
     broker_order_id: str
     idempotency_key: str
-    status: str
+    status: BrokerOrderStatus
     requested_lots: int
     executed_lots: int
     requested_amount: Decimal
@@ -71,6 +87,27 @@ class BrokerOrderState(PositionalModel):
     currency: str
     executed_price: Decimal = Decimal()
     executed_at: datetime | None = None
+    pre_rpc_abort_proof: PreRpcAbortProof | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def validate_pre_rpc_abort(self):
+        proof = self.pre_rpc_abort_proof
+        if proof is None:
+            return self
+        if (
+            str(proof.idempotency_key) != self.idempotency_key
+            or self.status != "CANCELLED"
+            or self.broker_order_id
+            or self.requested_lots <= 0
+            or self.requested_amount <= 0
+            or self.executed_lots != 0
+            or self.executed_amount != 0
+            or self.executed_commission != 0
+            or self.executed_price != 0
+            or self.executed_at is not None
+        ):
+            raise ValueError("Pre-RPC abort proof requires a matching, zero-fill cancelled order.")
+        return self
 
 
 class BrokerScope(PositionalModel):
@@ -92,6 +129,7 @@ class BrokerConnection(PositionalModel):
     environment: BrokerEnvironment | None = None
     access_mode: BrokerAccessMode = "READ_ONLY"
     account_id: str = ""
+    configuration_fingerprint: ConfigurationFingerprint | None = None
 
     @model_validator(mode="after")
     def validate_environment(self):

@@ -61,6 +61,8 @@ class PositionDecisionEvaluator:
         indicators: MarketIndicators,
         session_open: bool,
         estimator: DecisionEstimatePort | None,
+        available_free_cash: Decimal = Decimal(),
+        positive_position_count: int | None = None,
     ) -> PositionDecisionBundle:
         observed_cycle = self._observe_cycle(command, position, order_book, history, cycle, indicators)
         plan = await self._planner.plan(
@@ -73,6 +75,8 @@ class PositionDecisionEvaluator:
             indicators=indicators,
             session_open=session_open,
             estimator=estimator,
+            available_free_cash=available_free_cash,
+            positive_position_count=positive_position_count,
         )
         return PositionDecisionBundle(
             plan=plan,

@@ -22,7 +22,7 @@ class AutomationCommandRepository:
         self._factory = factory
         self._environment = environment
 
-    def claim(self, limit: int) -> list[AutomationCommand]:
+    def claim(self, limit: int, *, broker_id: UUID | None = None) -> list[AutomationCommand]:
         if limit <= 0:
             return []
         with self._factory() as session:
@@ -38,6 +38,7 @@ class AutomationCommandRepository:
                     UserBrokerModel.state == "ACTIVE",
                     True if self._environment is None else UserBrokerModel.environment == self._environment,
                     UserBrokerModel.external_account_id.is_not(None),
+                    True if broker_id is None else UserBrokerModel.id == str(broker_id),
                     or_(
                         TradingAutomationModel.state == AutomationState.IN_QUEUE.value,
                         and_(
@@ -53,7 +54,7 @@ class AutomationCommandRepository:
             ).all()
         return [self._command(automation, user_broker, instrument) for automation, user_broker, instrument in rows]
 
-    def statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult:
+    def statuses(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult:
         requested = tuple(dict.fromkeys(automation_ids))
         if not requested:
             return AutomationStatusesResult(automations=())
@@ -65,6 +66,7 @@ class AutomationCommandRepository:
                 .where(
                     TradingAutomationModel.id.in_(tuple(by_text)),
                     True if self._environment is None else UserBrokerModel.environment == self._environment,
+                    True if broker_id is None else UserBrokerModel.id == str(broker_id),
                 )
             ).all()
         by_id = {row.id: row for row in rows}
@@ -75,8 +77,10 @@ class AutomationCommandRepository:
                     user_broker_id=UUID(by_id[str(automation_id)].user_broker_id),
                     state=AutomationState(by_id[str(automation_id)].state),
                     revision=by_id[str(automation_id)].revision,
+                    settings_revision=by_id[str(automation_id)].settings_revision,
                     last_sequence_number=by_id[str(automation_id)].last_sequence_number,
                     resume_requested=by_id[str(automation_id)].resume_requested,
+                    order_quota_percent=by_id[str(automation_id)].order_quota_percent,
                 )
                 for automation_id in requested
                 if str(automation_id) in by_id
@@ -130,7 +134,9 @@ class AutomationCommandRepository:
             min_price_increment=instrument.min_price_increment,
             state=AutomationState(automation.state),
             revision=automation.revision,
+            settings_revision=automation.settings_revision,
             last_sequence_number=automation.last_sequence_number,
             resume_requested=automation.resume_requested,
+            order_quota_percent=automation.order_quota_percent,
             bootstrap=bootstrap,
         )

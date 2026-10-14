@@ -30,10 +30,10 @@ it("does not expose automation controls on the read-only details page", async ()
 const automation = {
   id: "auto-1", broker_id: "b1", broker_name: "Sandbox", account_id: "a1",
   instrument_id: "i1", ticker: "SBER", instrument_name: "Sber", state: "IN_WORK",
-  suspended_from_state: null, revision: 2, last_sequence_number: 3, resume_requested: false,
+  suspended_from_state: null, revision: 2, settings_revision: 1, last_sequence_number: 3, resume_requested: false,
   quantity_lots: 2, average_price: "100", invested_amount: "200", realized_pnl: "0",
   unrealized_pnl: "4", net_pnl: "3.5", actual_commissions: "0.5",
-  currency: "RUB", strategy_code: "adaptive_scalping", strategy_version: "1",
+  currency: "RUB", strategy_code: "adaptive_scalping", strategy_version: "1", order_quota_percent: "10",
 }
 
 const details = { automation, operations: [], candles: [{
@@ -55,6 +55,134 @@ it("shows automation state and trading details", async () => {
   expect(screen.queryByText(/Последняя:/)).toBeNull()
   expect(screen.queryByText(/Средняя:/)).toBeNull()
   expect(document.querySelector(".candlestick-chart__average-price-line")).toBeTruthy()
+  expect((screen.getByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" }) as HTMLInputElement).value).toBe("10")
+  expect(screen.getByText(/полная продажа и защитный стоп не ограничиваются/)).toBeTruthy()
+})
+
+it("saves the percent with the current revision and empty input resets the common setting", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(details))
+    .mockResolvedValueOnce(Response.json({ ...automation, settings_revision: 2, order_quota_percent: "12.5" }))
+    .mockResolvedValueOnce(Response.json({ ...automation, settings_revision: 3, order_quota_percent: null }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  await screen.findByRole("heading", { name: "SBER — торговый автомат" })
+  const input = screen.getByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  expect(screen.getByText("Оставьте поле пустым и сохраните, чтобы использовать общее значение.")).toBeTruthy()
+  await fireEvent.update(input, "12.5")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+
+  expect(fetchMock.mock.calls[1][0]).toBe("/api/trading-automations/auto-1/settings")
+  expect(fetchMock.mock.calls[1][1]).toMatchObject({
+    method: "PATCH",
+    body: JSON.stringify({ expected_revision: 2, expected_settings_revision: 1, order_quota_percent: "12.5" }),
+  })
+  expect((input as HTMLInputElement).value).toBe("12.5")
+
+  await fireEvent.update(input, "")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+  expect(fetchMock.mock.calls[2][1]).toMatchObject({
+    method: "PATCH",
+    body: JSON.stringify({ expected_revision: 2, expected_settings_revision: 2, order_quota_percent: null }),
+  })
+})
+
+it.each(["0", "100.1", "NaN", "-2"]) ("rejects invalid quota percent %s before saving", async (value) => {
+  const fetchMock = vi.fn().mockResolvedValue(Response.json(details))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  await screen.findByRole("heading", { name: "SBER — торговый автомат" })
+  await fireEvent.update(screen.getByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" }), value)
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+
+  expect(await screen.findByText("Укажите число больше 0 и не больше 100." )).toBeTruthy()
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
+it("keeps an edited quota through polling and keeps it after revision conflict", async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(details))
+    .mockResolvedValueOnce(Response.json({ ...details, automation: { ...automation, order_quota_percent: "20" } }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ detail: { code: "REVISION_CONFLICT", message: "Настройки уже изменены. Обновите позицию и повторите сохранение." } }), { status: 409 }))
+    .mockResolvedValueOnce(Response.json({ ...details, automation: { ...automation, settings_revision: 3, order_quota_percent: "20" } }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  const input = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  await fireEvent.update(input, "15")
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await flushPromises()
+  expect((input as HTMLInputElement).value).toBe("15")
+
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  expect((await screen.findByRole("alert")).textContent).toContain("Настройки уже изменены. Обновите позицию и повторите сохранение.")
+  expect((input as HTMLInputElement).value).toBe("15")
+  expect(await screen.findByText("Квота изменилась. Проверьте значение и измените поле, чтобы повторить сохранение.")).toBeTruthy()
+  expect((await screen.findByRole("button", { name: "Сохранить лимит" }) as HTMLButtonElement).disabled).toBe(true)
+
+  await fireEvent.update(input, "16")
+  expect((screen.getByRole("button", { name: "Сохранить лимит" }) as HTMLButtonElement).disabled).toBe(false)
+})
+
+it("does not let the conflict refresh overwrite a newer poll", async () => {
+  let resolveConflictRefresh!: (response: Response) => void
+  const oldConflictRefresh = new Promise<Response>((resolve) => { resolveConflictRefresh = resolve })
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(details))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ detail: { code: "REVISION_CONFLICT", message: "Квота изменилась." } }), { status: 409 }))
+    .mockReturnValueOnce(oldConflictRefresh)
+    .mockResolvedValueOnce(Response.json({ ...details, automation: { ...automation, settings_revision: 3, order_quota_percent: "25" } }))
+    .mockResolvedValueOnce(Response.json({ ...automation, settings_revision: 4, order_quota_percent: "16" }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  const input = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  await fireEvent.update(input, "15")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await flushPromises()
+  resolveConflictRefresh(Response.json({ ...details, automation: { ...automation, settings_revision: 2, order_quota_percent: "20" } }))
+  await flushPromises()
+
+  expect((input as HTMLInputElement).value).toBe("15")
+  expect(screen.getByText("Квота изменилась. Проверьте значение и измените поле, чтобы повторить сохранение.")).toBeTruthy()
+  await fireEvent.update(input, "16")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+  expect(fetchMock.mock.calls[4][1]).toMatchObject({
+    method: "PATCH",
+    body: JSON.stringify({ expected_revision: 2, expected_settings_revision: 3, order_quota_percent: "16" }),
+  })
+})
+
+it("keeps newer settings from polling when an older save response arrives late", async () => {
+  let resolveSave!: (response: Response) => void
+  const pendingSave = new Promise<Response>((resolve) => { resolveSave = resolve })
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(details))
+    .mockReturnValueOnce(pendingSave)
+    .mockResolvedValueOnce(Response.json({ ...details, automation: { ...automation, settings_revision: 3, order_quota_percent: "20" } }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  const input = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  await fireEvent.update(input, "15")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await flushPromises()
+  resolveSave(Response.json({ ...automation, settings_revision: 2, order_quota_percent: "15" }))
+  await flushPromises()
+
+  expect((input as HTMLInputElement).value).toBe("15")
+  expect(await screen.findByText("Квота изменилась. Проверьте значение и измените поле, чтобы повторить сохранение.")).toBeTruthy()
+})
+
+it("disables quota editing for a closed automation", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ ...details, automation: { ...automation, state: "CLOSED" } })))
+  await renderDetailsView()
+  const input = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  expect((input as HTMLInputElement).disabled).toBe(true)
+  expect((screen.getByRole("button", { name: "Сохранить лимит" }) as HTMLButtonElement).disabled).toBe(true)
 })
 
 it("does not show an average marker for an empty position average price", async () => {
@@ -244,4 +372,54 @@ it("clears loaded position values on route change and keeps a single current pol
   await vi.advanceTimersByTimeAsync(60_000)
   expect(fetchMock.mock.calls).toHaveLength(1)
   expect(vi.getTimerCount()).toBe(0)
+})
+
+it("ignores a late settings save after navigating to another position", async () => {
+  let resolveSave!: (response: Response) => void
+  const pendingSave = new Promise<Response>((resolve) => { resolveSave = resolve })
+  const fetchMock = vi.fn((url: string) => {
+    if (url.endsWith("/settings")) return pendingSave
+    return Promise.resolve(Response.json(url.includes("auto-B") ? detailsB : details))
+  })
+  vi.stubGlobal("fetch", fetchMock)
+  const { router } = await renderRoutedPosition()
+  const firstInput = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  await fireEvent.update(firstInput, "15")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await router.push("/positions/auto-B")
+  await flushPromises()
+  const nextInput = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  resolveSave(Response.json({ ...automation, order_quota_percent: "15" }))
+  await flushPromises()
+
+  expect(screen.getByRole("heading", { name: "GAZP — торговый автомат" })).toBeTruthy()
+  expect((nextInput as HTMLInputElement).value).toBe("10")
+})
+
+it("ignores a details request started before a successful quota save", async () => {
+  let resolveOldDetails!: (response: Response) => void
+  const oldDetails = new Promise<Response>((resolve) => { resolveOldDetails = resolve })
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(Response.json(details))
+    .mockReturnValueOnce(oldDetails)
+    .mockResolvedValueOnce(Response.json({ ...automation, settings_revision: 2, order_quota_percent: "15" }))
+    .mockResolvedValueOnce(Response.json({ ...automation, settings_revision: 3, order_quota_percent: "16" }))
+  vi.stubGlobal("fetch", fetchMock)
+  await renderDetailsView()
+  const input = await screen.findByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" })
+  await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
+  await fireEvent.update(input, "15")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+  resolveOldDetails(Response.json(details))
+  await flushPromises()
+
+  expect((input as HTMLInputElement).value).toBe("15")
+  await fireEvent.update(input, "16")
+  await fireEvent.click(screen.getByRole("button", { name: "Сохранить лимит" }))
+  await flushPromises()
+  expect(fetchMock.mock.calls[3][1]).toMatchObject({
+    method: "PATCH",
+    body: JSON.stringify({ expected_revision: 2, expected_settings_revision: 2, order_quota_percent: "16" }),
+  })
 })

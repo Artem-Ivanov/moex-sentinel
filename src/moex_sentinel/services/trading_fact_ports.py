@@ -10,6 +10,8 @@ from moex_sentinel.domain.trading_facts import (
     BrokerOrderDraft,
     BrokerOrderEventDraft,
     ExecutionLotAllocationDraft,
+    FactRuntimeAuthorization,
+    FactSubmitReservation,
     PositionCycleDraft,
     PositionLotDraft,
     PositionValuationSnapshotDraft,
@@ -151,6 +153,21 @@ class TradingAnalyticsPort(Protocol):
 
 class TradingFactsUnitOfWorkPort(Protocol):
     def scope_matches_environment(self, user_broker_id: str, environment: str) -> bool: ...
+
+    def authorize_fact_runtime(
+        self,
+        user_broker_id: str,
+        runtime_instance_id: str,
+        generation: int,
+        *,
+        environment: str,
+    ) -> FactRuntimeAuthorization | None: ...
+
+    def get_fact_submit_reservation(
+        self, user_broker_id: str, idempotency_key: str
+    ) -> FactSubmitReservation | None: ...
+
+    def confirm_submit_not_sent(self, user_broker_id: str, idempotency_key: str, *, now: datetime) -> bool: ...
 
     @property
     def automations(self) -> AutomationFactsPort: ...

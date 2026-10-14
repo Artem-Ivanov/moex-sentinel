@@ -3,7 +3,9 @@ import { computed, onBeforeUnmount, ref, watch } from "vue"
 import { RouterLink, useRoute } from "vue-router"
 
 import {
+  ApiError,
   fetchAutomationDetails,
+  updateAutomationSettings,
   type AutomationDetails,
 } from "../api/automations"
 import CandlestickChart from "../components/CandlestickChart.vue"
@@ -20,6 +22,11 @@ const averagePrice = computed(() => {
 })
 const error = ref("")
 const loading = ref(false)
+const quotaDraft = ref("")
+const quotaSaving = ref(false)
+const quotaError = ref("")
+const quotaConflict = ref(false)
+const quotaDirty = computed(() => quotaDraft.value !== (data.value?.order_quota_percent ?? ""))
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined
 let disposed = false
@@ -27,6 +34,22 @@ let generation = 0
 
 function isCurrent(requestGeneration: number): boolean {
   return !disposed && requestGeneration === generation
+}
+
+function isOlderVersion(incoming: AutomationDetails["automation"], current: AutomationDetails["automation"]): boolean {
+  return incoming.revision < current.revision || (incoming.settings_revision ?? 0) < (current.settings_revision ?? 0)
+}
+
+function applyDetails(response: AutomationDetails, requestGeneration: number, automationId: string): void {
+  if (!isCurrent(requestGeneration) || String(route.params.id) !== automationId) return
+  const current = details.value?.automation
+  if (current && isOlderVersion(response.automation, current)) return
+
+  const wasDirty = quotaDirty.value
+  if (wasDirty && current && (response.automation.revision !== current.revision ||
+    response.automation.settings_revision !== current.settings_revision)) quotaConflict.value = true
+  details.value = response
+  if (!wasDirty) quotaDraft.value = response.automation.order_quota_percent ?? ""
 }
 
 async function refresh(): Promise<void> {
@@ -37,11 +60,53 @@ async function refresh(): Promise<void> {
   error.value = ""
   try {
     const response = await fetchAutomationDetails(automationId)
-    if (isCurrent(requestGeneration)) details.value = response
+    applyDetails(response, requestGeneration, automationId)
   } catch (caught: unknown) {
     if (isCurrent(requestGeneration)) error.value = caught instanceof Error ? caught.message : "Торговый автомат не найден."
   } finally {
     if (isCurrent(requestGeneration)) loading.value = false
+  }
+}
+
+async function saveQuota(): Promise<void> {
+  if (!data.value || data.value.state === "CLOSED" || quotaSaving.value || !quotaDirty.value || quotaConflict.value) return
+  const value = quotaDraft.value.trim()
+  if (value !== "" && (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(value) || !Number.isFinite(Number(value)) || Number(value) <= 0 || Number(value) > 100)) {
+    quotaError.value = "Укажите число больше 0 и не больше 100."
+    return
+  }
+  const requestGeneration = generation
+  const automationId = data.value.id
+  quotaSaving.value = true
+  quotaError.value = ""
+  try {
+    const updated = await updateAutomationSettings(automationId, data.value.revision, data.value.settings_revision ?? 0, value === "" ? null : value)
+    if (isCurrent(requestGeneration) && String(route.params.id) === automationId) {
+      const current = details.value?.automation
+      const responseIsOlder = current && isOlderVersion(updated, current)
+      if (responseIsOlder) {
+        quotaConflict.value = true
+      } else {
+        details.value = { ...details.value!, automation: updated }
+        quotaDraft.value = updated.order_quota_percent ?? ""
+        quotaConflict.value = false
+      }
+    }
+  } catch (caught: unknown) {
+    if (isCurrent(requestGeneration) && String(route.params.id) === automationId) {
+      quotaError.value = caught instanceof ApiError && caught.fields.length
+        ? caught.fields.map((field) => field.message).join(" ")
+        : caught instanceof Error ? caught.message : "Не удалось сохранить лимит квоты."
+      if (caught instanceof ApiError && caught.status === 409) {
+        quotaConflict.value = true
+        try {
+          const latest = await fetchAutomationDetails(automationId)
+          applyDetails(latest, requestGeneration, automationId)
+        } catch { /* Keep the original revision conflict visible. */ }
+      }
+    }
+  } finally {
+    if (isCurrent(requestGeneration)) quotaSaving.value = false
   }
 }
 
@@ -51,6 +116,10 @@ watch(() => String(route.params.id ?? ""), async (automationId) => {
   details.value = undefined
   error.value = ""
   loading.value = false
+  quotaDraft.value = ""
+  quotaSaving.value = false
+  quotaError.value = ""
+  quotaConflict.value = false
   if (disposed || !automationId) return
   await refresh()
   // A prior route or unmounted page must not resurrect its polling timer.
@@ -82,6 +151,19 @@ onBeforeUnmount(() => {
         <article class="grid-row"><strong>Результат</strong><p>Realized: {{ data.bootstrap_pending ? '—' : data.realized_pnl }}</p><p>Unrealized: {{ data.bootstrap_pending ? '—' : data.unrealized_pnl }}</p><p>Net P&amp;L: {{ data.bootstrap_pending ? '—' : data.net_pnl }}</p><p>Комиссии: {{ data.bootstrap_pending ? '—' : data.actual_commissions }}</p></article>
         <article class="grid-row"><strong>Стратегия</strong><p>Код: {{ data.strategy_code }}</p><p>Версия: {{ data.strategy_version }}</p><p>Единый алгоритм для всех позиций. Пороги усреднения и частичной прибыли пересчитываются по рынку.</p><p>Revision: {{ data.revision }}</p></article>
       </div>
+      <article class="candle-panel">
+        <div class="candle-panel__header"><strong>Квота заявки</strong></div>
+        <form class="form-card" @submit.prevent="saveQuota">
+          <label>Максимальная доля квоты на одну заявку, %
+            <input v-model="quotaDraft" aria-label="Максимальная доля квоты на одну заявку, %" type="text" inputmode="decimal" :disabled="data.state === 'CLOSED' || quotaSaving" :aria-invalid="Boolean(quotaError)" @input="quotaError = ''; quotaConflict = false">
+          </label>
+          <p>Свободные деньги счёта делятся на число открытых торговых позиций (валютные не считаются, минимум 1), затем применяется этот процент. Ограничение действует для покупок, усреднения и частичной продажи; полная продажа и защитный стоп не ограничиваются.</p>
+          <small class="hint">Оставьте поле пустым и сохраните, чтобы использовать общее значение.</small>
+          <p v-if="quotaConflict" class="error" role="status">Квота изменилась. Проверьте значение и измените поле, чтобы повторить сохранение.</p>
+          <p v-if="quotaError" class="error" role="alert">{{ quotaError }}</p>
+          <button type="submit" :disabled="data.state === 'CLOSED' || quotaSaving || !quotaDirty || quotaConflict">{{ quotaSaving ? "Сохранение…" : "Сохранить лимит" }}</button>
+        </form>
+      </article>
       <article class="candle-panel">
         <div class="candle-panel__header"><strong>Минутные свечи за последние два часа</strong></div>
         <div class="candle-chart-frame">

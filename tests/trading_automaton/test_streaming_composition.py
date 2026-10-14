@@ -1,6 +1,8 @@
 import asyncio
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import UUID
 
 import httpx
 import pytest
@@ -9,15 +11,21 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from moex_sentinel.api.app import create_app
+from moex_sentinel.storage.database import create_database_engine
 from moex_sentinel.storage.models import Base as CoreBase
+from moex_sentinel.storage.models.trading_admission import TradingAccountAdmissionModel, WorkerRuntimeInstanceModel
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerPosition
+from tests.trading_automaton.command_factory import command as make_command
+from tests.trading_automaton.command_factory import decision_item
 from tests.trading_automaton.services.test_broker_tick_preparation_service import bootstrap_market
 from tests.trading_automaton.services.test_streaming_runtime_coordinator_service import bootstrap_command
+from tests.trading_automaton.storage.worker_storage_helpers import INTENT_ID
 from trading_automaton import composition
 from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.composition import BrokerRuntimeBundle, build_broker_runtime, build_streaming_runtime
 from trading_automaton.config import AutomatonSettings, StrategySettings
 from trading_automaton.domain.dtos import CommissionQuote
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.runtime.streaming_coordinator import StreamingRuntimeCoordinator
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.storage.models import Base
@@ -251,6 +259,147 @@ def test_streaming_composition_opens_only_supplied_local_sqlite(monkeypatch, tmp
     http.close()
 
     assert opened_urls == [database_url]
+
+
+def test_streaming_composition_passes_prod_environment_to_retained_intent_gate(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'prod-retained-intent.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    repo = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = make_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="CANCELLED", occurred_at=NOW + timedelta(seconds=1))
+    engine.dispose()
+
+    settings = AutomatonSettings(
+        APPLICATION_ENVIRONMENT="PROD",
+        BROKER_ACCESS_MODE="READ_ONLY",
+        AUTOMATON_WORKER_ID="worker-prod",
+        INTERNAL_WORKER_ID="worker-prod",
+        INTERNAL_WORKER_BROKER_ID=str(value.broker_id),
+        INTERNAL_WORKER_TOKEN="a" * 64,
+        CORE_URL="http://core.invalid",
+        AUTOMATON_DATABASE_URL=database_url,
+    )
+
+    with pytest.raises(ValueError, match="READ_ONLY cannot start with active intents"):
+        build_streaming_runtime(settings, StrategySettings())
+
+
+def test_pending_worker_waits_for_actual_core_transfer_then_retries_same_runtime(monkeypatch, tmp_path) -> None:
+    broker_id = UUID("00000000-0000-4000-8000-000000000021")
+    incumbent_id = UUID("00000000-0000-4000-8000-000000000022")
+    worker_token = "a" * 64
+    incumbent_secret = "b" * 64
+    database_url = f"sqlite:///{tmp_path / 'pending-transfer.db'}"
+    for name, value in (
+        ("APPLICATION_ENVIRONMENT", "PROD"),
+        ("BROKER_ACCESS_MODE", "READ_ONLY"),
+        ("AUTH_ALLOWED_ORIGIN", "https://operator.example.test"),
+        ("AUTH_SESSION_COOKIE_NAME", "__Host-prod-operator"),
+        ("INTERNAL_WORKER_ID", "worker-prod"),
+        ("INTERNAL_WORKER_BROKER_ID", str(broker_id)),
+        ("INTERNAL_WORKER_TOKEN", worker_token),
+    ):
+        monkeypatch.setenv(name, value)
+    engine = create_database_engine(database_url)
+    CoreBase.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO user_brokers "
+            "(id, api_slug, display_name, environment, fqdn, settings, external_account_id, state, "
+            "created_at, updated_at) "
+            "VALUES (?, 't_invest', 'Synthetic', 'PROD', 'invest-public-api.tbank.ru:443', ?, 'account-1', "
+            "'ACTIVE', ?, ?)",
+            (str(broker_id), '{"token":"synthetic-token"}', NOW.isoformat(), NOW.isoformat()),
+        )
+    engine.dispose()
+
+    app = create_app(test_auth_bypass=True, database_url=database_url)
+    with TestClient(app) as core_http:
+        owner_headers = {
+            "Authorization": f"Bearer {worker_token}",
+            "X-Runtime-Instance-ID": str(incumbent_id),
+            "X-Runtime-Secret": incumbent_secret,
+        }
+        owner = core_http.post(
+            "/internal/automaton/runtime-instances",
+            json={
+                "worker_id": "worker-prod",
+                "runtime_instance_id": str(incumbent_id),
+                "broker_id": str(broker_id),
+                "application_environment": "PROD",
+                "access_mode": "READ_ONLY",
+                "strategy_enabled": False,
+            },
+            headers=owner_headers,
+        )
+        assert owner.status_code == 200
+        assert owner.json()["registration_status"] == "OWNER"
+
+        worker_requests = []
+
+        def forward(request: httpx.Request) -> httpx.Response:
+            worker_requests.append(request)
+            response = core_http.request(
+                request.method,
+                request.url.path,
+                content=request.content,
+                headers=dict(request.headers),
+            )
+            return httpx.Response(
+                response.status_code,
+                content=response.content,
+                headers={"content-type": response.headers.get("content-type", "application/json")},
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(forward), base_url="http://core") as worker_http:
+            worker = CoreClient(
+                worker_http,
+                application_environment="PROD",
+                access_mode="READ_ONLY",
+                worker_id="worker-prod",
+                broker_id=broker_id,
+                worker_token=worker_token,
+            )
+            worker_instance_id = worker.runtime_instance_id
+            with pytest.raises(CoreOperationError) as pending:
+                worker.broker_connection(str(broker_id))
+            pending_error = pending.value
+            pending_paths = [request.url.path for request in worker_requests]
+
+            sessions = sessionmaker(app.state.database_engine, expire_on_commit=False)
+            with sessions.begin() as session:
+                incumbent = session.get(WorkerRuntimeInstanceModel, str(incumbent_id))
+                candidate = session.get(WorkerRuntimeInstanceModel, str(worker_instance_id))
+                admission = session.get(TradingAccountAdmissionModel, str(broker_id))
+                incumbent.registration_status = "RETIRED"
+                incumbent.retired_at = NOW
+                candidate.registration_status = "OWNER"
+                candidate.generation = 2
+                candidate.lease_expires_at = NOW + timedelta(seconds=30)
+                admission.owner_runtime_instance_id = str(worker_instance_id)
+                admission.owner_generation = 2
+                admission.lease_expires_at = candidate.lease_expires_at
+
+            connection = worker.broker_connection(str(broker_id))
+            all_paths = [request.url.path for request in worker_requests]
+            registration_requests = [
+                request for request in worker_requests if request.url.path.endswith("/runtime-instances")
+            ]
+
+    assert isinstance(pending_error, CoreOperationError)
+    assert pending_error.retryable is True
+    assert pending_paths == ["/internal/automaton/runtime-instances"]
+    assert len(registration_requests) == 2
+    assert all(
+        json.loads(request.content)["runtime_instance_id"] == str(worker_instance_id)
+        for request in registration_requests
+    )
+    assert registration_requests[0].headers["X-Runtime-Secret"] == registration_requests[1].headers["X-Runtime-Secret"]
+    assert connection.account_id == "account-1"
+    assert all_paths[-1].endswith("/connection")
 
 
 def test_composed_empty_control_iteration_delivers_actual_worker_diagnostics_to_core(tmp_path, monkeypatch):

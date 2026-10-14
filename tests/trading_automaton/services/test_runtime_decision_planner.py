@@ -14,6 +14,7 @@ from sentinel_contracts.broker_execution import (
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import MarketIndicators
 from trading_automaton.domain.storage_dtos import IntentHistory, TradeLotRecord, TradingCycleState
 from trading_automaton.services.runtime_decision_planner import (
@@ -258,3 +259,68 @@ def test_actionable_decision_is_recomputed_with_estimated_commission() -> None:
     estimated_order_amount = Decimal("1000")
     assert result.context_after_estimate.commission_schedule.buy_rate == Decimal("2.5") / estimated_order_amount
     assert result.context_after_estimate.commission_schedule.sell_rate == Decimal()
+
+
+def test_legacy_planner_uses_supplied_account_cash_and_position_count_for_quota() -> None:
+    planner = TradingDecisionPlanner(
+        decisions=_DecisionSequence((TradeDecision(DecisionKind.BUY_MORE, 12, Decimal("100"), "BUY"),))
+    )
+
+    result = _run_async(
+        planner.plan(
+            command=baseline_command(lot_size=1, order_quota_percent=Decimal("10")),
+            position=BrokerPosition("instrument-1", Decimal("1"), Decimal("100"), Decimal("100"), "RUB"),
+            order_book=_order_book(),
+            history=_history(),
+            lots=_lots(),
+            cycle=_cycle(),
+            indicators=_indicators_fallback(),
+            session_open=True,
+            estimator=None,
+            available_free_cash=Decimal("5000"),
+            positive_position_count=1,
+        )
+    )
+
+    assert (result.decision.kind, result.decision.quantity_lots) == (DecisionKind.BUY_MORE, 5)
+
+
+def test_real_strategy_sizes_first_buy_to_ten_lots_from_approved_example() -> None:
+    planner = TradingDecisionPlanner(settings=StrategySettings(enabled=True))
+    book = OrderBookSnapshot(
+        bids=(OrderBookLevel(Decimal("50"), 10),),
+        asks=(OrderBookLevel(Decimal("50"), 10),),
+        captured_at=NOW,
+    )
+    indicators = MarketIndicators(
+        averaging_step_percent=Decimal("0.5"),
+        minimum_net_profit_percent=Decimal("0.5"),
+        source="TEST",
+        mean_5=Decimal("50"),
+        mean_20=Decimal("50"),
+        change_10_percent=Decimal("0"),
+        last_candle_at=NOW,
+        last_candle_open=Decimal("50"),
+        last_candle_close=Decimal("50"),
+        range_low=Decimal("45"),
+        range_high=Decimal("55"),
+    )
+    cycle = _cycle().model_copy(update={"pending_low": Decimal("49")})
+
+    result = _run_async(
+        planner.plan(
+            command=baseline_command(lot_size=1, order_quota_percent=Decimal("10")),
+            position=BrokerPosition("instrument-1", Decimal(), Decimal(), Decimal("50"), "RUB"),
+            order_book=book,
+            history=_history(),
+            lots=(),
+            cycle=cycle,
+            indicators=indicators,
+            session_open=True,
+            estimator=None,
+            available_free_cash=Decimal("5000"),
+            positive_position_count=1,
+        )
+    )
+
+    assert (result.decision.kind, result.decision.quantity_lots) == (DecisionKind.BUY_MORE, 10)

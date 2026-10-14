@@ -17,8 +17,14 @@ AUDIT_PROCESS_ID = "00000000-0000-4000-8000-000000000408"
 SELL_INTENT_ID = "00000000-0000-4000-8000-000000000410"
 
 
-def baseline_command():
-    return command(broker="broker-1", account="account-1", instrument="instrument-1")
+def baseline_command(*, settings_revision: int = 0, order_quota_percent: Decimal | None = None):
+    return command(
+        broker="broker-1",
+        account="account-1",
+        instrument="instrument-1",
+        settings_revision=settings_revision,
+        order_quota_percent=order_quota_percent,
+    )
 
 
 def filled_buy() -> ExecutionFinalization:

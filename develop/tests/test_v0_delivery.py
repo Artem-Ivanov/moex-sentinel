@@ -155,15 +155,15 @@ def test_retryable_mixed_http_response_acks_bootstrap_then_retries_peer(tmp_path
             def __init__(self):
                 self.failed = False
 
-            def publish(self, facts):
+            def publish(self, facts, **context):
                 if self.failed:
-                    return ingress.publish(facts)
+                    return ingress.publish(facts, **context)
                 self.failed = True
                 bootstrap = [fact for fact in facts if fact.automation_id == AUTOMATION_ID]
                 delayed = [fact for fact in facts if fact.automation_id == peer.automation_id]
                 assert len(bootstrap) == 4
                 assert len(delayed) == 1
-                accepted = ingress.publish(bootstrap)
+                accepted = ingress.publish(bootstrap, **context)
                 return FactBatchResult(
                     results=accepted.results,
                     failures=(

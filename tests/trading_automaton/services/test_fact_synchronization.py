@@ -1,6 +1,7 @@
 """Typed baseline Worker-to-Core synchronization behavior."""
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 import pytest
@@ -65,7 +66,7 @@ class RepositoryStub:
         self.acknowledged: list[tuple[str, int, int]] = []
         self.retries: list[tuple[tuple[str, ...], int, datetime]] = []
         self.rejected: list[tuple[str, tuple[str, ...], str]] = []
-        self.reconciled: list[tuple[str, str, int, int]] = []
+        self.reconciled: list[tuple[str, str, int, int, int, Decimal | None]] = []
         self.holds: list[tuple[str | None, str]] = []
 
     def cache_command(self, command: AutomationCommand) -> bool:
@@ -116,8 +117,12 @@ class RepositoryStub:
         state: str,
         revision: int,
         last_sequence_number: int,
+        settings_revision: int,
+        order_quota_percent: Decimal | None,
     ) -> None:
-        self.reconciled.append((automation_id, state, revision, last_sequence_number))
+        self.reconciled.append(
+            (automation_id, state, revision, last_sequence_number, settings_revision, order_quota_percent)
+        )
 
     def hold_active(self, reason: str, automation_id: str | None = None) -> None:
         self.holds.append((automation_id, reason))
@@ -151,6 +156,8 @@ class ClientStub:
                     revision=4,
                     last_sequence_number=7,
                     resume_requested=False,
+                    settings_revision=2,
+                    order_quota_percent=Decimal("10"),
                 ),
             )
         )
@@ -226,7 +233,7 @@ def test_non_retryable_failure_reconciles_without_acknowledging_failed_rows() ->
             FactIngressErrorCode.AUTOMATION_REVISION_CONFLICT.value,
         )
     ]
-    assert repository.reconciled == [(failed.automation_id, "HOLD", 4, 7)]
+    assert repository.reconciled == [(failed.automation_id, "HOLD", 4, 7, 2, Decimal("10"))]
     assert client.status_batches == [(UUID(failed.automation_id),)]
 
 
@@ -400,5 +407,5 @@ def test_permanent_protocol_failure_reconciles_and_rejects_without_retry(status)
     assert len(client.published) == 1
     assert client.status_batches == [(UUID(pending.automation_id),)]
     assert repository.rejected == [(pending.automation_id, (pending.event_id,), f"HTTP_{status}")]
-    assert repository.reconciled == [(pending.automation_id, "HOLD", 4, 7)]
+    assert repository.reconciled == [(pending.automation_id, "HOLD", 4, 7, 2, Decimal("10"))]
     assert repository.retries == delays == []

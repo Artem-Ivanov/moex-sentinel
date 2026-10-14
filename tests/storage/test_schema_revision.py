@@ -1,5 +1,7 @@
 from sqlalchemy import create_engine, text
 
+from alembic import command
+from alembic.config import Config
 from moex_sentinel.storage.schema_revision import (
     current_schema_revision,
     expected_schema_revision,
@@ -32,5 +34,13 @@ def test_schema_is_compatible_only_for_expected_revision() -> None:
     assert schema_is_compatible(engine, "revision-2") is False
 
 
-def test_expected_revision_is_current_alembic_head() -> None:
-    assert expected_schema_revision() == "0003_user_broker_archive"
+def test_expected_revision_accepts_current_migrated_database(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'schema-head.db'}"
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        assert schema_is_compatible(engine, expected_schema_revision()) is True
+    finally:
+        engine.dispose()

@@ -188,3 +188,70 @@ def test_bootstrap_timestamp_serializes_with_millisecond_precision() -> None:
         BrokerPositionBootstrap.model_validate(
             {**bootstrap.model_dump(mode="python"), "observed_at": NOW.replace(microsecond=123001)}
         )
+
+
+def test_command_and_status_carry_optional_quota_as_a_decimal_string() -> None:
+    values = {
+        "automation_id": AUTOMATION_ID,
+        "user_broker_id": SCOPE_ID,
+        "broker_id": BROKER_ID,
+        "account_id": "synthetic-account",
+        "external_instrument_id": "synthetic-instrument",
+        "instrument_id": INSTRUMENT_ID,
+        "currency": "RUB",
+        "lot_size": 10,
+        "min_price_increment": Decimal("0.01"),
+        "state": AutomationState.IN_QUEUE,
+        "revision": 1,
+        "last_sequence_number": 0,
+        "resume_requested": False,
+    }
+    command = AutomationCommand.model_validate({**values, "order_quota_percent": Decimal("12.50")})
+    status = AutomationStatus(
+        automation_id=AUTOMATION_ID,
+        user_broker_id=SCOPE_ID,
+        state=AutomationState.IN_QUEUE,
+        revision=1,
+        last_sequence_number=0,
+        resume_requested=False,
+        order_quota_percent=Decimal("12.50"),
+    )
+
+    assert command.model_dump(mode="json")["order_quota_percent"] == "12.50"
+    assert status.model_dump(mode="json")["order_quota_percent"] == "12.50"
+    assert AutomationCommand.model_validate(values).order_quota_percent is None
+    assert AutomationStatus.model_validate(status.model_dump(mode="python") | {"order_quota_percent": None})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("100.01"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("0.0000000001"),
+    ],
+)
+def test_command_rejects_invalid_order_quota_percent(value: object) -> None:
+    values = {
+        "automation_id": AUTOMATION_ID,
+        "user_broker_id": SCOPE_ID,
+        "broker_id": BROKER_ID,
+        "account_id": "synthetic-account",
+        "external_instrument_id": "synthetic-instrument",
+        "instrument_id": INSTRUMENT_ID,
+        "currency": "RUB",
+        "lot_size": 10,
+        "min_price_increment": Decimal("0.01"),
+        "state": AutomationState.IN_QUEUE,
+        "revision": 1,
+        "last_sequence_number": 0,
+        "resume_requested": False,
+        "order_quota_percent": value,
+    }
+
+    with pytest.raises(ValidationError):
+        AutomationCommand.model_validate(values)

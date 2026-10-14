@@ -74,6 +74,7 @@ class CandlesUsecase:
 
 def test_market_data_http_contracts(monkeypatch, tmp_path) -> None:
     usecases = SimpleNamespace(
+        daily_admission_preparation=SimpleNamespace(),
         search_market_instruments=SearchUsecase(),
         view_market_instrument=InstrumentUsecase(),
         view_historic_candles=CandlesUsecase(),
@@ -124,7 +125,9 @@ def test_market_search_validation_is_returned_as_field_error(monkeypatch, tmp_pa
                 (FieldError("query", "MIN_LENGTH", "Введите минимум два символа."),),
             )
 
-    usecases = SimpleNamespace(search_market_instruments=InvalidSearchUsecase())
+    usecases = SimpleNamespace(
+        daily_admission_preparation=SimpleNamespace(), search_market_instruments=InvalidSearchUsecase()
+    )
     monkeypatch.setattr("moex_sentinel.api.app.build_application_usecases", lambda _factory, *, settings: usecases)
 
     with TestClient(

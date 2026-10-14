@@ -4,19 +4,213 @@
 
 Исторический снимок на 2026-10-02: приложение развёрнуто на VPS `135.136.178.252` (Ubuntu 24.04, amd64, Docker 29.7.2, Compose v5.4.0). Замеры того снимка: RAM1,92GiB, диск55,99GiB/available47,45GiB. Локальная история не переносилась; состояние Sandbox было загружено штатным API. Повторный SSH/sudo успешен; running `STRATEGY_ENABLED=false`, broker/Core/Worker ledger и доставка выборки сверены. Каталог/позиции/выход и session401 в живом браузере подтверждены; restart без дублей оставался открыт. Evidence: `develop/reports/vps-audit-20261002/`. Источники скопированы из проверенного рабочего дерева в root-owned релиз; локальный код ещё не был закоммичен. Ниже также приведена общая процедура для будущих релизов. Этот документ не обещает SLA.
 
-База и внутренние API не имеют опубликованных портов. UI слушает только `127.0.0.1:8080`; Nginx публикует его через `https://135.136.178.252/`. Backend требует учётные данные оператора; HTTP cookie для loopback на удалённом Compose выключена. Не открывать Docker API наружу.
+База и внутренние API не имеют опубликованных портов. Текущий PROD UI слушает только `127.0.0.1:8081`; Nginx публикует его через `https://135.136.178.252/`. Backend требует учётные данные оператора; HTTP cookie для loopback на удалённом Compose выключена. Не открывать Docker API наружу.
 
 На текущем VPS созданы новые внешние volumes PostgreSQL и Worker SQLite. Worker остаётся **один на брокерский scope во всех хостах вместе**; replica=1 не предотвращает второй процесс на другом сервере. Профиль `trading` отделяет его запуск от проверки UI. Worker имеет 120 секунд на SIGTERM, остальные сервисы — 90 секунд; Docker-логи ротируются. Worker помечает чистое завершение после закрытия runtime; код выхода/логи проверяются отдельно.
 
 ### Публикация по IP
 
-На текущем VPS сертификат Let's Encrypt содержит IP в SAN и автоматически продлевается Certbot. Nginx проксирует только loopback frontend (`127.0.0.1:8080`), закрывает `/internal/*` и ограничивает `/api/auth/login` по IP клиента: 10 запросов в минуту с burst до 5. Внешние проверки подтвердили HTTPS, отказ анонимному API, вход, защищённую cookie, CSRF, выход, отзыв сессии и HTTP 429 после превышения лимита.
+На текущем VPS сертификат Let's Encrypt содержит IP в SAN и автоматически продлевается Certbot. Nginx проксирует только PROD loopback frontend (`127.0.0.1:8081`), закрывает `/internal/*` и ограничивает `/api/auth/login` по IP клиента: 10 запросов в минуту с burst до 5. Внешние проверки подтвердили HTTPS, отказ анонимному API, вход, защищённую cookie, CSRF, выход, отзыв сессии и HTTP 429 после превышения лимита.
 
 Overlay использует [правила merge Docker Compose](https://docs.docker.com/reference/compose-file/merge/), включая `!override` (требует 2.24.4). [Профиль](https://docs.docker.com/compose/how-tos/profiles/) исключает Worker из обычного `up`, но явное указание имени сервиса запускает его даже без `--profile`.
 
 ## Развёрнутый VPS
 
-### Текущий снимок после deploy 04.10.2026
+### Актуальный PROD443 и выведенный TEST — 10.10.2026
+
+Около14:54 МСК завершён выпуск `vps-20261010-quota-987a495d6c71`:
+новые PROD Core/Worker/frontend, схема0005. Основной HTTPS443 теперь PROD8081;
+8443 listener отсутствует, внешний TLS/HTTPS8443 недоступен.
+AUTH_ALLOWED_ORIGIN=https://135.136.178.252 и __Host-moex-prod-session сохранены
+в строгой конфигурации. Health/HTTPS/auth/CSRF/assets/позиции/новые поля настроек PASS.
+Chrome в отдельном временном профиле отрисовал вход; карточка после входа вручную не проверялась.
+
+На снимке14:55 работают шесть сервисов: PROD Core/Worker/frontend/Analytics и
+общие PostgreSQL/collector. TEST Worker/Core/frontend/Analytics stopped/restart=no,
+canonical TEST READ_ONLY/strategy=false. TEST volumes/history/outbox сохраняются.
+Общие DB/collector принадлежат moex-sentinel-remote, но обслуживают PROD —
+не выполнять TEST whole-project down и не запускать его приложения.
+Исходные mounts/networks/caps/loopback bindings сохранены, OOM/restarts0.
+В текущем PROD wrapper задавать явно REMOTE_CONTOUR=PROD и
+REMOTE_ENV_FILE=/etc/moex-sentinel/production.env, путь /opt/moex-sentinel/production-current.
+
+Штатная передача владельца: generation3/revision5, STOP_REQUIRED/recovery_only,
+limits=null/effective_can_submit=false, свежая lease. ARM/reconcile не выполнялись;
+база московского дня10.10 сохранена. Процент квоты пока NULL/settings_revision0.
+Health не подтверждает реальную торговлю или свежесть рынка.
+
+Original build/rollout FAIL и markers сохранены. Однократные продолжения завершили
+только оставшиеся шаги без повторного применения0005. Рабочая БД не копировалась
+и не восстанавливалась; integrity/финансовый граф не проверялись. Rollback подготовлен,
+не запускался. Root evidence и independent rollout_ops_review:
+`develop/reports/quota-prod-rollout-20261010/` — `complete-rollout.json`,
+`final-runtime-proof.json`, `external-browser-smoke.json`, `result.json`/`final-review.json`.
+Ниже — исторические снимки.
+
+### Включение TEST/Sandbox торговли 08.10.2026
+
+После отдельного явного разрешения владельца в TEST включены
+`BROKER_ACCESS_MODE=TRADE` и `STRATEGY_ENABLED=true`. В canonical TEST env
+изменены только эти два значения. Release `vps-20261008-62639a8`, images,
+ограничения ресурсов, volumes, сети и shared PostgreSQL сохранены. PROD
+остаётся `READ_ONLY`, `STRATEGY_ENABLED=false`; его env и container IDs
+не менялись. Endpoint TEST подтверждён как `sandbox-invest-public-api.tbank.ru:443`.
+
+Candidate прошёл preflight до изменения runtime. TEST Worker завершён чисто
+с нулём активных intents, затем остановлены TEST Core и общий collector.
+После изменения env сначала запущены Core/collector, затем единственный
+TEST Worker на VPS. Краткая остановка общего collector задержала чтение
+портфелей обоих контуров; PROD Core/Worker продолжали работать.
+
+Worker стартовал в 17:42:09 UTC (20:42:09 МСК). Все 12 последних проверенных
+решений получены после старта, `STRATEGY_DISABLED` отсутствует; есть
+`SELL_PART/LIFO_LOT_TAKE_PROFIT`. Финальный снимок 17:44:13 UTC подтвердил
+5 TEST orders `FILLED`, 2 `CANCELLED` и 5 executions в Core; последняя
+execution — 17:42:52 UTC. В истории брокера появились новые TEST операции,
+последняя в проверенной выборке — 17:42:51 UTC. PROD orders/executions=0.
+
+HTTPS/auth/CSRF/assets/health и свежий `CONTROL_PROGRESS/COMPLETED` прошли
+в обоих контурах. 9 контейнеров работают без OOM и перезапусков. Delivery
+за 7,5 секунды подтвердила ACK границы Worker и рост Core/Worker sequences
+всех 6 TEST automation; FAILED нет. Captured cohort пуст, поэтому конкретные
+UUID событий этой проверкой не сверялись; 9 новых pending выше cutoff допустимы.
+Общий diagnostics остаётся `UNKNOWN`; открытые S1/S2/B1 и полный benchmark
+этим включением не закрыты. Singleton проверен на VPS, другие хосты не проверялись.
+
+Рабочие данные не восстанавливались. Резервная копия deploy ниже относится
+к состоянию до новых Sandbox сделок. После появления заявок возврат в
+READ_ONLY требует чистой остановки Worker и сверки intents/брокера;
+восстановление прежней рабочей БД не является способом отката торговли.
+Evidence: `develop/reports/test-vps-deploy-20261008/` —
+`server-test-trade-preflight-final.json`, `server-test-trade-stop.json`,
+`server-test-trade-core-start.json`, `server-test-trade-worker-start.json`,
+`server-test-trade-fresh-decisions.json`, `server-public-after-test-trade.json`,
+`server-test-trade-delivery.json`, `server-test-trade-final-runtime.json`
+и `test-trade-acceptance.json`.
+
+Независимый `recent_completeness_audit` принял фактические receipts и этот
+раздел: C0/I0/M0. Ревью выполнено без SSH по безопасным результатам root-проверок;
+приватный VPS baseline рецензент не читал. Результат:
+`test-trade-final-review.json` в том же каталоге evidence.
+
+### Применение сохранённого PROD токена 08.10.2026
+
+По запросу владельца на боевой запуск проверено актуальное PROD подключение:
+запись обновлена в 21:06:47 МСК, а Worker был запущен до изменения. В
+21:14:19 МСК чисто перезапущен тот же PROD Worker в `READ_ONLY` с
+`STRATEGY_ENABLED=false`. Перед стартом подтверждены exit0, отсутствие активных
+intents, чистое завершение SQLite и отсутствие незавершённых WAL/journal.
+Container ID, полное окружение, image, caps и volume сохранены; остальные
+контейнеры и canonical env не менялись. TEST продолжает торговлю без перезапуска.
+
+Сохранённые credentials проверены прямыми безопасными RPC `GetAccounts`,
+`GetPortfolio`, `GetPositions`, `GetOrders`, `GetStopOrders`: выбранный счёт
+доступен, позиции читаются, blocked balances и активные обычные/стоп-заявки
+отсутствуют. `GetAccounts` вернул для счёта `FULL_ACCESS`; это не приёмка
+торгового допуска или проверка прав реальной мутацией. Значение токена агент
+не менял и не выводил; `updated_at` подтверждает изменение записи, а не
+сравнение старого и нового токена. Настройки стабильны до и после restart/RPC.
+
+Проверки 21:15–21:17 МСК подтвердили свежий `CONTROL_PROGRESS/COMPLETED`,
+health/auth и нулевые PROD app orders/executions. Боевой алгоритм не запускался:
+семь действующих guards запрещают PROD+TRADE. Независимая source-проверка
+подтвердила отсутствие P3 admission/lease, численных ограничений и live
+arming/revocation перед post/retry. Для ограниченного запуска нужны реализация
+P3, принятая свежая P4 сверка и P5 с конкретным UID/бюджетом владельца.
+Запрошены UID, max order notional, exposure, outstanding orders и daily loss;
+значения не подставлялись автоматически. Общий diagnostics остаётся `UNKNOWN`.
+
+Evidence в `develop/reports/test-vps-deploy-20261008/`:
+`server-prod-token-metadata-before.json`, `server-prod-token-worker-restart.json`,
+`server-prod-token-safe-rpc-retry.json`, `server-prod-launch-public-after.json`,
+`server-prod-token-final-financial-scope.json`, `prod-token-acceptance.json`.
+Первый RPC probe отказал до запуска из-за типа stdin диагностической команды;
+исправлен только транспорт, первоначальный failure сохранён отдельно.
+Независимый `recent_completeness_audit` принял применение credentials и этот
+раздел: C0/I0/M0; evidence `prod-token-final-review.json`. Это ревью локальных
+receipts без SSH и новых тестов, с сохранением env/config по безопасным
+root assertions. Боевой допуск этим ревью не принят.
+
+### Исторический снимок после deploy 08.10.2026 — до включения торговли
+
+По явному разрешению владельца обновлены TEST и PROD до commit
+`62639a8655cf439c1b1eea6a83a14ae1f14dd33b`, release `vps-20261008-62639a8`.
+Финальная проверка 16:32:03 UTC подтвердила обе current links, замену только
+`RELEASE_TAG` в root-only canonical env и точные новые Python image IDs.
+Frontend использует прежний image: его входы не менялись. Нативные source
+hashes, imports из `/app/src`, UID, зависимости и конфигурация образов проверены;
+448 source/test файлов совпадают с ранее проверенным snapshot (1991 backend PASS).
+
+9 контейнеров работают без OOM и перезапусков. Shared PostgreSQL сохранила ID,
+volume и schema `0003_user_broker_archive`; default transaction isolation —
+`read committed`. Legacy PROD database остановлена. Worker volumes, scopes,
+порты, сети, UID и прежние ограничения ресурсов сохранены; миграций нет.
+Оба контура `READ_ONLY`, `STRATEGY_ENABLED=false`, orders/executions/intents=0.
+Collector после обновления записал свежие TEST/PROD snapshots без ошибок.
+
+HTTPS, index/JS/CSS, health/schema, вход, защищённые cookies, CSRF, выход и
+отзыв сессии прошли в обоих контурах. Worker показывает свежий
+`CONTROL_PROGRESS/COMPLETED` после запуска. Общий diagnostics status остаётся
+`UNKNOWN`: это не подтверждение полной готовности всех зависимостей.
+Проверка доставки за 11,3 секунды подтвердила Core ACK зафиксированной границы
+Worker и рост последовательностей всех 6 TEST automation; PROD достиг своей
+границы. Captured outbox cohort был пуст в обоих контурах, поэтому конкретные
+UUID событий этой проверкой не сверялись. 32 новых pending выше cutoff
+допустимы; FAILED отсутствует. Это проверка границы, а не всей истории доставки.
+
+Согласованная резервная копия общей PG и обеих Worker SQLite проверена
+в изолированных хранилищах. Private backup:
+`/root/moex-sentinel-backups/vps-20261008-62639a8`; manifest SHA256
+`f07295db83a1e40d0033f21825b8bc70e0e71c5113415e4cb894609ddc830efe`.
+PG dump 487875983 bytes; schema, scopes, bootstrap graph и outbox обеих
+сохранённых Worker копий согласованы. Restore clone остановлен; рабочие данные
+не восстанавливались. Backup относится к первой остановке; более поздние
+READ_ONLY журналы остались в рабочих volumes. Старые images/env сохранены.
+Первый restore отказал из-за readiness временного initserver, следующая
+проверка — из-за синтаксиса paired SQL. Старые сервисы возобновлялись на время
+проверки; исправленный запрос проверен на уже восстановленной isolated PG.
+Первый delivery probe не завершился за 90 секунд; отдельная проверка по
+sequences прошла. Failed receipts сохранены, original helpers
+не переписаны. Возобновление collector сбросило его исторический restart
+counter 1→0; новый baseline зафиксировал фактический 0.
+
+Отсутствие новых TEST сделок объясняется READ_ONLY и выключенной стратегией:
+Worker делает `WAIT/STRATEGY_DISABLED`, а UI показывает историю операций брокера.
+Последняя TEST операция подтверждена: 29.09.2026 14:03:53.398 UTC, read errors=0.
+Deploy не включает торговлю. Открытые S1/S2/B1 из
+[аудита](../audits/service-isolation-completeness-20261008.md) остаются;
+shared data network `Internal=true` не обеспечивает полной изоляции сервисов.
+Evidence: `develop/reports/test-vps-deploy-20261008/`, прежде всего
+`server-installed-final.json`, `server-runtime-both-new.json`,
+`server-public-both-new.json`, `server-delivery-fast-both-new.json` и
+`server-verified-backup.json`. Browser click-through, TRADE и полный benchmark
+в этот deploy не входили.
+
+### Смена PROD токена и готовность к торговле — проверка кода 08.10.2026
+
+Сохранённое подключение редактируется в PROD UI: `/brokers`, двойной клик по
+строке, замена поля `token`, «Сохранить», затем «Проверить». PUT настроек
+разрешён в READ_ONLY после авторизации, с Origin и CSRF. Для подключения с уже
+выбранным счётом account/API/environment/FQDN закреплены; смена токена не
+создаёт новый scope и не требует удаления подключения или истории.
+
+Core читает новый токен из сохранённых settings; market gateway пересоздаёт
+источник при изменении подключения, collector читает settings в каждом цикле.
+Работающий streaming Worker сохраняет SDK session со старым токеном и не
+пересоздаёт её только из-за PUT. После смены токена нужен контролируемый
+перезапуск PROD Worker с сохранением SQLite volume; мгновенный hot reload не
+реализован. «Проверить» читает доступные счета и наличие выбранного account,
+не отправляет пробную заявку и не доказывает торговые права токена.
+
+Торговый режим и общие настройки стратегии читаются из окружения при старте,
+через форму брокера не меняются. В release `62639a8` PROD+TRADE отвергают Core,
+Worker, order adapter и deploy preflight: замены токена и env недостаточно.
+Допуск, лимиты, контролируемое владение account и аварийное отключение из
+[P3–P5](../superpowers/plans/production-api.md#p3-допуск-торговли-и-восстановление)
+требуют реализации и проверки до старта реальных сделок. Эта проверка кода не
+меняла VPS, токен или READ_ONLY и не запускала торговые действия.
+
+### Исторический снимок после deploy 04.10.2026
 
 По разрешению владельца установлен commit
 `f29472f405542ba172af4401f81d192246e04f43`, версия сервисов `0.2.0`, release
@@ -302,14 +496,47 @@ sh deploy/remote/compose.sh --profile trading up -d --no-deps trading-automaton
 
 ## Обновление и откат
 
-1. Собрать новый уникальный tag заранее; сохранить старые образы и точные env/commit.
-2. Остановить Worker, затем остальные writers, проверить graceful shutdown. Сделать согласованную резервную копию обеих БД.
-3. Применить миграции новой версии. Запустить Core/Analytics/UI, проверить health и audit. Включить единственный Worker последним.
-4. Если приложение сломано **до возобновления торговли** и схема совместима, вернуть старый `RELEASE_TAG` и прежний checkout, запускать `up --no-build`; не выполнять rebuild старого tag из новых исходников.
-5. При несовместимой схеме не делать слепой Alembic downgrade. Восстановить согласованную пару backup в **новые** volumes, переключить env на них, сохранив повреждённые volumes для расследования. Проверить совместимость версии Worker SQLite отдельно.
-   Общая PG затрагивает обе среды: перед restore остановить все TEST/PROD writers;
-   после переключения оба Core должны указывать на одну восстановленную database.
-6. Если после backup уже были новые брокерские действия, откат данных к backup может потерять intent и привести к повторной торговле. Сначала остановить Worker и провести reconciliation с брокером; обычное восстановление старого backup запрещено как автоматическая процедура. Брокерское исполнение откатом БД не отменяется.
+Для планируемого GitHub CI/CD согласован ручной запуск раскатки PROD кнопкой
+**Run workflow** с выбором готового проверенного релиза (решение 10.10.2026).
+Workflows пока не внедрены; ниже описан действующий порядок обновления.
+
+1. Подготовить новый уникальный tag и проверить миграцию с rollback-скриптом на
+   отдельной тестовой БД. Сохранить старые образы, параметры запуска и volumes.
+2. Остановить Worker, затем остальные необходимые writers; проверить graceful
+   shutdown. Обычное совместимое обновление не требует нового backup/restore.
+3. Применить проверенную миграцию непосредственно к рабочей БД. Запустить
+   совместимые Core/Analytics/UI и collector, затем единственный Worker.
+   После смены PROD Worker выполнить штатную передачу владения; она оставляет
+   `STOP_REQUIRED`/`recovery_only`, новый торговый допуск не выдаётся автоматически.
+4. Приёмка после запуска: health checks, ping и открытие базового интерфейса.
+   Проверка целостности, сравнение финансового графа и репетиция восстановления
+   БД в обычный deployment не входят.
+5. При аварии выполнить предусмотренный безопасный rollback схемы Core и
+   приватной SQLite, затем вернуть совместимые прежние образы и параметры
+   запуска (`up --no-build`). Не пересобирать старый tag из новых исходников.
+   Если downgrade отказывает, сохранить данные и схему с совместимой версией
+   приложения; не запускать старый Core с несовместимым Alembic head.
+
+Backup/restore и перенос между хостами выше — отдельные эксплуатационные
+процедуры. Они не повторяются при каждом обновлении. Существующие резервные
+копии сохраняются; исполненные брокерские действия откатом БД не отменяются.
+
+Для выпуска квоты `0005_order_quota_percent` откат подготовлен в самой
+Alembic-миграции и в `develop/position-quota/rollback_worker_quota.py`.
+Сначала остановить PROD Worker/Core и общий collector, сохранить доказательство
+остановки владельца. Запускать downgrade до `0004_trading_admission` новым Core
+образом с действующим `DATABASE_URL` из PROD Compose, через Alembic Python API;
+сырой `alembic upgrade/downgrade` без явного URL использует SQLite из ini.
+Затем выполнить Worker-скрипт с единственным аргументом — существующим путём
+приватной SQLite из `LOCAL_DATABASE_URL`, на исходном volume. Оба скрипта
+отказывают при сохранённом ненулевом `order_quota_percent`; настройки не удалять
+ради прохождения проверки. При частичном откате схем сначала вернуть совместимый
+head0005 новым образом, а не запускать несовместимый старый Core.
+После успешного отката обеих схем вернуть проверенную пару прежних image IDs,
+запустить collector/Core/UI и Worker, передать владение без ARM. TEST приложения
+остаются выключены. Публичный маршрут при откате приложения сохраняет PROD443,
+`AUTH_ALLOWED_ORIGIN=https://135.136.178.252` и PROD-cookie; порт8443 не возвращать.
+Старые параметры сохраняются как частные входы операции, секреты не выводить.
 
 ## Эксплуатационные проверки
 

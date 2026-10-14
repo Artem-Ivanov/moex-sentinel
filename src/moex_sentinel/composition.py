@@ -8,10 +8,12 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.adapters.registry import BrokerAdapterRegistry
+from moex_sentinel.adapters.tinvest.admission_risk import TInvestAdmissionRiskAdapter
 from moex_sentinel.adapters.tinvest.market_data import TInvestMarketDataAdapter
 from moex_sentinel.adapters.tinvest.market_stream_source import TInvestMarketStreamSource
 from moex_sentinel.adapters.tinvest.order_execution import TInvestOrderExecutionAdapter
 from moex_sentinel.adapters.tinvest.portfolio import TInvestPortfolioAdapter
+from moex_sentinel.api.worker_auth import WorkerAuthenticator
 from moex_sentinel.config import Settings
 from moex_sentinel.domain.trading_summary import TradingSummaryView
 from moex_sentinel.services.automations import AutomationService
@@ -23,6 +25,7 @@ from moex_sentinel.services.broker_factory import (
 )
 from moex_sentinel.services.brokers import BrokerConfigurationService
 from moex_sentinel.services.connections import BrokerConnectionService
+from moex_sentinel.services.daily_admission_preparation import DailyAdmissionPreparationService
 from moex_sentinel.services.environment import PinnedEnvironment
 from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
 from moex_sentinel.services.market_data import BrokerMarketDataService
@@ -30,6 +33,7 @@ from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
 from moex_sentinel.services.portfolio import PortfolioAggregationService
 from moex_sentinel.services.portfolio_snapshot_collection import PortfolioSnapshotCollectionService
 from moex_sentinel.services.position_adoption import ConfiguredPositionAdoptionService, PositionAdoptionService
+from moex_sentinel.services.trading_admission import TradingAdmissionService
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
 from moex_sentinel.services.trading_fact_mapping import TradingFactMapper
 from moex_sentinel.services.trading_sessions import TradingSessionService
@@ -40,6 +44,7 @@ from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.storage.repositories.portfolio_snapshots import PortfolioSnapshotRepository
 from moex_sentinel.storage.repositories.position_adoption import PositionAdoptionRepository
 from moex_sentinel.storage.repositories.reference_catalog import ReferenceCatalogRepository
+from moex_sentinel.storage.repositories.trading_admission import TradingAdmissionRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
 from moex_sentinel.usecases.automations import (
@@ -47,6 +52,7 @@ from moex_sentinel.usecases.automations import (
     CreateTradingAutomationUsecase,
     HoldAutomationUsecase,
     ResumeAutomationUsecase,
+    UpdateTradingAutomationSettingsUsecase,
     ViewTradingAutomationDetailsUsecase,
     ViewTradingAutomationStatusesUsecase,
     ViewTradingAutomationsUsecase,
@@ -101,6 +107,7 @@ class ApplicationUsecases(PositionalModel):
     view_automaton_broker_connection: ViewAutomatonBrokerConnectionUsecase
     record_automaton_heartbeat: RecordAutomatonHeartbeatUsecase
     create_trading_automation: CreateTradingAutomationUsecase
+    update_trading_automation_settings: UpdateTradingAutomationSettingsUsecase
     view_trading_automation: ViewTradingAutomationUsecase
     view_trading_automation_statuses: ViewTradingAutomationStatusesUsecase
     view_trading_automation_details: ViewTradingAutomationDetailsUsecase
@@ -128,6 +135,9 @@ class ApplicationUsecases(PositionalModel):
     view_automation_statuses: ViewAutomationStatusesUsecase
     publish_trading_facts: PublishTradingFactsUsecase
     view_trading_summary: ViewTradingSummaryUsecase
+    trading_admission: TradingAdmissionService
+    daily_admission_preparation: DailyAdmissionPreparationService
+    worker_authenticator: WorkerAuthenticator
 
 
 class _SessionTradingSummaryService:
@@ -232,7 +242,10 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         automation_service,
         automaton_broker_service,
         lambda connection: TInvestOrderExecutionAdapter(
-            connection.token, connection.target, access_mode=connection.access_mode, account_id=connection.account_id
+            connection.token,
+            connection.target,
+            access_mode="READ_ONLY" if connection.environment == "PROD" else connection.access_mode,
+            account_id=connection.account_id,
         ),
         instrument_repository,
     )
@@ -242,11 +255,27 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         TradingFactMapper(),
         environment=settings.application_environment,
     )
+    trading_admission_repository = TradingAdmissionRepository(factory)
+    trading_admission = TradingAdmissionService(
+        trading_admission_repository,
+        risk=TInvestAdmissionRiskAdapter(),
+        connection_resolver=automaton_broker_service.connection,
+    )
+    daily_admission_preparation = DailyAdmissionPreparationService(
+        trading_admission,
+        broker_id=None if settings.internal_worker_broker_id is None else str(settings.internal_worker_broker_id),
+        enabled=settings.daily_admission_preparation_enabled,
+        environment=settings.application_environment,
+        access_mode=settings.broker_access_mode,
+        canary_uid=settings.daily_admission_canary_uid,
+    )
+    worker_authenticator = WorkerAuthenticator(settings, trading_admission_repository.get_runtime_credential)
     return ApplicationUsecases(
         view_automaton_broker_scope=ViewAutomatonBrokerScopeUsecase(automaton_broker_service),
         view_automaton_broker_connection=ViewAutomatonBrokerConnectionUsecase(automaton_broker_service),
         record_automaton_heartbeat=RecordAutomatonHeartbeatUsecase(automaton_sync_service),
         create_trading_automation=CreateTradingAutomationUsecase(automation_service),
+        update_trading_automation_settings=UpdateTradingAutomationSettingsUsecase(automation_service),
         view_trading_automation=ViewTradingAutomationUsecase(automation_service),
         view_trading_automation_statuses=ViewTradingAutomationStatusesUsecase(automation_service),
         view_trading_automation_details=ViewTradingAutomationDetailsUsecase(
@@ -281,4 +310,7 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         view_trading_summary=ViewTradingSummaryUsecase(
             _SessionTradingSummaryService(factory, settings.application_environment)
         ),
+        trading_admission=trading_admission,
+        daily_admission_preparation=daily_admission_preparation,
+        worker_authenticator=worker_authenticator,
     )

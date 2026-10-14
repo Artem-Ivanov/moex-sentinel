@@ -10,6 +10,14 @@ from moex_sentinel.storage.models.order_facts import (
 )
 from moex_sentinel.storage.models.position_facts import ExecutionLotAllocationModel, PositionLotModel
 from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel, InstrumentSyncStateModel
+from moex_sentinel.storage.models.trading_admission import (
+    TradingAccountAdmissionModel,
+    TradingAdmissionBaselineModel,
+    TradingAdmissionEventModel,
+    TradingReconciliationModel,
+    TradingSubmitReservationModel,
+    WorkerRuntimeInstanceModel,
+)
 from moex_sentinel.storage.models.trading_analytics import (
     BrokerAccountFeeProfileModel,
     PortfolioSnapshotModel,
@@ -36,6 +44,12 @@ __all__ = [
     "TradeAuditEventModel",
     "TradeDecisionModel",
     "TradeExecutionModel",
+    "TradingAccountAdmissionModel",
+    "TradingAdmissionBaselineModel",
+    "TradingAdmissionEventModel",
     "TradingAutomationModel",
+    "TradingReconciliationModel",
+    "TradingSubmitReservationModel",
     "UserBrokerModel",
+    "WorkerRuntimeInstanceModel",
 ]

@@ -24,3 +24,11 @@ class PortfolioStateCacheService:
     async def position(self, account_id: str, instrument_id: str) -> BrokerPosition | None:
         async with self._lock:
             return self._positions.get((account_id, instrument_id))
+
+    async def positive_security_count(self, account_id: str) -> int:
+        async with self._lock:
+            return sum(
+                position.quantity_lots > 0
+                for (cached_account, _), position in self._positions.items()
+                if cached_account == account_id
+            )

@@ -15,6 +15,11 @@ from sentinel_contracts.automation_lifecycle import InvalidAutomationTransition
 from sentinel_contracts.broker_execution import BrokerOrderState, OrderSide
 from sentinel_contracts.business_audit import BusinessAuditEvent, BusinessAuditLevel, BusinessAuditStage
 from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAuthorizationRequest,
+    submit_request_fingerprint,
+)
 from sentinel_contracts.trading_facts import BrokerPositionBootstrap, FactKind
 from tests.trading_automaton.command_factory import decision_item
 from tests.trading_automaton.storage.worker_storage_helpers import (
@@ -30,7 +35,7 @@ from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
 from trading_automaton.services.order_dispatch import OrderDispatchService
 from trading_automaton.services.order_tracking import OrderTrackingService
-from trading_automaton.storage.database import create_worker_engine
+from trading_automaton.storage.database import create_worker_engine, initialize_worker_schema
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import (
     Base,
@@ -54,6 +59,51 @@ def test_cache_round_trip_uses_strategy_free_baseline_command(worker_repository_
     assert restored == [command_value]
     assert not hasattr(restored[0], "strategy")
     assert restored[0].currency == "RUB"
+
+
+def test_settings_refresh_preserves_pending_fact_envelope_and_execution_revision(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    command_value = baseline_command()
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    before = repo.ready_fact_outbox(10, now=NOW, deadline_ms=0)
+    cached_before = repo.get_cached_command(str(command_value.automation_id))
+
+    repo.synchronize_core_state(
+        str(command_value.automation_id),
+        state=AutomationState.IN_WORK.value,
+        revision=1,
+        last_sequence_number=0,
+        settings_revision=1,
+        order_quota_percent=Decimal("10"),
+    )
+
+    refreshed = repo.get_cached_command(str(command_value.automation_id))
+    after = repo.ready_fact_outbox(10, now=NOW, deadline_ms=0)
+    assert refreshed.order_quota_percent == Decimal("10")
+    assert refreshed.settings_revision == 1
+    assert refreshed.revision == command_value.revision
+    assert refreshed.last_sequence_number == cached_before.last_sequence_number
+    assert after == before
+
+
+def test_cached_order_quota_survives_worker_database_restart(tmp_path) -> None:
+    path = tmp_path / "quota-restart.sqlite"
+    engine = create_worker_engine(f"sqlite:///{path}")
+    initialize_worker_schema(engine)
+    command_value = baseline_command(settings_revision=3, order_quota_percent=Decimal("12.5"))
+    LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False)).cache_command(command_value)
+    engine.dispose()
+
+    reopened = create_worker_engine(f"sqlite:///{path}")
+    initialize_worker_schema(reopened)
+    restored = LocalAutomationRepository(sessionmaker(reopened, expire_on_commit=False)).get_cached_command(
+        str(command_value.automation_id)
+    )
+    reopened.dispose()
+
+    assert restored.settings_revision == 3
+    assert restored.order_quota_percent == Decimal("12.5")
 
 
 def test_decision_batch_emits_typed_decision_and_order_facts(worker_repository_factory) -> None:
@@ -115,6 +165,397 @@ def test_order_state_fact_preserves_recorded_order_intent_snapshot(worker_reposi
             assert Decimal(str(changed[field])) == Decimal(str(recorded[field]))
         else:
             assert changed[field] == recorded[field]
+
+
+def test_pre_rpc_abort_proof_is_atomic_with_cancel_fact(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="SUBMITTING", occurred_at=NOW + timedelta(milliseconds=1))
+    proof = PreRpcAbortProof(
+        permit_id=UUID("00000000-0000-4000-8000-000000000701"),
+        idempotency_key=UUID(INTENT_ID),
+        request_fingerprint="a" * 64,
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000702"),
+        generation=1,
+        configuration_fingerprint="b" * 64,
+        aborted_at=NOW,
+        reason="PERMIT_EXPIRED_BEFORE_POST",
+    )
+
+    repo.update_intent(
+        INTENT_ID,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        requested_amount=Decimal("1000"),
+        estimated_commission=Decimal(),
+        pre_rpc_abort_proof=proof,
+    )
+
+    facts = repo.ready_fact_outbox(10, now=NOW + timedelta(seconds=2), deadline_ms=0)
+    assert facts[-1].payload["pre_rpc_abort_proof"] == proof.model_dump(mode="json")
+    assert facts[-1].payload["requested_amount"] == "1000"
+    proof_facts = [fact for fact in facts if fact.payload.get("pre_rpc_abort_proof") is not None]
+    assert len(proof_facts) == 1
+
+
+def test_duplicate_pre_rpc_proof_update_is_idempotent_and_rejects_changed_result(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="SUBMITTING", occurred_at=NOW + timedelta(milliseconds=1))
+    proof = PreRpcAbortProof(
+        permit_id=UUID("00000000-0000-4000-8000-000000000705"),
+        idempotency_key=UUID(INTENT_ID),
+        request_fingerprint="a" * 64,
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000706"),
+        generation=1,
+        configuration_fingerprint="b" * 64,
+        aborted_at=NOW,
+        reason="PERMIT_EXPIRED_BEFORE_POST",
+    )
+    result = {
+        "requested_amount": Decimal("1000"),
+        "estimated_commission": Decimal(),
+        "executed_amount": Decimal(),
+        "executed_commission": Decimal(),
+        "executed_lots": 0,
+        "executed_price": Decimal(),
+    }
+    repo.update_intent(
+        INTENT_ID,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        pre_rpc_abort_proof=proof,
+        **result,
+    )
+    before_retry = repo.ready_fact_outbox(20, now=NOW + timedelta(seconds=2), deadline_ms=0)
+
+    duplicate = repo.update_intent(
+        INTENT_ID,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=3),
+        pre_rpc_abort_proof=proof,
+        **result,
+    )
+    assert duplicate.state == "CANCELLED"
+    assert repo.ready_fact_outbox(20, now=NOW + timedelta(seconds=4), deadline_ms=0) == before_retry
+
+    changed_proof = proof.model_copy(update={"generation": 2})
+    changed_results = (
+        {"pre_rpc_abort_proof": changed_proof},
+        {"requested_amount": Decimal("1001")},
+        {"estimated_commission": Decimal("1")},
+        {"executed_amount": Decimal("1")},
+        {"executed_commission": Decimal("1")},
+        {"executed_lots": 1},
+        {"executed_price": Decimal("100")},
+        {"broker_order_id": "unexpected-order"},
+        {"state": "REJECTED"},
+    )
+    for change in changed_results:
+        retry_values = {**result, **change}
+        retry_proof = retry_values.pop("pre_rpc_abort_proof", proof)
+        retry_state = retry_values.pop("state", "CANCELLED")
+        retry_broker_order_id = retry_values.pop("broker_order_id", None)
+        with pytest.raises(ValueError, match="proof|result"):
+            repo.update_intent(
+                INTENT_ID,
+                state=retry_state,
+                occurred_at=NOW + timedelta(seconds=5),
+                broker_order_id=retry_broker_order_id,
+                pre_rpc_abort_proof=retry_proof,
+                **retry_values,
+            )
+        assert repo.ready_fact_outbox(20, now=NOW + timedelta(seconds=6), deadline_ms=0) == before_retry
+
+
+def test_pre_rpc_abort_proof_outbox_survives_sqlite_restart_and_retry(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'proof-replay.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW), environment="PROD")
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="SUBMITTING", occurred_at=NOW + timedelta(milliseconds=1))
+    proof = PreRpcAbortProof(
+        permit_id=UUID("00000000-0000-4000-8000-000000000711"),
+        idempotency_key=UUID(INTENT_ID),
+        request_fingerprint="c" * 64,
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000712"),
+        generation=2,
+        configuration_fingerprint="d" * 64,
+        aborted_at=NOW,
+        reason="PERMIT_EXPIRED_BEFORE_POST",
+    )
+    repo.update_intent(
+        INTENT_ID,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        requested_amount=Decimal("1000"),
+        estimated_commission=Decimal(),
+        pre_rpc_abort_proof=proof,
+    )
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=2)),
+        environment="PROD",
+    )
+    first_delivery = reopened.ready_fact_outbox(10, now=NOW + timedelta(seconds=2), deadline_ms=0)
+    retried_delivery = reopened.ready_fact_outbox(10, now=NOW + timedelta(seconds=3), deadline_ms=0)
+
+    assert first_delivery[-1].payload["pre_rpc_abort_proof"] == proof.model_dump(mode="json")
+    assert retried_delivery[-1].payload == first_delivery[-1].payload
+    assert reopened.get_active_intent(str(value.automation_id)) is not None
+    reopened.acknowledge_fact_outbox(
+        str(value.automation_id),
+        accepted_through_sequence=retried_delivery[-1].sequence_number,
+        current_revision=reopened.get_state(str(value.automation_id)).revision,
+    )
+    assert reopened.ready_fact_outbox(10, now=NOW + timedelta(seconds=4), deadline_ms=0) == []
+    reopened_engine.dispose()
+
+
+def test_pre_rpc_zero_fill_cancel_replay_survives_sqlite_restart(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'pre-rpc-finalization-replay.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW), environment="PROD")
+    value = baseline_command()
+    repo.cache_command(value)
+    origin = {
+        "runtime_instance_id": "00000000-0000-4000-8000-000000000722",
+        "generation": 2,
+        "revision": 1,
+        "configuration_fingerprint": "d" * 64,
+        "lot_size": value.lot_size,
+        "currency": value.currency,
+        "instrument_uid": value.external_instrument_id,
+        "fact_instrument_id": str(value.instrument_id),
+    }
+    decision = decision_item(value).model_copy(update={"strategy_snapshot": {"admission_origin": origin}})
+    repo.save_decision_batch((decision,), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="SUBMITTING", occurred_at=NOW + timedelta(milliseconds=1))
+    authorization = SubmitAuthorizationRequest(
+        broker_id=value.broker_id,
+        account_id=value.account_id,
+        automation_id=value.automation_id,
+        idempotency_key=UUID(INTENT_ID),
+        generation=origin["generation"],
+        revision=origin["revision"],
+        configuration_fingerprint=origin["configuration_fingerprint"],
+        instrument_uid=origin["instrument_uid"],
+        lot_size=origin["lot_size"],
+        currency=origin["currency"],
+        side="BUY",
+        quantity_lots=1,
+        limit_price=Decimal("100"),
+        market_valid_until=NOW,
+        submit_deadline=NOW,
+    )
+    proof = PreRpcAbortProof(
+        permit_id=UUID("00000000-0000-4000-8000-000000000721"),
+        idempotency_key=UUID(INTENT_ID),
+        request_fingerprint=submit_request_fingerprint(authorization),
+        runtime_instance_id=UUID(origin["runtime_instance_id"]),
+        generation=origin["generation"],
+        configuration_fingerprint=origin["configuration_fingerprint"],
+        aborted_at=NOW + timedelta(seconds=1),
+        reason="PERMIT_EXPIRED_BEFORE_POST",
+    )
+    finalization = ExecutionFinalization(
+        intent_id=INTENT_ID,
+        automation_id=str(value.automation_id),
+        broker_id=str(value.broker_id),
+        account_id=value.account_id,
+        instrument_id=value.external_instrument_id,
+        side="BUY",
+        quantity_lots=1,
+        requested_price=Decimal("100"),
+        currency="RUB",
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=2),
+        broker_order_id="",
+        requested_amount=Decimal("1000"),
+        executed_amount=Decimal(),
+        estimated_commission=Decimal(),
+        executed_commission=Decimal(),
+        executed_lots=0,
+        executed_price=Decimal(),
+        executed_at=None,
+        terminal_at=NOW + timedelta(seconds=2),
+        lot_size=10,
+        process_id=AUDIT_PROCESS_ID,
+    )
+    repo.update_intent(
+        INTENT_ID,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        requested_amount=Decimal("1000"),
+        estimated_commission=Decimal(),
+        executed_amount=Decimal(),
+        executed_commission=Decimal(),
+        executed_lots=0,
+        executed_price=Decimal(),
+        pre_rpc_abort_proof=proof,
+    )
+
+    first = repo.finalize_execution(finalization)
+    assert first.applied is True
+    facts_after_finalize = repo.ready_fact_outbox(20, now=NOW + timedelta(seconds=2), deadline_ms=0)
+    proof_facts = [fact for fact in facts_after_finalize if fact.payload.get("pre_rpc_abort_proof") is not None]
+    order_state_facts = [
+        fact for fact in facts_after_finalize if fact.fact_kind == FactKind.BROKER_ORDER_STATE_CHANGED.value
+    ]
+    assert len(proof_facts) == 1
+    assert order_state_facts[-1].payload.get("pre_rpc_abort_proof") is None
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=3)),
+        environment="PROD",
+    )
+    before_replay = reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=3), deadline_ms=0)
+    replay = reopened.finalize_execution(finalization)
+    after_replay = reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=4), deadline_ms=0)
+
+    assert replay.applied is False
+    assert replay.intent is not None
+    assert replay.intent.broker_order_id is None
+    assert after_replay == before_replay
+    with pytest.raises(ValueError, match="conflicts"):
+        reopened.finalize_execution(finalization.model_copy(update={"broker_order_id": "real-broker-order"}))
+    assert reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=5), deadline_ms=0) == before_replay
+    for invalid_origin in (
+        None,
+        {**origin, "configuration_fingerprint": "e" * 64},
+        {**origin, "lot_size": origin["lot_size"] + 1},
+    ):
+        with reopened_factory.begin() as session:
+            intent_model = session.get_one(LocalIntentModel, INTENT_ID)
+            snapshot = dict(intent_model.strategy_snapshot)
+            if invalid_origin is None:
+                snapshot.pop("admission_origin")
+            else:
+                snapshot["admission_origin"] = invalid_origin
+            intent_model.strategy_snapshot = snapshot
+        with pytest.raises(ValueError, match="conflicts"):
+            reopened.finalize_execution(finalization)
+        assert reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=6), deadline_ms=0) == before_replay
+    reopened_engine.dispose()
+
+
+@pytest.mark.parametrize("state", ["FILLED", "REJECTED", "CANCELLED", "EXPIRED"])
+def test_terminal_intent_without_execution_facts_remains_recoverable(tmp_path: Path, state: str) -> None:
+    engine = create_worker_engine(f"sqlite:///{tmp_path / 'terminal-recovery.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, environment="PROD")
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state=state, occurred_at=NOW + timedelta(seconds=1))
+
+    active = repo.get_active_intent(str(value.automation_id))
+
+    assert active is not None
+    assert active.state == state
+    engine.dispose()
+
+
+@pytest.mark.parametrize(("state", "executed_lots"), [("REJECTED", 0), ("CANCELLED", 1), ("EXPIRED", 0)])
+def test_test_terminal_without_execution_facts_does_not_block_next_intent(
+    tmp_path: Path,
+    state: str,
+    executed_lots: int,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'legacy-terminal.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW))
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(
+        INTENT_ID,
+        state=state,
+        occurred_at=NOW + timedelta(seconds=1),
+        executed_lots=executed_lots,
+    )
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=2)),
+    )
+
+    assert reopened.get_active_intent(str(value.automation_id)) is None
+    next_intent_id = "00000000-0000-4000-8000-000000000909"
+    reopened.save_decision_batch(
+        (decision_item(value, intent_id=next_intent_id),),
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+    active = reopened.get_active_intent(str(value.automation_id))
+
+    assert active is not None
+    assert active.idempotency_key == next_intent_id
+    reopened_engine.dispose()
+
+
+def test_test_filled_intent_is_active_until_execution_facts_are_committed(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(INTENT_ID, state="FILLED", occurred_at=NOW + timedelta(seconds=1), executed_lots=1)
+
+    pending = repo.get_active_intent(str(value.automation_id))
+    assert pending is not None
+    assert pending.state == "FILLED"
+
+    repo.finalize_execution(filled_buy())
+
+    assert repo.get_active_intent(str(value.automation_id)) is None
+
+
+def test_stale_nonterminal_update_cannot_regress_finalized_filled_intent(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    repo.update_intent(
+        INTENT_ID,
+        state="FILLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        terminal_at=NOW + timedelta(seconds=1),
+    )
+    before = repo.ready_fact_outbox(10, now=NOW + timedelta(seconds=2), deadline_ms=0)
+
+    actual = repo.update_intent(
+        INTENT_ID,
+        state="ACCEPTED",
+        occurred_at=NOW + timedelta(seconds=2),
+        executed_lots=0,
+    )
+    after = repo.ready_fact_outbox(10, now=NOW + timedelta(seconds=3), deadline_ms=0)
+
+    assert actual.state == "FILLED"
+    assert after == before
 
 
 def test_active_buy_reservation_uses_cached_command_currency(worker_repository_factory) -> None:

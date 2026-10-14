@@ -11,7 +11,7 @@ from alembic import command
 from alembic.config import Config
 from moex_sentinel.config import Settings as CoreSettings
 from moex_sentinel.storage.models import Base
-from moex_sentinel.storage.schema_revision import current_schema_revision
+from moex_sentinel.storage.schema_revision import current_schema_revision, expected_schema_revision
 
 
 def test_schema_command_upgrades_configured_database_to_head(monkeypatch, capsys) -> None:
@@ -120,7 +120,7 @@ def test_schema_command_migrates_with_database_configuration_only(
     assert json.loads(capsys.readouterr().out) == {"status": "SCHEMA_UPGRADED"}
     engine = create_engine(database_url)
     try:
-        assert current_schema_revision(engine) == "0003_user_broker_archive"
+        assert current_schema_revision(engine) == expected_schema_revision(str(alembic_ini))
         assert set(inspect(engine).get_table_names()) == {*Base.metadata.tables, "alembic_version"}
     finally:
         engine.dispose()

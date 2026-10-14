@@ -1,10 +1,68 @@
 # Актуальный план развития
 
-Актуализировано 2026-10-04 по текущему checkout и сохранённым материалам.
+Актуализировано 2026-10-10 по текущему checkout и сохранённым материалам.
 Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
 содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
 объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
 сохранена как история приёмок, а не инструкция к повторному выполнению.
+
+## Дополнение 10.10.2026: процент квоты одной заявки — DEPLOYED PROD
+
+Пользователь уточнил первоначальные «величину лота и количество лотов» до
+одного процента доступной квоты в карточке открытой позиции. Подтверждено:
+свободные деньги / число открытых торговых позиций; BUY, усреднение и обычный
+SELL_PART ограничиваются, защитный стоп и SELL_ALL остаются без этого лимита.
+Сверка root с текущим кодом показала общий `buy_order_lots`, отсутствие формы
+и редактирования Core, локальное хранение активных команд Worker. Старый 0.7
+без индивидуальных ресурсов заменён только этим пользовательским параметром.
+
+Контракт: nullable `order_quota_percent` (0 < процент <= 100), NULL сохраняет
+прежнее поведение. Валютные и неположительные позиции не участвуют в делителе,
+минимум 1; предел номинала округляется вниз по цене биржевого лота (ask для
+покупки, bid для продажи); комиссия отдельно входит в проверку доступных денег.
+5000 RUB / 1 × 10% / 50 RUB = 10 лотов. Настройка обновляется у активной позиции,
+сохраняется после перезапуска и влияет на будущие решения; созданные intent
+не меняются. Отдельная `settings_revision` сохраняет принимаемость pending
+финансовых фактов; PATCH проверяет execution и settings revisions, изменяет
+только последнюю. Core 0005 и аддитивное обновление Worker SQLite имеют
+проверяемый откат с отказом при потере заданной настройки.
+
+Root актуализировал scope/DoD до делегирования; авторы `quota_core`,
+`quota_worker`, `quota_frontend` (gpt-6-luna/high), общий contract writer Core.
+Независимый nonauthor `rollout_ops_review` проверил Core/API/CAS, реальные
+Worker composition/status refresh/стратегию, сохранность intents/outbox,
+SQLite/PostgreSQL upgrade/rollback и UI race/conflict: C0/I0/M0 после исправлений.
+Финансовое округление использует точный расчёт целых лотов; BUY размер задаётся
+до проверки средств и стратегии. При сбое связи с Core Worker приостанавливает
+новые решения до подтверждения настроек. UI сохраняет ввод при polling,
+защищает сохранённые настройки от задержанных ответов и явно предлагает сброс.
+
+Root: полный backend на Python 3.12 с отдельным PostgreSQL — 2266 PASS,
+2 SKIP исторических restore rehearsal без `pg_dump`, 232 warnings; frontend —
+215 PASS, typecheck/build PASS; изменённые Python-файлы Ruff/Black/diff PASS.
+Свежий отдельный прогон двух PostgreSQL migration tests — PASS. Итоговая
+локальная интеграция и доказательства независимо приняты `rollout_ops_review`: C0/I0/M0.
+Доказательства:
+`develop/reports/position-quota-20261010/`,
+план `develop/.planning/2026-10-10-position-lot-parameters/task_plan.md`.
+Core, Worker и интерфейс совместно выложены в PROD около14:54 МСК10.10:
+`vps-20261010-quota-987a495d6c71`, рабочая схема `0005_order_quota_percent`.
+Основной `https://135.136.178.252/` обслуживает PROD; listener8443 отключён,
+внешний HTTPS8443 недоступен. Четыре TEST приложения stopped/restart=no,
+canonical TEST READ_ONLY/strategy=false; shared PostgreSQL/collector и volumes сохранены.
+Health/HTTPS/auth/CSRF/assets/позиции/поля настроек PASS; отдельный Chrome
+отрисовал форму входа. Карточка после входа вручную не проверялась.
+Процент пока NULL/settings_revision0. Owner generation3/revision5,
+STOP_REQUIRED/recovery_only/effective_can_submit=false, lease свежая на снимке14:55.
+ARM/reconcile не выполнялись; база10.10 сохранена, реальная торговля не подтверждена.
+Original FAILED_BUILD/FAILED_ROLLOUT и markers сохранены; однократные продолжения
+завершили только недостающие шаги без повторной миграции/сборки.
+OPS: root36, затем47 для build continuation и8 для rollout continuation;
+Ruff/Black/diff PASS. Independent rollout_ops_review проверил подготовку и actual receipts;
+окончательная приёмка документации фиксируется в `final-review.json`.
+Evidence: `develop/reports/quota-prod-rollout-20261010/` — `complete-rollout.json`,
+`final-runtime-proof.json`, `external-browser-smoke.json`, `result.json`.
+[Контракт и условия отката](development.md#процент-квоты-заявки).
 
 ## Дополнение 02.10.2026: VPS, эксплуатация и реальный API
 
@@ -257,10 +315,211 @@ Storage baseline измерен и независимо
 | Порядок | Веха | Условие готовности |
 |---|---|---|
 | 1 | Sandbox: initial приёмка PASS | Длительное наблюдение далее O1/S1 |
-| 2 | O1/S1: диагностика, ёмкость и M1 оптимизация ОЗУ — OPEN | Статус/audit доступны оператору; замеры24ч и подтверждение7дней дают диапазон хранения30/180дней; M1 требует измеримого before/after и независимого review |
+| 2 | O1/S1: диагностика, ёмкость и M1 оптимизация ОЗУ — OPEN | Статус/audit доступны оператору; замеры24ч и подтверждение7дней подтверждают рост данных и потребность в ёмкости; M1 требует измеримого before/after и независимого review |
 | 3 | PROD P1/P2/shared-DB/dedup: code/integration PASS | Одна Core PG/БД, scope guards/collector/Compose проверены; backend 1456/0skip, frontend 119/type/build, isolated paired fixtures 2/0skip. Deployment, рабочая парная backup/restore и ограниченные capacity/runtime проверки выполнены; initial operational acceptance PASS; PROD accounts/summary приняты; остальная PROD приёмка и длительное наблюдение открыты |
 | 4 | O2/PROD P3/P4: готовность | Уведомления, лимиты/controlled takeover, восстановление и сверка реального счёта приняты |
 | 5 | PROD P5: canary | Отдельный допуск владельца, численные лимиты и один разрешённый UID; расширение отдельно |
+
+10.10 выполнен свежий аудит ресурсов, БД и торгового допуска; по запросу пользователя удалены копии. Шесть работающих сервисов занимали около 542 MiB Docker RAM; shared PostgreSQL — 8,60 GB logical / 8,71 GB physical, том SQLite PROD Worker — 0,27 MiB. Удалены два остановленных PostgreSQL restore-контейнера с их томами и 23 файла копий; освобождено 30,07 GB, свободно около 39,01 GB. Все 11 остальных контейнеров и четыре исходных тома сохранены. Это точечное измерение, приёмка 24ч/7суток O1/S1/M1 остаётся открытой. GOLD имеет IN_WORK и 18 лотов, но допуск STOP_REQUIRED/recovery_only=true/effective_can_submit=false и SDK session CLOSED; торговля в аудитe не включалась. Пользователь согласовал месячную очистку с исключениями для финансовой истории, постоянных ключей повторов и незавершённых операций. Реализован `develop/scripts/cleanup_database.py`: отчёт по умолчанию, `--apply` для удаления старых некритичных логов и снимков с сохранением последних. 17 целевых проверок изолированных PostgreSQL/SQLite и 2268 проектных тестов прошли (2 paired restore skipped: нет `pg_dump`); независимый `cleanup_ops_review` C0/I0/M0. [Правила и команды](../develop/database-retention.md). На рабочей БД SQL DELETE не выполнялся. Доказательства: `develop/reports/prod-resources-db-trading-audit-20261010/audit-report.md`, `copy-deletion.json`, `copy-post-verification.json`.
+
+11.10 подготовлено [архитектурное предложение по БД](audits/database-architecture-20261011.md)
+по свежему READ ONLY снимку PostgreSQL 16.15 и SQLite PROD Worker:
+shared PG 8,611 GB, 24 таблицы/45 FK/69 индексов; три таблицы events/audit/decisions
+занимают 99,43% размера. Все 1592 sampled envelopes принадлежат историческому TEST;
+это не измерение текущего роста PROD. Найдены два составных CHECK, допускающих NULL,
+дублирование diagnostic payload в permanent envelopes и новый постоянный audit
+OWNER_LEASE_RENEWED на каждый heartbeat. Это исходный архитектурный снимок;
+последующая реализация описана ниже, deployment доработок не выполнялся.
+Предложенные отдельные задачи (приёмка/rollback подробно в заключении):
+
+| Задача | Статус | Граница / DoD |
+|---|---|---|
+| D1: строгие bootstrap/generation CHECK | CODE_DONE / NOT_DEPLOYED | Новая миграция поверх 0005, без правки применённых revisions; isolated upgrade/downgrade, отказ без удаления несовместимых данных |
+| D1b: Worker typed states / order transitions | CODE_DONE / NOT_DEPLOYED | Отдельная versioned SQLite migration и narrow policy реальных recovery/terminal edges; сохранение outbox/intents/keys |
+| D2a: компактная диагностика успешного renewal | CODE_DONE / NOT_DEPLOYED | Lease обновляется/проверяется каждый heartbeat; permanent owner/ARM/STOP/expiry/denial evidence сохраняются; выбранный observability contract и before/after |
+| D2b: один decision audit summary вместо шести markers | CODE_DONE / NOT_DEPLOYED | Решения/финансовые факты/critical/bootstrap/recovery сохраняются; old history не удаляется; sequence/retry и полнота summary проверяются |
+| D3: измеренный portfolio run_id index | CODE_DONE / NOT_DEPLOYED | Только isolated query/insert/WAL comparison; один оправданный index, rollback; пустые/малые relations заранее не индексировать |
+| D4: permanent receipt + diagnostic body | CONDITIONAL | Versioned semantic replay/retention/rollback spec; финансовая история и global dedup identity постоянны; начинать при доказанной необходимости |
+
+11.10 архитектурная приёмка: независимые status/audit/index исследования выполнены;
+финальное nonauthor cross-review `db_architecture_review` C0/I0/M0, оценка завершена. Пользователь 11.10 разрешил реализацию D1/D1b/D2a/D2b/D3
+с делегированием и удаление всех TEST данных из текущей shared Core БД.
+[План, scope и rollback](superpowers/plans/2026-10-11-database-improvements-and-test-purge.md):
+реализация D1/D1b/D2a/D2b/D3 и task cross-review завершены; общая source-проверка
+завершена: финальный TEST recovery FAILED→open→terminal край и устаревшие fixtures
+исправлены и независимо перепроверены. Общие проверки: 2437 проектных + 141
+служебный тест, Ruff/Black 65 Python файлов, diff check PASS; broad final source
+review database_integration_review Approved C0/I0/M0. Новые source миграции 0006/0007
+не применялись на VPS (live head 0005). Decision audit 6→1, successful lease audit
+первое событие поколения и затем не чаще одного за 300с; heartbeat и security checks
+сохранены. Изолированный benchmark run_id index: 1080→4 buffers, индекс 336 KiB,
+WAL +12,25% для измеренного workload. TEST purge helper прошёл 16 isolated SQLite/PG
+tests и independent test_purge_review C0/I0/M1; actual purge завершён, fresh24таблицы
+TEST0/originalerrors0/allprocessbackendabsence. Собственный временный audit index
+создан и снят; protected PROD18eventtail/original4volumes сохранены.
+Health/ping/basicHTML/API PASS, независимое operational review purge_final_ops_review
+Approved C0/I0/M0, final I1 закрыт. D4 остаётся условным; O1/S1/M1 и торговая приёмка открыты.
+[Отчёт реализации](audits/database-improvements-20261011.md).
+
+09.10 начата авторизованная реализация и раскатка P3 по
+[спецификации допуска](superpowers/specs/2026-10-09-production-admission-design.md)
+и [плану](superpowers/plans/2026-10-09-production-admission.md).
+P3 **DONE** 09.10 в 21:55 МСК по актуальному базовому DoD: реализация и независимые Core/Worker/fact/OPS
+reviews приняты без существенных замечаний. Оба полных прогона — baseline
+и Python3.12.14 с фактическими 51 runtime зависимостями PROD — прошли:
+2230 тестов без пропусков каждый. Native Linux образы собраны и проверены.
+Пользователь отдельно подтвердил краткую остановку TEST portfolio collector.
+QUIESCE 09.10 в 17:12 МСК выполнен: все пять writers остановлены; Core SIGTERM
+подтверждён свежими shutdown markers, Worker/collector — exit 0, обе SQLite
+без active intents/unclean runs/WAL. Узкий OPS dispatcher принят независимым
+review; свежие 71 OPS/wrapper проверки и Ruff/Black прошли. Парная резервная копия и
+изолированное восстановление прошли; проверка совместимости остановилась на
+несовпадении hostname helper с реальным shared PostgreSQL alias. После явного
+указания пользователя 09.10 продолжение restore и полные проверки целостности
+исключены из DoD: проверенная миграция применяется непосредственно к рабочей БД,
+после запуска проверяются health/ping, базовый интерфейс и read-only допуск
+DISARMED. Rollback-скрипт обязателен каждой миграции; обычный deploy не требует
+нового полного backup/restore. Рабочая миграция `0004_trading_admission` и
+cutover выполнены: release `vps-20261009-p3-41dd35003304`, все девять целевых
+сервисов running, health healthy/none, без OOM и рестартов. Shared PG,
+volumes/caps и Analytics/frontend сохранены; обе canonical ссылки обновлены.
+HTTPS UI/assets/auth/health/runtime/positions/operations/automations PASS
+в TEST/PROD. PROD READ_ONLY/strategy=false/DISARMED, effective_can_submit=false;
+TEST TRADE возобновлён. Автор helper `capacity_contingency`, root ops;
+независимый `rollout_ops_review`: код и actual receipts/runtime C0/I0/M0;
+`resume_local_checks`: документная политика принята. Root 10 новых целевых
+тестов PASS, Ruff/Black/diff PASS. Доказательства:
+`develop/reports/prod-admission-20261009/basic-deploy.json`,
+`server-basic-runtime.json`, `basic-root-tests.log`.
+Предшествовавшая ограниченная очистка 43 старых
+private BuildKit cache записей сохранила все образы/контейнеры/volumes/backups;
+повторный fresh capacity gate перед QUIESCE прошёл с бюджетом 24 млрд байт.
+Целевой rollout — PROD READ_ONLY, strategy=false, DISARMED; TEST TRADE и
+финансовая история сохраняются. Это не закрывает O2, P4 или P5. Боевой ARM
+на момент закрытия P3 ожидал выбранного UID, численных лимитов и отдельной
+операционной приёмки.
+
+Дополнение 10.10: пользователь разрешил подготовить базу/сверку и включить
+TRADE/допуск для открытой GOLD позиции. Broker UID подтверждён; лимиты
+утверждены формулой: свободные RUB деньги / стоимость счёта / число
+положительных торговых позиций / 5% базы московского дня. TEST position
+stop loss не подменяет дневной лимит счёта. Core cash-position bug исправлен
+и совместимый patch выложен; baseline 5052,94 RUB принята. PROD Core/Worker
+TRADE/strategy=true, Analytics healthy. Передача владельца generation 2
+и финальная canary сверка выполнены; активных ordinary/stop orders и
+unresolved reservations 0, позиция GOLD 18 единиц. Сверка DATA_UNKNOWN /
+can_arm=false; risk snapshot сообщает MARK_PRICE_STALE. ARM и установка
+лимитов ожидают свежих рыночных данных. Health и базовые HTTPS функции
+TEST/PROD прошли; десять сервисов running без OOM/рестартов, volumes сохранены.
+Подробности и фактические receipts — [runbook](deployment/production-cutover.md).
+O2/P4/P5 и длительная приёмка TRADE остаются OPEN.
+
+Fresh readiness 10.10 20:26–20:27 МСК после релиза квоты: Core health OK,
+runtime PROD/TRADE, Worker heartbeat и завершение циклов наблюдаются. Текущий
+owner generation 3, lease свежа; допуск STOP_REQUIRED/recovery_only=true,
+limits/reconciliation отсутствуют после передачи owner. Прямой read-only SDK
+GOLD подтвердил запрет limit/market orders и MARK_PRICE_STALE (последняя
+цена сделки 09.10 23:47 МСК). Active ordinary/stop orders и unresolved
+reservations 0. Независимый просмотр связанных компонентов выявил отдельный
+кодовый блок: risk adapter возвращает SDK ETF, а каталог и submit contract
+ожидают FUND; установленная версия отклонит snapshot с DATA_UNKNOWN. Хеши
+трёх deployed файлов совпали с локальным source. Нужен минимальный патч
+нормализации ETF→FUND; он не расширяет allowlist и не ослабляет gates.
+Патч подготовлен локально (две строки adapter); root100 связанных tests PASS,
+Ruff/Black/diff-check PASS. На момент проверки 20:27 в PROD он ещё не был установлен.
+Независимое cleanup_ops_review C0/I0/M0; ETF/FUND замечание закрыто локально.
+После его выпуска при доступном рынке нужны свежий current-day baseline
+при необходимости, CANARY_UID сверка и разрешённые caps/ARM только при can_arm=true. ARM и заявки
+в этой проверке не выполнялись. Evidence:
+`develop/reports/prod-trading-readiness-20261010/{api-now,risk-now,result}.json`.
+
+Выпуск патча 10.10 21:23–21:24 МСК: Core-only релиз
+`vps-20261010-etf-fund-1b9e20608a22`, установленный SDKriskGOLD теперь FUND.
+Core/внешний HTTPS health, anonymous Chrome loginrender и authenticated
+API позиции PASS, source243/dependencies verified. Остальные контейнеры,
+ENV и volumes сохранены; Worker/PG/collector/TEST не перезапускались.
+Initial attempt отказал до Corestop из-за inherited stale overlaychecksum;
+originalFAILED сохранён, bounded reviewed continuation завершил candidate
+marker/checksum и reused activation без rebuild/initialreplay. Code/OPS review
+rollout_ops_review C0/I0/M0, root100 patch tests и21 OPS tests PASS; final
+actualreview rollout_ops_review C0/I0/M0 принял технический выпуск. Торговля остаётся STOP_REQUIRED/recovery_only,
+MARK_PRICE_STALE и brokerlimit/market flags false; orders/stops/unresolved0,
+ARM/reconcile/orders/migrations/DBintegrity/backup не выполнялись.
+Evidence: `develop/reports/etf-fund-prod-patch-rollout-20261010/` (report/result,
+complete-deploy, postflight, api-after, risk-after, root-runtime-proof).
+O2/P4/P5 остаются OPEN.
+
+Свежая диагностика 13.10, 22:44–22:48 МСК: PROD Core/Worker/Analytics работают,
+TRADE и стратегия включены, но допуск STOP_REQUIRED/recovery_only, ARM/лимиты/
+сверка отсутствуют, база дня от10.10. База создаётся явным operatorPOST/CLI;
+ежедневного автоматического создания в приложении нет. Worker пишет WAIT/NOT_OWNER из-за режима
+восстановления; текущий owner generation3 совпадает с Worker, lease живая на снимке.
+Дополнительный gate активации — MARK_PRICE_STALE: код требует возраст последней
+сделки≤1с, SDK GOLD вернул ~73с при свежем стакане~0,7с и разрешённых api/limit/market
+флагах. Старые закрытый рынок и ETF/FUND не являются сегодняшней причиной.
+TEST4 подтверждённо stopped/restart=no после вывода из эксплуатации; sharedPG/collector
+работают для PROD. Нужны текущая база московского дня, CANARY_UID сверка с can_arm=true,
+актуальные согласованные caps/ARM; пригодность источника mark и порога1с для GOLD
+требует отдельной оценки без подмены времени сделки временем запроса. В диагностике
+не изменялись допуск, бизнес-данные и runtime; заявки не отправлялись. Доказательства:
+`develop/reports/trading-blockers-20261013/report.md` и соседние
+`result.json`, `api-now.json`, `risk-now.json`, `worker-now.json`. Независимый
+prod_admission_core_review принял вывод и helper C0/I0/M0; review.md содержит
+область проверки и ограничения.
+
+13.10 23:16–23:18 МСК подтверждён отдельный Important UI дефект после
+пользовательского HOLD: runtime.ts разрешает tradingAllowed только TEST+TRADE,
+поэтому Resume/Close в PROD отключены при фактическом PROD+TRADE. Hold доступен
+отдельно. API GOLD HOLD/resume_requested=false; тот же TEST-only guard прочитан
+из действующего JS bundle. Backend resume допускает TRADE и не снимает ARM/
+account admission gates. I1 OPEN: нужна ограниченная правка global capability с
+проверками всех callers (Resume/Close/Create), сохраняя READ_ONLY/unknown и
+Core/Worker допуска. Диагностика не выполняла Resume, patch или deploy.
+Доказательства: `develop/reports/hold-resume-20261013/report.md` и receipts.
+
+14.10 сформулирован [план задач запуска PROD](superpowers/plans/2026-10-14-prod-trading-start.md):
+PT1 UI capability, PT2 risk mark/freshness, PT3 ежедневная подготовка,
+PT4 причины блокировки/оповещения, PT5 сквозные проверки/кросс-ревью,
+PT6 совместимый выпуск, PT7 оставшаяся read-only P4/операционная приёмка и
+последующий explicit ARM/Resume/canary P5. Первый запуск допускает существующий
+ручной baseline/reconcile/ARM; daily automation нужна для устойчивой работы новых дней.
+Пользовательский HOLD сохраняется; automatic daily ARM требует отдельно принятой
+политики. План принят независимым prod_admission_core_review C0/I0/M0,
+SHA972696c... первоначального плана. Затем пользователь разрешил делегирование и
+локальную реализацию до собственного merge в master; позднее14.10 отдельно разрешил deployment до merge.
+PT1 локально исправлен (known PROD/TEST TRADE), 216 frontend tests/typecheck/build;
+независимый prod_admission_core_review C0/I0/M0. Runtime UI I1 остаётся до выпуска.
+PT2 book-only policy и реализация приняты независимым review: exact UID/настоящий unary
+orderbook_ts/best ask/age0..1с, без fallback и увеличения TTL.
+[Дизайн](superpowers/specs/2026-10-14-prod-trading-start-design.md) задаёт opt-in daily
+preparation без ARM/Resume и Telegram (канал выбран пользователем). На этапе локальной реализации14.10
+live runtime ещё не проверялся; operational источники тогда — receipts13.10.
+На локальном этапе SSH/deploy/ARM/Resume/real alerts не выполнялись; тогда PT6–7 были OPEN. Обновлённый статус PT6 приведён ниже.
+
+14.10 локально реализованы PT1–PT5: команды PROD, свежий book-only риск,
+идемпотентная подготовка дня без ARM/Resume, точный Worker STOP_REQUIRED,
+read-only UI допуска и optional Telegram. Новая база сохраняет STOP/recovery;
+сверка при recovery остаётся явной. Automatic acceptance проверяет реальный
+snapshot deadline после locks; неуспешная SQL сверка не оставляет финансовых
+изменений. Пять Core Important, ошибки UI/quotes/recovery исправлены и независимо
+перепроверены. Root native: 2524 project +141 develop tests, отдельная PostgreSQL;
+frontend 266 tests/typecheck/build, Ruff/Black/diffcheck PASS. Исходные userdirty
+сохранены; branch/stage/commit/push не выполнялись. Reviewers:
+prod_admission_core_review (Core/risk/Worker/alerts/интеграция/fixtures),
+prod_start_ui_review (UI), оба не авторы. Остался неблокирующий Minor дублирования
+baseline cash-flow validation; текущие правила совпадают. Evidence:
+`develop/reports/prod-trading-start-implementation-20261014/`, final45 SHA manifest.
+После локальной приёмки пользователь изменил порядок: deployment до merge.
+PT6 **DONE14.10**, PRODtagvps-20261014-prod-start-b2f54029c729: Core/Worker/frontend
+обновлены, необходимые проверенные PG0006/0007 и WorkerSQLite1 применены.
+Health/progress/HTTPUI+read API PASS; независимый prod_release_architect C0/I0/M0.
+Ownergeneration4/revision6, HOLDrevision3/noResume и STOP_REQUIRED/recoverytrue
+сохранены; sharedPG/collector/Analytics прежние, TESTretired, daily/Telegramdisabled.
+Source353manifest/imageIDs/envSHA/volumes подтверждены; отчёт
+`develop/reports/prod-trading-start-deploy-20261014/report.md`.
+Merge делает пользователь. PT7 OPEN: Telegram recipient/доставка, opt-in daily,
+remaining read-only P4, stop/UNKNOWN и explicit ARM/Resume/P5. Визуальный browser
+и live trading не проверялись; обычный deploy не включает fullDBintegrity/restore.
 
 ### M1 — оптимизация ОЗУ в O1/S1 (OPEN)
 
@@ -297,7 +556,8 @@ auth и TLS сохраняются; регрессия latency API и доста
 Идентификаторы P1–P5 здесь относятся к PROD плану, а не оценкам приоритета
 P1/P2 прежнего performance backlog. Код PROD P1/P2 реализован; независимый
 `/root/prod_integration_review_retry` — code PASS (150 Python,29 UI).
-Наблюдаемость, retention и P3/P4/P5 остаются открытыми. Initial PROD развёрнут
+Наблюдаемость, retention и P4/P5 остаются открытыми; P3 READ_ONLY rollout
+завершён 09.10 по актуальной базовой приёмке выше. Initial PROD развёрнут
 на общей БД; авторизованные PROD accounts/summary приняты, остальные чтения и
 сверки остаются открытыми.
 SDK1.49.3 AsyncClient с синтетическим неверным токеном дал UNAUTHENTICATED:
@@ -501,7 +761,8 @@ Owned synthetic PG schemas/restore databases очищены, test-контейн
 review: develop/reports/core-performance-20261004/{final-report.md,
 root-final-acceptance.json,root-integration-independent-review.md}.
 Новых API/dependencies/миграций/Worker storage переносов/PROD TRADE нет.
-Полные M1/O1/O2/PROD P3–P5 остаются открытыми, W3/C5 и условные W5/F4 не входят
+Полные M1/O1/O2/PROD P4–P5 остаются открытыми; P3 READ_ONLY rollout завершён
+09.10 по актуальной приёмке выше. W3/C5 и условные W5/F4 не входят
 в выбранный пакет. Пользователь коммитит сам; deployment — отдельный GO после
 локальной приёмки.
 

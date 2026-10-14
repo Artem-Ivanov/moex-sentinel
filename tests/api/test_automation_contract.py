@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 from types import SimpleNamespace
+from uuid import UUID
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+import moex_sentinel.api.app as app_module
 from moex_sentinel.api.app import create_app
 from moex_sentinel.domain.automations import TradingAutomationDetails
 from moex_sentinel.domain.portfolio import BrokerOperationsView
@@ -73,8 +75,13 @@ def test_internal_connection_http_preserves_worker_broker_scope(monkeypatch, tmp
     monkeypatch.setenv("AUTH_ALLOWED_ORIGIN", "https://operator.example.test")
     monkeypatch.setenv("AUTH_SESSION_COOKIE_NAME", "__Host-test-prod-session")
     monkeypatch.setenv("AUTH_INSECURE_LOOPBACK", "false")
+    prod_broker_id = UUID("00000000-0000-4000-8000-000000000001")
+    if environment == "PROD":
+        monkeypatch.setenv("INTERNAL_WORKER_ID", "test-prod-contract-worker")
+        monkeypatch.setenv("INTERNAL_WORKER_BROKER_ID", str(prod_broker_id))
+        monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "b" * 64)
     expected = BrokerConnection(
-        broker_id="broker-1",
+        broker_id=str(prod_broker_id) if environment == "PROD" else "broker-1",
         adapter_code="TINVEST_PROD" if environment == "PROD" else "TINVEST_SANDBOX",
         target="invest-public-api.tbank.ru:443" if environment == "PROD" else "sandbox-invest-public-api.tbank.ru:443",
         token="synthetic-token",  # noqa: S106 - synthetic fixture
@@ -84,22 +91,43 @@ def test_internal_connection_http_preserves_worker_broker_scope(monkeypatch, tmp
         account_id="selected-account",
     )
     connection = Execute(expected)
-    monkeypatch.setattr(
-        "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory, *, settings: SimpleNamespace(view_automaton_broker_connection=connection),
-    )
-    with TestClient(create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'connection.db'}")) as api:
+    database_url = f"sqlite:///{tmp_path / 'connection.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    if environment == "PROD":
+        with sessionmaker(engine, expire_on_commit=False).begin() as session:
+            broker = user_broker_model(str(prod_broker_id), "selected-account")
+            broker.environment = "PROD"
+            broker.fqdn = "invest-public-api.tbank.ru:443"
+            session.add(broker)
+    engine.dispose()
+
+    build_usecases = app_module.build_application_usecases
+
+    def build_usecases_with_connection(factory, *, settings):
+        composed = build_usecases(factory, settings=settings)
+        return composed.model_copy(update={"view_automaton_broker_connection": connection})
+
+    monkeypatch.setattr(app_module, "build_application_usecases", build_usecases_with_connection)
+    with TestClient(create_app(test_auth_bypass=True, database_url=database_url)) as api:
 
         def forward(request):
-            response = api.request(request.method, request.url.path, content=request.content)
+            response = api.request(
+                request.method, request.url.path, headers=dict(request.headers), content=request.content
+            )
             return httpx.Response(response.status_code, content=response.content)
 
         with httpx.Client(base_url="http://core", transport=httpx.MockTransport(forward)) as http:
-            actual = CoreClient(http, application_environment=environment, access_mode=access_mode).broker_connection(
-                "broker-1"
-            )
+            actual = CoreClient(
+                http,
+                application_environment=environment,
+                access_mode=access_mode,
+                worker_id="test-prod-contract-worker" if environment == "PROD" else None,
+                broker_id=prod_broker_id if environment == "PROD" else None,
+                worker_token="b" * 64 if environment == "PROD" else None,
+            ).broker_connection(expected.broker_id)
 
-    assert connection.calls == [("broker-1",)]
+    assert connection.calls == [(str(prod_broker_id) if environment == "PROD" else "broker-1",)]
     assert actual.account_id == expected.account_id
     assert actual.environment == expected.environment
     assert actual.access_mode == expected.access_mode
@@ -118,6 +146,7 @@ def test_public_automation_contract_is_strategy_free(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
         lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             create_trading_automation=create,
             view_trading_automations=listing,
             view_trading_automation=details,
@@ -159,6 +188,85 @@ def test_public_automation_contract_is_strategy_free(monkeypatch, tmp_path) -> N
     assert held.json()["state"] == "HOLD"
     assert resumed.json()["state"] == "IN_QUEUE"
     assert closed.json()["state"] == "CLOSED"
+
+
+def test_settings_patch_uses_two_revisions_and_is_available_before_trade(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("APPLICATION_ENVIRONMENT", "TEST")
+    monkeypatch.setenv("BROKER_ACCESS_MODE", "READ_ONLY")
+    database_url = f"sqlite:///{tmp_path / 'automation-settings.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine, expire_on_commit=False).begin() as session:
+        session.add(user_broker_model("scope-1", "account-1"))
+        session.flush()
+        session.add(instrument_model("instrument-1", "scope-1"))
+        session.flush()
+        session.add(automation_model("automation-1", state="IN_WORK"))
+    engine.dispose()
+
+    with TestClient(create_app(test_auth_bypass=True, database_url=database_url)) as client:
+        invalid = client.patch(
+            "/api/trading-automations/automation-1/settings",
+            json={"expected_revision": 1, "expected_settings_revision": 0, "order_quota_percent": 0},
+        )
+        saved = client.patch(
+            "/api/trading-automations/automation-1/settings",
+            json={"expected_revision": 1, "expected_settings_revision": 0, "order_quota_percent": 12.5},
+        )
+        stale = client.patch(
+            "/api/trading-automations/automation-1/settings",
+            json={"expected_revision": 1, "expected_settings_revision": 0, "order_quota_percent": None},
+        )
+        cleared = client.patch(
+            "/api/trading-automations/automation-1/settings",
+            json={"expected_revision": 1, "expected_settings_revision": 1, "order_quota_percent": None},
+        )
+
+    assert invalid.status_code == 422
+    assert saved.status_code == 200
+    assert saved.json()["revision"] == 1
+    assert saved.json()["settings_revision"] == 1
+    assert saved.json()["order_quota_percent"] == "12.500000000"
+    assert stale.status_code == 409
+    assert cleared.status_code == 200
+    assert cleared.json()["revision"] == 1
+    assert cleared.json()["settings_revision"] == 2
+    assert cleared.json()["order_quota_percent"] is None
+
+
+@pytest.mark.parametrize(
+    ("state", "closed", "broker_environment", "expected_code"),
+    [
+        ("CLOSED", True, "TEST", "AUTOMATION_STATE_CONFLICT"),
+        ("IN_WORK", False, "PROD", "BROKER_ENVIRONMENT_MISMATCH"),
+    ],
+)
+def test_settings_patch_rejects_closed_or_other_environment_automation(
+    monkeypatch, tmp_path, state, closed, broker_environment, expected_code
+) -> None:
+    monkeypatch.setenv("APPLICATION_ENVIRONMENT", "TEST")
+    monkeypatch.setenv("BROKER_ACCESS_MODE", "READ_ONLY")
+    database_url = f"sqlite:///{tmp_path / 'automation-settings-scope.db'}"
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine, expire_on_commit=False).begin() as session:
+        broker = user_broker_model("scope-1", "account-1")
+        broker.environment = broker_environment
+        session.add(broker)
+        session.flush()
+        session.add(instrument_model("instrument-1", "scope-1"))
+        session.flush()
+        session.add(automation_model("automation-1", state=state, closed=closed))
+    engine.dispose()
+
+    with TestClient(create_app(test_auth_bypass=True, database_url=database_url)) as client:
+        response = client.patch(
+            "/api/trading-automations/automation-1/settings",
+            json={"expected_revision": 1, "expected_settings_revision": 0, "order_quota_percent": 10},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == expected_code
 
 
 @pytest.mark.parametrize(
@@ -214,6 +322,7 @@ def test_api_distinguishes_pending_bootstrap_from_confirmed_position(
         service = AutomationService(AutomationRepository(factory), access_mode=settings.broker_access_mode)
         external = ExternalReads()
         return SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             view_trading_automations=ViewTradingAutomationsUsecase(service),
             view_trading_automation_details=ViewTradingAutomationDetailsUsecase(service, external, external),
         )

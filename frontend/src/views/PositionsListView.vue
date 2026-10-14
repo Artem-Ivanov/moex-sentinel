@@ -19,6 +19,7 @@ import {
   type TradingSummaryResponse,
 } from "../api/portfolio"
 import TradingSummary from "../components/TradingSummary.vue"
+import TradingAdmissionStatus from "../components/TradingAdmissionStatus.vue"
 
 const router = useRouter()
 const data = ref<AutomationList>()
@@ -155,6 +156,14 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
         </tbody>
       </table>
     </div>
+    <TradingAdmissionStatus
+      v-if="runtime?.environment === 'PROD' && selected"
+      :key="`${selected.broker_id}:${selected.account_id}`"
+      :broker-id="selected.broker_id"
+      :account-id="selected.account_id"
+      :position-state="selected.state"
+      :resume-requested="selected.resume_requested"
+    />
     <div class="page-title section-title">
       <h2>Последние операции</h2>
       <label>Показывать

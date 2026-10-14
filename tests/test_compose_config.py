@@ -56,6 +56,10 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert automaton["environment"] == {
         "APPLICATION_ENVIRONMENT": "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}",
         "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
+        "INTERNAL_WORKER_ID": "${INTERNAL_WORKER_ID:-}",
+        "INTERNAL_WORKER_BROKER_ID": "${INTERNAL_WORKER_BROKER_ID:-}",
+        "INTERNAL_WORKER_TOKEN": "${INTERNAL_WORKER_TOKEN:-}",
+        "AUTOMATON_WORKER_ID": "${INTERNAL_WORKER_ID:-trading-automaton-1}",
         "AUTOMATON_DATABASE_URL": "sqlite:////app/data/trading_automaton.db",
         "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS": "3",
         "CORE_URL": "http://backend:8000",
@@ -92,6 +96,23 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
         "${AUTH_PASSWORD_HASH:?AUTH_PASSWORD_HASH must be configured}"
     )
     assert backend["environment"]["AUTH_INSECURE_LOOPBACK"] == "${AUTH_INSECURE_LOOPBACK:-false}"
+    admission_environment = {
+        "INTERNAL_WORKER_ID": "${INTERNAL_WORKER_ID:-}",
+        "INTERNAL_WORKER_BROKER_ID": "${INTERNAL_WORKER_BROKER_ID:-}",
+        "INTERNAL_WORKER_TOKEN": "${INTERNAL_WORKER_TOKEN:-}",
+    }
+    assert {key: backend["environment"][key] for key in admission_environment} == admission_environment
+    preparation_environment = {
+        "DAILY_ADMISSION_PREPARATION_ENABLED": "${DAILY_ADMISSION_PREPARATION_ENABLED:-false}",
+        "DAILY_ADMISSION_CANARY_UID": "${DAILY_ADMISSION_CANARY_UID:-}",
+    }
+    alert_environment = {
+        "TELEGRAM_ALERTS_ENABLED": "${TELEGRAM_ALERTS_ENABLED:-false}",
+        "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN:-}",
+        "TELEGRAM_CHAT_ID": "${TELEGRAM_CHAT_ID:-}",
+    }
+    core_only_environment = preparation_environment | alert_environment
+    assert {key: backend["environment"][key] for key in core_only_environment} == core_only_environment
     assert snapshot_worker["build"]["dockerfile"] == "docker/portfolio-snapshot-worker.Dockerfile"
     assert snapshot_worker["depends_on"] == {"database": {"condition": "service_healthy"}}
     assert snapshot_worker["environment"] == {
@@ -104,6 +125,14 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
         "LOG_FORMAT": "json",
         "LOG_LEVEL": "INFO",
         "PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS": "${PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:-60}",
+    }
+    for name in set(compose["services"]) - {"backend", "trading-automaton"}:
+        assert not set(admission_environment) & set(compose["services"][name].get("environment", {}))
+    for name in set(compose["services"]) - {"backend"}:
+        assert not set(core_only_environment) & set(compose["services"][name].get("environment", {}))
+    assert {key: automaton["environment"][key] for key in (*admission_environment, "AUTOMATON_WORKER_ID")} == {
+        **admission_environment,
+        "AUTOMATON_WORKER_ID": "${INTERNAL_WORKER_ID:-trading-automaton-1}",
     }
     assert "ports" not in snapshot_worker
     assert "volumes" not in snapshot_worker
@@ -222,6 +251,16 @@ def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
             for line in (PROJECT_ROOT / "deploy/remote" / example).read_text().splitlines()
             if line and not line.startswith("#")
         )
+        environment.update(
+            INTERNAL_WORKER_ID="compose-test-worker",
+            INTERNAL_WORKER_BROKER_ID="11111111-2222-4333-8444-555555555555",
+            INTERNAL_WORKER_TOKEN="a" * 64,
+            DAILY_ADMISSION_PREPARATION_ENABLED="true",
+            DAILY_ADMISSION_CANARY_UID="uid-compose-test-marker",
+            TELEGRAM_ALERTS_ENABLED="true",
+            TELEGRAM_BOT_TOKEN="compose-test-token-marker",  # noqa: S106 - never used for delivery.
+            TELEGRAM_CHAT_ID="compose-test-chat-marker",
+        )
         environment["REMOTE_ENV_FILE"] = "/dev/null"
         result = subprocess.run(
             [
@@ -254,6 +293,27 @@ def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
     assert set(prod["services"]["backend"]["networks"]) == {"default", "data"}
     assert test["networks"]["default"]["name"] != prod["networks"]["default"]["name"]
     assert test["volumes"]["automaton-data"]["name"] != prod["volumes"]["automaton-data"]["name"]
+    assert prod["services"]["backend"]["environment"]["INTERNAL_WORKER_ID"] == "compose-test-worker"
+    for name, value in {
+        "DAILY_ADMISSION_PREPARATION_ENABLED": "true",
+        "DAILY_ADMISSION_CANARY_UID": "uid-compose-test-marker",
+        "TELEGRAM_ALERTS_ENABLED": "true",
+        "TELEGRAM_BOT_TOKEN": "compose-test-token-marker",
+        "TELEGRAM_CHAT_ID": "compose-test-chat-marker",
+    }.items():
+        assert test["services"]["backend"]["environment"][name] == value
+        assert prod["services"]["backend"]["environment"][name] == value
+        assert all(
+            name not in service.get("environment", {})
+            for service_name, service in test["services"].items()
+            if service_name != "backend"
+        )
+        assert all(
+            name not in service.get("environment", {})
+            for service_name, service in prod["services"].items()
+            if service_name != "backend"
+        )
+    assert prod["services"]["trading-automaton"]["environment"]["AUTOMATON_WORKER_ID"] == "compose-test-worker"
 
     module_spec = importlib.util.spec_from_file_location(
         "shared_preflight", PROJECT_ROOT / "deploy/remote/preflight.py"

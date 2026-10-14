@@ -6,12 +6,13 @@ from enum import StrEnum
 from typing import Annotated, Literal, TypeAlias
 from uuid import UUID
 
-from pydantic import AfterValidator, ConfigDict, Field, PlainSerializer
+from pydantic import AfterValidator, BeforeValidator, ConfigDict, Field, PlainSerializer, model_validator
 
 from sentinel_contracts.base import PositionalModel
-from sentinel_contracts.broker_execution import OrderSide
+from sentinel_contracts.broker_execution import BrokerOrderStatus, OrderSide
 from sentinel_contracts.time import require_utc_millisecond
 from sentinel_contracts.trading import AutomationState, DecisionKind
+from sentinel_contracts.trading_admission import PreRpcAbortProof
 
 MillisecondUtc = Annotated[
     datetime,
@@ -26,6 +27,33 @@ MillisecondUtc = Annotated[
 
 class StrictFrozenModel(PositionalModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+
+def _reject_boolean_quota(value: object) -> object:
+    if isinstance(value, bool):
+        raise ValueError("Order quota percent must be a decimal number.")  # noqa: TRY004
+    return value
+
+
+def _validate_quota(value: Decimal) -> Decimal:
+    if not value.is_finite() or value <= 0 or value > 100:
+        raise ValueError("Order quota percent must be finite and between 0 and 100.")
+    _, digits, exponent = value.as_tuple()
+    trailing_zeroes = 0
+    while trailing_zeroes < len(digits) and digits[-trailing_zeroes - 1] == 0:
+        trailing_zeroes += 1
+    fractional_digits = max(0, -exponent - trailing_zeroes)
+    if fractional_digits > 9:
+        raise ValueError("Order quota percent must have at most 9 decimal places.")
+    return value
+
+
+OrderQuotaPercent = Annotated[
+    Decimal,
+    BeforeValidator(_reject_boolean_quota),
+    AfterValidator(_validate_quota),
+    PlainSerializer(str, return_type=str, when_used="json"),
+]
 
 
 class FactKind(StrEnum):
@@ -57,19 +85,7 @@ class FactBrokerOrderType(StrEnum):
     LIMIT = "LIMIT"
 
 
-class FactBrokerOrderStatus(StrEnum):
-    CREATED = "CREATED"
-    DISPATCH_PENDING = "DISPATCH_PENDING"
-    SUBMITTING = "SUBMITTING"
-    SUBMITTED = "SUBMITTED"
-    ACCEPTED = "ACCEPTED"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
-    UNCERTAIN = "UNCERTAIN"
-    FAILED = "FAILED"
+FactBrokerOrderStatus = BrokerOrderStatus
 
 
 class FactExecutionSource(StrEnum):
@@ -157,6 +173,27 @@ class BrokerOrderStateChangedPayload(BrokerOrderAggregatePayload):
     safe_message: str = Field(max_length=1000)
     occurred_at: MillisecondUtc
     created_at: MillisecondUtc
+    pre_rpc_abort_proof: PreRpcAbortProof | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def validate_pre_rpc_abort(self):
+        proof = self.pre_rpc_abort_proof
+        if proof is None:
+            return self
+        if (
+            str(proof.idempotency_key) != self.idempotency_key
+            or self.state is not FactBrokerOrderStatus.CANCELLED
+            or self.to_state is not FactBrokerOrderStatus.CANCELLED
+            or self.external_order_id is not None
+            or self.broker_responded_at is not None
+            or self.quantity_lots <= 0
+            or self.requested_amount <= 0
+            or self.executed_amount != 0
+            or self.executed_commission != 0
+            or self.executed_at is not None
+        ):
+            raise ValueError("Pre-RPC abort proof requires a matching, zero-fill cancelled order.")
+        return self
 
 
 class TradeExecutionRecordedPayload(StrictFrozenModel):
@@ -352,6 +389,8 @@ class AutomationCommand(StrictFrozenModel):
     last_sequence_number: int = Field(ge=0)
     resume_requested: bool
     bootstrap: BrokerPositionBootstrap | None = None
+    settings_revision: int = Field(ge=0, default=0)
+    order_quota_percent: OrderQuotaPercent | None = None
 
 
 class AutomationStatus(StrictFrozenModel):
@@ -361,6 +400,8 @@ class AutomationStatus(StrictFrozenModel):
     revision: int = Field(gt=0)
     last_sequence_number: int = Field(ge=0)
     resume_requested: bool
+    settings_revision: int = Field(ge=0, default=0)
+    order_quota_percent: OrderQuotaPercent | None = None
 
 
 class AutomationStatusesResult(StrictFrozenModel):

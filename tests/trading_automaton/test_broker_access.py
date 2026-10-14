@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from trading_automaton.storage.models import FactOutboxModel, LocalIntentModel, 
 
 SANDBOX = "sandbox-invest-public-api.tbank.ru:443"
 PROD = "invest-public-api.tbank.ru:443"
+SYNTHETIC_TOKEN = "synthetic-token"
 
 
 def test_worker_access_mode_is_explicit_and_strategy_disabled(monkeypatch):
@@ -53,8 +55,8 @@ def test_test_session_rejects_wrong_target(target):
         BrokerSdkSession("synthetic", target, environment="TEST", access_mode="TRADE")
 
 
-def test_prod_trade_session_rejected():
-    with pytest.raises(ValueError, match="PROD TRADE"):
+def test_prod_trade_session_requires_core_admission():
+    with pytest.raises(ValueError, match="submit admission"):
         BrokerSdkSession("synthetic", PROD, environment="PROD", access_mode="TRADE", account_id="account")
 
 
@@ -316,6 +318,10 @@ def test_worker_environment_settings_pin(monkeypatch):
     monkeypatch.delenv("APPLICATION_ENVIRONMENT", raising=False)
     assert AutomatonSettings(BROKER_ACCESS_MODE="READ_ONLY").application_environment == "TEST"
     monkeypatch.setenv("APPLICATION_ENVIRONMENT", "PROD")
+    monkeypatch.setenv("AUTOMATON_WORKER_ID", "worker")
+    monkeypatch.setenv("INTERNAL_WORKER_ID", "worker")
+    monkeypatch.setenv("INTERNAL_WORKER_BROKER_ID", "00000000-0000-4000-8000-000000000001")
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "a" * 64)
     assert AutomatonSettings(BROKER_ACCESS_MODE="READ_ONLY").application_environment == "PROD"
     monkeypatch.setenv("APPLICATION_ENVIRONMENT", "unsafe")
     with pytest.raises(ValidationError):
@@ -378,18 +384,69 @@ def test_matching_prod_worker_can_start_read_only_runtime():
     asyncio.run(scenario())
 
 
-def test_prod_worker_rejects_trade_mode_before_runtime():
-    with pytest.raises(ValidationError, match="PROD TRADE"):
-        AutomatonSettings(APPLICATION_ENVIRONMENT="PROD", BROKER_ACCESS_MODE="TRADE")
+def test_prod_trade_requires_and_accepts_configured_runtime_authentication():
+    settings = AutomatonSettings(
+        APPLICATION_ENVIRONMENT="PROD",
+        BROKER_ACCESS_MODE="TRADE",
+        AUTOMATON_WORKER_ID="worker-a",
+        INTERNAL_WORKER_ID="worker-a",
+        INTERNAL_WORKER_BROKER_ID="00000000-0000-4000-8000-000000000001",
+        INTERNAL_WORKER_TOKEN="a" * 64,
+    )
+    assert settings.broker_access_mode == "TRADE"
+
+
+def test_prod_trade_composition_rejects_session_without_validated_connection_binding():
+    class Core:
+        runtime_instance_id = UUID("00000000-0000-4000-8000-000000000006")
+
+    connection = BrokerConnection(
+        broker_id="00000000-0000-4000-8000-000000000001",
+        adapter_code="TINVEST_PROD",
+        target=PROD,
+        token=SYNTHETIC_TOKEN,
+        is_test=False,
+        environment="PROD",
+        access_mode="TRADE",
+        account_id="account",
+        configuration_fingerprint="a" * 64,
+    )
+
+    async def scenario():
+        await build_broker_runtime(
+            connection,
+            repository(),
+            strategy_settings=StrategySettings(enabled=True),
+            worker_access_mode="TRADE",
+            application_environment="PROD",
+            now=lambda: datetime.now(UTC),
+            session_factory=lambda _: Session(),
+            core_client=Core(),
+        )
+
+    with pytest.raises(ValueError, match="validated Core connection"):
+        asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("mismatch", [None, "account", "environment", "broker", "missing"])
-def test_composed_closed_outbox_uses_disabled_broker_scope_without_credentials(monkeypatch, tmp_path, mismatch):
+def test_composed_closed_outbox_uses_authenticated_disabled_broker_scope(monkeypatch, tmp_path, mismatch):
     pending = row()
     requests = []
 
     def handler(request):
         requests.append((request.method, request.url.path))
+        if request.url.path == "/internal/automaton/runtime-instances":
+            body = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "runtime_instance_id": body["runtime_instance_id"],
+                    "generation": 1,
+                    "registration_status": "OWNER",
+                    "admission_status": "DISARMED",
+                    "lease_expires_at": "2099-01-01T00:00:00.000Z",
+                },
+            )
         if request.url.path == "/internal/runtime":
             return httpx.Response(200, json={"environment": "PROD", "access_mode": "READ_ONLY"})
         if request.url.path.endswith("/scope"):
@@ -413,6 +470,10 @@ def test_composed_closed_outbox_uses_disabled_broker_scope_without_credentials(m
             AutomatonSettings(
                 APPLICATION_ENVIRONMENT="PROD",
                 BROKER_ACCESS_MODE="READ_ONLY",
+                AUTOMATON_WORKER_ID="worker-a",
+                INTERNAL_WORKER_ID="worker-a",
+                INTERNAL_WORKER_BROKER_ID=str(pending.user_broker_id),
+                INTERNAL_WORKER_TOKEN="a" * 64,
                 AUTOMATON_DATABASE_URL=f"sqlite:///{tmp_path / 'closed.db'}",
             ),
             StrategySettings(),
@@ -436,6 +497,8 @@ def test_composed_closed_outbox_uses_disabled_broker_scope_without_credentials(m
         else:
             with pytest.raises(ValueError, match="mismatch|scope is missing"):
                 synchronization.flush_outbox()
-            assert not any(method == "POST" for method, _ in requests)
+            assert not any(
+                method == "POST" and path != "/internal/automaton/runtime-instances" for method, path in requests
+            )
         assert repository.has_pending_fact_outbox(pending.automation_id)
         http.close()

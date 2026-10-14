@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from threading import Event
 from time import monotonic as system_monotonic
 from types import SimpleNamespace
@@ -11,10 +12,17 @@ from sqlalchemy.orm import sessionmaker
 
 from sentinel_contracts.broker_execution import BrokerConnection
 from sentinel_contracts.trading import AutomationState
-from sentinel_contracts.trading_facts import AutomationCommand, BrokerPositionBootstrap
+from sentinel_contracts.trading_facts import (
+    AutomationCommand,
+    AutomationStatus,
+    AutomationStatusesResult,
+    BrokerPositionBootstrap,
+)
 from tests.trading_automaton.command_factory import command as baseline_command
 from tests.trading_automaton.command_factory import decision_item
+from trading_automaton.composition import FactCoordinatorCoreAdapter
 from trading_automaton.config import StrategySettings
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.runtime.streaming_coordinator import LOGGER, StreamingRuntimeCoordinator
 from trading_automaton.services.automation_lifecycle import WorkerAutomationLifecycleService
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
@@ -201,6 +209,177 @@ def test_claims_syncs_and_assigns_commands_to_one_broker_runtime() -> None:
     assert core.heartbeat_value == ("worker", NOW)
     assert core.status_batches == [(str(command().automation_id),)]
     assert bundle.closed
+
+
+def test_status_failure_publishes_transient_hold_then_restores_core_state() -> None:
+    async def scenario():
+        repository = Repository()
+        active = command(AutomationState.IN_WORK)
+        repository.active = [active]
+        synchronization = Synchronization()
+        synchronization.claimed = True
+
+        class FlakyCore(Core):
+            fail = True
+
+            def automation_statuses(self, automation_ids):
+                if self.fail:
+                    self.fail = False
+                    raise CoreOperationError(retryable=True)
+                return super().automation_statuses(automation_ids)
+
+        core = FlakyCore()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        with pytest.raises(CoreOperationError):
+            await service.run_iteration()
+        after_failure = repository.active[0]
+        failed_runtime_state = bundle.commands[-1][0].state
+        await service.run_iteration()
+        restored_runtime_state = bundle.commands[-1][0].state
+        await service.close()
+        return repository, active, after_failure, failed_runtime_state, restored_runtime_state
+
+    repository, active, after_failure, failed_state, restored_state = asyncio.run(scenario())
+    assert after_failure == active
+    assert repository.events == []
+    assert failed_state is AutomationState.HOLD
+    assert restored_state is AutomationState.IN_WORK
+
+
+@pytest.mark.parametrize("failure_point", ["claim", "second_flush"])
+def test_control_failure_holds_active_runtime_then_restores_without_durable_hold(failure_point) -> None:
+    class FailingControl(Synchronization):
+        fail_claim = False
+        block_flush_number = None
+
+        def claim_commands(self, worker_id, limit):
+            if self.fail_claim:
+                raise CoreOperationError(retryable=True)
+            return super().claim_commands(worker_id, limit)
+
+        def flush_outbox(self):
+            self.flushed += 1
+            return self.flushed != self.block_flush_number
+
+    async def scenario():
+        repository = Repository()
+        repository.active = [command(AutomationState.IN_WORK)]
+        synchronization = FailingControl()
+        synchronization.claimed = True
+        core = Core()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        if failure_point == "claim":
+            synchronization.fail_claim = True
+            with pytest.raises(CoreOperationError):
+                await service.run_iteration()
+        else:
+            synchronization.block_flush_number = synchronization.flushed + 2
+            await service.run_iteration()
+        failed_runtime_state = bundle.commands[-1][0].state
+        failed_persisted_state = repository.active[0].state
+        synchronization.fail_claim = False
+        synchronization.block_flush_number = None
+        await service.run_iteration()
+        restored_runtime_state = bundle.commands[-1][0].state
+        await service.close()
+        return repository, failed_runtime_state, failed_persisted_state, restored_runtime_state
+
+    repository, failed_runtime_state, persisted_state, restored_runtime_state = asyncio.run(scenario())
+    assert failed_runtime_state is AutomationState.HOLD
+    assert persisted_state is AutomationState.IN_WORK
+    assert repository.events == []
+    assert restored_runtime_state is AutomationState.IN_WORK
+
+
+def test_active_status_adapter_refreshes_quota_and_null_reset_into_sqlite_runtime(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'active-quota.sqlite'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+
+    class QuotaCore(Core):
+        refresh_count = 0
+
+        def automation_statuses(self, automation_ids):
+            assert automation_ids == [value.automation_id]
+            self.refresh_count += 1
+            return AutomationStatusesResult(
+                automations=(
+                    AutomationStatus(
+                        automation_id=value.automation_id,
+                        user_broker_id=value.user_broker_id,
+                        state=AutomationState.IN_WORK,
+                        revision=value.revision,
+                        last_sequence_number=value.last_sequence_number,
+                        resume_requested=False,
+                        settings_revision=self.refresh_count,
+                        order_quota_percent=Decimal("10") if self.refresh_count == 1 else None,
+                    ),
+                )
+            )
+
+    async def scenario():
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        core = QuotaCore()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            FactCoordinatorCoreAdapter(core),
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        first_runtime_command = bundle.commands[-1][0]
+        await service.run_iteration()
+        second_runtime_command = bundle.commands[-1][0]
+        await service.close()
+        return first_runtime_command, second_runtime_command
+
+    first_published, reset_published = asyncio.run(scenario())
+    cached = repository.get_cached_command(str(value.automation_id))
+    engine.dispose()
+
+    assert first_published.order_quota_percent == Decimal("10")
+    assert first_published.settings_revision == 1
+    assert reset_published.order_quota_percent is None
+    assert reset_published.settings_revision == 2
+    assert cached.order_quota_percent is None
+    assert cached.settings_revision == 2
+    assert cached.revision == value.revision
+    assert cached.last_sequence_number == value.last_sequence_number
 
 
 @pytest.mark.parametrize("local_state", [AutomationState.HOLD, AutomationState.IN_QUEUE, AutomationState.IN_WORK])

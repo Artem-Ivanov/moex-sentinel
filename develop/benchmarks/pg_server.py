@@ -16,6 +16,7 @@ from moex_sentinel.services.sync_execution import bind_sync_runner, inline_runne
 from moex_sentinel.usecases.trading_fact_ingress import PublishTradingFactsUsecase
 from moex_sentinel.views.internal_trading_facts import router
 from trading_automaton.adapters.core_client import CoreClient
+from trading_automaton.domain.errors import CoreOperationError
 
 
 class TimedIngress:
@@ -24,9 +25,9 @@ class TimedIngress:
         self.profile = profile
         self.require_all = require_all
 
-    def publish(self, facts):
+    def publish(self, facts, **context):
         with self.profile.request(len(facts)), self.profile.timing("core_ingress_ms"):
-            result = self.ingress.publish(facts)
+            result = self.ingress.publish(facts, **context)
             if self.require_all:
                 require(not result.failures, "Production Core ingress rejected synthetic facts")
                 require(
@@ -127,9 +128,10 @@ class NetworkDelivery:
         try:
             with self.profile.timing("http_roundtrip_ms"):
                 result = self.client.publish_facts(facts)
-        except httpx.TransportError:
-            self.transport_errors += 1
-            self.replay_expected = {str(fact.event_id): fact.model_dump(mode="json") for fact in facts}
+        except CoreOperationError as error:
+            if isinstance(error.__cause__, httpx.TransportError):
+                self.transport_errors += 1
+                self.replay_expected = {str(fact.event_id): fact.model_dump(mode="json") for fact in facts}
             raise
         require(not result.failures, "Core rejected synthetic facts over HTTP")
         for fact in facts:

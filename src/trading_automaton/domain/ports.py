@@ -4,7 +4,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
+from sentinel_contracts.broker_execution import BrokerOrderStatus
 from sentinel_contracts.business_audit import BusinessAuditStage
+from sentinel_contracts.trading_admission import PreRpcAbortProof
 from trading_automaton.domain.storage_dtos import LocalIntentRecord
 
 
@@ -13,7 +15,7 @@ class IntentUpdatePort(Protocol):
         self,
         idempotency_key: str,
         *,
-        state: str,
+        state: BrokerOrderStatus,
         occurred_at: datetime,
         broker_order_id: str | None = None,
         requested_amount: Decimal | None = None,
@@ -27,6 +29,7 @@ class IntentUpdatePort(Protocol):
         broker_responded_at: datetime | None = None,
         terminal_at: datetime | None = None,
         process_id: str | None = None,
+        pre_rpc_abort_proof: PreRpcAbortProof | None = None,
     ) -> LocalIntentRecord: ...
 
 

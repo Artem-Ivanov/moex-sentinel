@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from sentinel_contracts.release import ReleaseVersionError, validate_release
@@ -31,6 +32,32 @@ def validate_auth_config(environment: dict[str, str]) -> None:
         fail("Set AUTH_PASSWORD_HASH to a generated scrypt verifier.")
 
 
+def validate_prod_worker_credentials(core: dict[str, str], worker: dict[str, str]) -> None:
+    worker_id = core.get("INTERNAL_WORKER_ID", "")
+    broker_id = core.get("INTERNAL_WORKER_BROKER_ID", "")
+    token = core.get("INTERNAL_WORKER_TOKEN", "")
+    if (
+        not 1 <= len(worker_id) <= 128
+        or worker_id != worker_id.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in worker_id)
+        or "replace" in worker_id.lower()
+    ):
+        fail("PROD requires a configured INTERNAL_WORKER_ID.")
+    try:
+        UUID(broker_id)
+    except (ValueError, AttributeError):
+        fail("PROD requires a valid INTERNAL_WORKER_BROKER_ID.")
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        fail("PROD requires a 32-byte lowercase-hex INTERNAL_WORKER_TOKEN.")
+    if (
+        worker.get("AUTOMATON_WORKER_ID") != worker_id
+        or worker.get("INTERNAL_WORKER_ID") != worker_id
+        or worker.get("INTERNAL_WORKER_BROKER_ID") != broker_id
+        or worker.get("INTERNAL_WORKER_TOKEN") != token
+    ):
+        fail("PROD Core and Worker admission credentials must match.")
+
+
 def validate_contour_config(config: dict) -> None:
     services = config["services"]
     backend = services["backend"].get("environment", {})
@@ -48,7 +75,7 @@ def validate_contour_config(config: dict) -> None:
     origin = backend.get("AUTH_ALLOWED_ORIGIN", "")
     if not re.fullmatch(r"__Host-[A-Za-z0-9_-]+", cookie):
         fail("Remote auth requires a safe __Host- session cookie name.")
-    expected_origin = "https://135.136.178.252" + (":8443" if contour == "PROD" else "")
+    expected_origin = "https://135.136.178.252"
     if origin != expected_origin:
         fail("Origin must match the reviewed contour HTTPS listener.")
     if contour == "TEST":
@@ -64,8 +91,7 @@ def validate_contour_config(config: dict) -> None:
             if not volume.get("external") or volume.get("name") != f"moex-sentinel-remote-{name}":
                 fail("TEST must retain its existing durable volume identities.")
     if contour == "PROD":
-        if mode != "READ_ONLY":
-            fail("PROD TRADE is unavailable until P3 admission is implemented.")
+        validate_prod_worker_credentials(backend, services["trading-automaton"].get("environment", {}))
         if config.get("name") != "moex-sentinel-prod" or cookie != "__Host-moex-prod-session":
             fail("PROD requires its separate project and session cookie.")
         if any(name in services for name in ("database", "migrations", "portfolio-snapshot-worker")):

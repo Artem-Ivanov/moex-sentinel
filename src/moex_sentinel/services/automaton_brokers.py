@@ -1,5 +1,6 @@
 """Validated short-lived broker connection metadata for the worker."""
 
+from moex_sentinel.domain.trading_admission import broker_configuration_fingerprint
 from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
 from moex_sentinel.services.ports import UserBrokerLookupPort
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerScope
@@ -40,8 +41,15 @@ class AutomatonBrokerService:
         if self._environment is not None and environment != self._environment.view().active_environment:
             raise EnvironmentMismatchError("Broker belongs to inactive environment.")
         resolve_tinvest_endpoint(environment, broker.adapter_code, target)
-        if environment == "PROD" and self._access_mode != "READ_ONLY":
-            raise ValueError("PROD TRADE requires a separate trading admission.")
+        fingerprint = broker_configuration_fingerprint(
+            account_id=broker.account_id or "",
+            access_mode=self._access_mode,
+            adapter_code=broker.adapter_code,
+            broker_id=broker.id,
+            environment=environment,
+            target=target,
+            token=token,
+        )
         return BrokerConnection(
             broker_id=broker.id,
             adapter_code=broker.adapter_code,
@@ -51,4 +59,5 @@ class AutomatonBrokerService:
             environment=environment,
             access_mode=self._access_mode,
             account_id=broker.account_id or "",
+            configuration_fingerprint=fingerprint,
         )

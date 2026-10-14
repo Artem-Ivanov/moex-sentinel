@@ -9,9 +9,11 @@ export interface Automation {
   state: "IN_QUEUE" | "OPENING" | "IN_WORK" | "HOLD" | "CLOSED"
   suspended_from_state: Automation["state"] | null
   revision: number
+  settings_revision?: number
   last_sequence_number: number
   resume_requested: boolean
   bootstrap_pending?: boolean
+  order_quota_percent?: string | null
   currency: string
   strategy_code: string
   strategy_version: string
@@ -42,6 +44,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly fields: ApiFieldError[] = [],
+    readonly status?: number,
   ) { super(message) }
 }
 
@@ -49,7 +52,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(url, init)
   if (!response.ok) {
     const payload = await readErrorPayload(response)
-    throw new ApiError(payload.detail?.message ?? "Не удалось выполнить запрос.", payload.detail?.fields)
+    throw new ApiError(payload.detail?.message ?? "Не удалось выполнить запрос.", payload.detail?.fields, response.status)
   }
   if (response.status === 204) return undefined as T
   return await response.json() as T
@@ -70,3 +73,9 @@ export const fetchAutomationDetails = (id: string) => request<AutomationDetails>
 export const holdAutomation = (id: string) => request<Automation>(`/api/trading-automations/${id}/hold`, json("POST"))
 export const resumeAutomation = (id: string) => request<Automation>(`/api/trading-automations/${id}/resume`, json("POST"))
 export const closeAutomation = (id: string) => request<Automation>(`/api/trading-automations/${id}/close`, json("POST"))
+export const updateAutomationSettings = (id: string, expectedRevision: number, expectedSettingsRevision: number, orderQuotaPercent: string | null) =>
+  request<Automation>(`/api/trading-automations/${id}/settings`, json("PATCH", {
+    expected_revision: expectedRevision,
+    expected_settings_revision: expectedSettingsRevision,
+    order_quota_percent: orderQuotaPercent,
+  }))

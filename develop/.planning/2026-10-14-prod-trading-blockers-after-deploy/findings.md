@@ -1,0 +1,1 @@
+Исторический PT6: STOP_REQUIRED/recovery-only, HOLDrev3, DISARMED/BASELINE_REQUIRED/RECONCILIATION_REQUIRED; daily/Telegramdisabled. Нужна свежая проверка, не считать это текущим runtime. Источники: CURRENT и develop/reports/prod-trading-start-deploy-20261014/acceptance.jsonl; код Core storage/repositories/trading_admission.py и Worker services/trading_admission.py.

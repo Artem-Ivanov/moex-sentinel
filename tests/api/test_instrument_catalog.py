@@ -99,6 +99,7 @@ def catalog_client(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
         lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             synchronize_broker_instruments=Synchronize(),
             view_broker_instruments=ListCatalog(),
             view_instrument_details=Details(),
@@ -153,7 +154,9 @@ def test_invalid_category_precedes_range_validation_and_external_reads(monkeypat
     usecase = ViewBrokerInstrumentsUsecase(InstrumentCatalogService(brokers, catalog, adapter_factory))
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory, *, settings: SimpleNamespace(view_broker_instruments=usecase),
+        lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(), view_broker_instruments=usecase
+        ),
     )
     with TestClient(
         create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'invalid-category.db'}")
@@ -199,7 +202,9 @@ def test_catalog_sync_reports_held_position_without_adopting(monkeypatch, tmp_pa
     usecase = SynchronizeBrokerInstrumentsUsecase(Catalog(), Adoption())
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory, *, settings: SimpleNamespace(synchronize_broker_instruments=usecase),
+        lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(), synchronize_broker_instruments=usecase
+        ),
     )
     with TestClient(
         create_app(test_auth_bypass=True, database_url=f"sqlite:///{tmp_path / 'diagnostics.db'}")

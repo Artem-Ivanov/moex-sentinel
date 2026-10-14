@@ -11,6 +11,7 @@ from trading_automaton.domain.storage_dtos import (
     TradeLotRecord,
     TradingCycleState,
 )
+from trading_automaton.services.order_quota import quota_lots
 
 
 class DecisionContextService:
@@ -34,12 +35,26 @@ class DecisionContextService:
         indicators: MarketIndicators | None = None,
         free_cash: Decimal = Decimal(),
         reserved_cash: Decimal = Decimal(),
+        positive_position_count: int | None = None,
     ) -> DecisionContext:
         integral_lots = position.quantity_lots.to_integral_value()
         if position.quantity_lots != integral_lots or integral_lots < 0:
             raise ValueError("Broker position quantity must contain whole non-negative lots.")
         quantity_lots = int(integral_lots)
         average_price = position.average_price
+        available_free_cash = max(Decimal(), free_cash - reserved_cash)
+        requested_buy_lots = (
+            None
+            if command.order_quota_percent is None
+            else quota_lots(
+                available_free_cash,
+                command.order_quota_percent,
+                positive_position_count,
+                price=order_book.best_ask.price,
+                lot_size=command.lot_size,
+            )
+        )
+        buy_order_lots = self._settings.buy_order_lots if requested_buy_lots is None else requested_buy_lots
         return DecisionContext(
             core_available=True,
             has_active_intent=False,
@@ -72,12 +87,13 @@ class DecisionContextService:
             indicators=indicators,
             free_cash=free_cash,
             reserved_cash=reserved_cash,
-            available_free_cash=max(Decimal(), free_cash - reserved_cash),
+            available_free_cash=available_free_cash,
+            requested_buy_lots=requested_buy_lots,
             required_order_cash=(
-                order_book.best_ask.price * command.lot_size * self._settings.buy_order_lots
+                order_book.best_ask.price * command.lot_size * buy_order_lots
                 + commission_schedule.estimate(
                     "BUY",
-                    order_book.best_ask.price * command.lot_size * self._settings.buy_order_lots,
+                    order_book.best_ask.price * command.lot_size * buy_order_lots,
                 )
             ),
         )

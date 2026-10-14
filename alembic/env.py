@@ -1,3 +1,4 @@
+# ruff: noqa: INP001
 """Alembic environment for supported Core database dialects."""
 
 from logging.config import fileConfig
@@ -39,6 +40,12 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def validate_sqlite_foreign_keys(ctx, **_) -> None:
+    """Validate rebuilt references before Alembic commits each SQLite revision."""
+    if ctx.connection.exec_driver_sql("PRAGMA foreign_key_check").first() is not None:
+        raise RuntimeError("SQLite migration would leave invalid foreign key references.")
+
+
 def run_migrations_online() -> None:
     configuration = config.get_section(config.config_ini_section, {})
     configuration["sqlalchemy.url"] = database_url()
@@ -51,7 +58,8 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         is_sqlite = connection.dialect.name == "sqlite"
         if is_sqlite:
-            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            # Parent CHECK rebuilds need FK enforcement disabled outside the physical transaction.
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
             connection.exec_driver_sql("PRAGMA busy_timeout=5000")
             connection.exec_driver_sql("PRAGMA journal_mode=WAL")
             connection.commit()
@@ -60,10 +68,16 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,
             render_as_batch=is_sqlite,
+            on_version_apply=validate_sqlite_foreign_keys if is_sqlite else None,
         )
 
-        with context.begin_transaction():
-            context.run_migrations()
+        try:
+            with context.begin_transaction():
+                context.run_migrations()
+        finally:
+            if is_sqlite:
+                connection.rollback()
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 if context.is_offline_mode():

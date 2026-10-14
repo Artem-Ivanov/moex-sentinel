@@ -57,6 +57,7 @@ from trading_automaton.services.recovery import RecoveryService
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
 from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
 from trading_automaton.services.streaming_position_decision import StreamingPositionDecisionService
+from trading_automaton.services.trading_admission import TradingAdmissionService
 from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
@@ -93,6 +94,8 @@ class FactCoordinatorCoreAdapter:
                     "state": status.state.value,
                     "revision": status.revision,
                     "last_sequence_number": status.last_sequence_number,
+                    "settings_revision": status.settings_revision,
+                    "order_quota_percent": status.order_quota_percent,
                 }
                 for status in result.automations
             },
@@ -143,17 +146,12 @@ async def build_broker_runtime(
     worker_access_mode: str = "READ_ONLY",
     application_environment: str = "TEST",
     now: Callable[[], datetime],
-    session_factory: Callable[[BrokerConnection], Any] = lambda connection: BrokerSdkSession(
-        connection.token,
-        connection.target,
-        environment=connection.environment,
-        access_mode=connection.access_mode,
-        account_id=connection.account_id,
-    ),
+    session_factory: Callable[[BrokerConnection], Any] | None = None,
     tick_seconds: float = 1.0,
     retry_limit: int = 5,
     analytics_url: str = "http://analytics:8001",
     analytics_client: AnalyticsPort | None = None,
+    core_client: CoreClient | None = None,
 ) -> BrokerRuntimeBundle:
     """Assemble a broker bundle whose close releases Analytics and the started SDK session."""
     if connection.environment != application_environment:
@@ -163,8 +161,17 @@ async def build_broker_runtime(
         raise ValueError("Invalid Worker broker access mode")
     if worker_access_mode != connection.access_mode:
         raise ValueError("Core/Worker access mode mismatch")
+    admission = None
     if connection.environment == "PROD" and worker_access_mode == "TRADE":
-        raise ValueError("PROD TRADE is not enabled in this phase")
+        if core_client is None or connection.configuration_fingerprint is None:
+            raise ValueError("PROD TRADE requires authenticated Core admission and a broker configuration fingerprint")
+        admission = TradingAdmissionService(
+            core_client,
+            broker_id=UUID(connection.broker_id),
+            account_id=connection.account_id,
+            runtime_instance_id=core_client.runtime_instance_id,
+            configuration_fingerprint=connection.configuration_fingerprint,
+        )
     if worker_access_mode == "READ_ONLY":
         if strategy_settings.enabled:
             raise ValueError("READ_ONLY requires strategy disabled")
@@ -173,7 +180,23 @@ async def build_broker_runtime(
                 "READ_ONLY cannot start with active intents; "
                 "preserve history and reconcile in the original trading contour"
             )
-    session = session_factory(connection)
+    session = (
+        session_factory(connection)
+        if session_factory is not None
+        else BrokerSdkSession(
+            connection.token,
+            connection.target,
+            environment=connection.environment,
+            access_mode=connection.access_mode,
+            account_id=connection.account_id,
+            broker_connection=connection if admission is not None else None,
+            submit_admission=admission,
+        )
+    )
+    if admission is not None and (
+        not isinstance(session, BrokerSdkSession) or not session.is_bound_to(connection, admission)
+    ):
+        raise ValueError("PROD TRADE broker session must bind the validated Core connection and admission gate")
     await session.start()
     rollback = AsyncExitStack()
     rollback.push_async_callback(session.close)
@@ -200,6 +223,7 @@ async def build_broker_runtime(
         decider = StreamingPositionDecisionService(
             commission_profiles,
             cash=cash,
+            positions=portfolio,
             contexts=DecisionContextService(strategy_settings),
             decisions=TradeDecisionService(),
         )
@@ -246,7 +270,7 @@ async def build_broker_runtime(
             cycles=StreamingCycleTransitionService(now=now, cycles=TradingCycleService(), order_books=order_books),
             now=now,
             audit=business_audit,
-            materializer=DecisionMaterializerService(settings=strategy_settings),
+            materializer=DecisionMaterializerService(settings=strategy_settings, admission=admission),
             order_books=order_books,
         )
         preparation = BrokerTickPreparationService(
@@ -264,6 +288,8 @@ async def build_broker_runtime(
                 audit=business_audit,
                 active_intents=active_intents,
                 cash=cash,
+                environment=application_environment,
+                admission=admission,
             ),
             cash=cash,
             now=now,
@@ -322,7 +348,10 @@ def build_streaming_runtime(
         raise ValueError("READ_ONLY requires strategy disabled")
     engine = create_worker_engine(settings.database_url)
     initialize_worker_schema(engine)
-    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    repository = LocalAutomationRepository(
+        sessionmaker(engine, expire_on_commit=False),
+        environment=settings.application_environment,
+    )
     if settings.broker_access_mode == "READ_ONLY" and repository.has_active_intents():
         engine.dispose()
         raise ValueError(
@@ -330,7 +359,15 @@ def build_streaming_runtime(
         )
     http = httpx.Client(base_url=settings.core_url, timeout=10.0)
     core = CoreClient(
-        http, application_environment=settings.application_environment, access_mode=settings.broker_access_mode
+        http,
+        application_environment=settings.application_environment,
+        access_mode=settings.broker_access_mode,
+        worker_id=settings.worker_id,
+        broker_id=settings.internal_worker_broker_id,
+        worker_token=(
+            None if settings.internal_worker_token is None else settings.internal_worker_token.get_secret_value()
+        ),
+        strategy_enabled=strategy_settings.enabled,
     )
 
     def now() -> datetime:
@@ -338,6 +375,8 @@ def build_streaming_runtime(
 
     def validate_commands(commands: list[AutomationCommand]) -> None:
         for broker_id in {str(command.broker_id) for command in commands}:
+            if settings.internal_worker_broker_id is not None and broker_id != str(settings.internal_worker_broker_id):
+                raise ValueError("Worker command broker scope mismatch")
             connection = core.broker_connection(broker_id)
             if connection.environment != settings.application_environment:
                 raise ValueError("Worker/Core environment mismatch")
@@ -390,6 +429,7 @@ def build_streaming_runtime(
             tick_seconds=settings.iteration_seconds,
             retry_limit=settings.sandbox_retry_limit,
             analytics_url=settings.analytics_url,
+            core_client=core,
         )
 
     iteration = SynchronizeTradingRuntimeUsecase(

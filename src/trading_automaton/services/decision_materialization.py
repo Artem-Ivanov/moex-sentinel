@@ -16,6 +16,7 @@ from sentinel_contracts.broker_execution import OrderSide
 from sentinel_contracts.strategy import STRATEGY_CODE, STRATEGY_VERSION
 from sentinel_contracts.streaming_market import InstrumentMarketState
 from sentinel_contracts.trading import DecisionKind, PositionSnapshot
+from sentinel_contracts.trading_admission import AdmissionView, SubmitDenialReason
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
 from trading_automaton.domain.dtos import DispatchRequest, PositionWorkItem, PreparedDecision, TradeDecision
@@ -27,6 +28,10 @@ class CashReservationPort(Protocol):
     async def available(self, account_id: str, currency: str) -> Decimal: ...
 
     async def reserved(self, account_id: str, currency: str) -> Decimal: ...
+
+
+class DecisionAdmissionPort(Protocol):
+    async def prepare(self, instrument_uid: str) -> AdmissionView | SubmitDenialReason: ...
 
 
 class DecisionMaterializerPort(Protocol):
@@ -62,9 +67,11 @@ class DecisionMaterializerService:
         *,
         settings: StrategySettings,
         id_factory: Callable[[], str] = lambda: str(uuid4()),
+        admission: "DecisionAdmissionPort | None" = None,
     ) -> None:
         self._settings = settings
         self._id_factory = id_factory
+        self._admission = admission
 
     async def materialize(
         self,
@@ -96,6 +103,19 @@ class DecisionMaterializerService:
             process_id = self._id_factory()
         request: DispatchRequest | None = None
         audit_cash: dict[str, str] = {}
+        admission_view: AdmissionView | None = None
+
+        if self._admission is not None and decision.kind in {
+            DecisionKind.BUY_MORE,
+            DecisionKind.SELL_PART,
+            DecisionKind.SELL_ALL,
+        }:
+            result = await self._admission.prepare(command.external_instrument_id)
+            if isinstance(result, SubmitDenialReason):
+                decision = TradeDecision(DecisionKind.WAIT, 0, None, result.value)
+                estimated_commission = Decimal()
+            else:
+                admission_view = result
 
         if decision.kind in {DecisionKind.BUY_MORE, DecisionKind.SELL_PART, DecisionKind.SELL_ALL}:
             if decision.limit_price is None:
@@ -142,6 +162,15 @@ class DecisionMaterializerService:
                     command.currency,
                     required_order_cash,
                 )
+                if admission_view is not None:
+                    request = request.model_copy(
+                        update={
+                            "admission_runtime_instance_id": str(admission_view.owner_runtime_instance_id),
+                            "admission_generation": admission_view.owner_generation,
+                            "admission_revision": admission_view.revision,
+                            "configuration_fingerprint": admission_view.configuration_fingerprint,
+                        }
+                    )
             audit_cash["estimated_buy_commission"] = str(estimated_commission if side is OrderSide.BUY else Decimal())
             if side is OrderSide.BUY and cash is not None:
                 audit_cash["available_after_reserve"] = str(projected_available)
@@ -199,7 +228,25 @@ class DecisionMaterializerService:
             reason_code=decision.reason_code,
             decision_quantity_lots=decision.quantity_lots,
             limit_price=decision.limit_price,
-            strategy_snapshot=self._strategy_snapshot(),
+            strategy_snapshot={
+                **self._strategy_snapshot(),
+                **(
+                    {
+                        "admission_origin": {
+                            "runtime_instance_id": str(admission_view.owner_runtime_instance_id),
+                            "generation": admission_view.owner_generation,
+                            "revision": admission_view.revision,
+                            "configuration_fingerprint": admission_view.configuration_fingerprint,
+                            "lot_size": command.lot_size,
+                            "currency": command.currency,
+                            "instrument_uid": command.external_instrument_id,
+                            "fact_instrument_id": str(command.instrument_id),
+                        }
+                    }
+                    if admission_view is not None
+                    else {}
+                ),
+            },
             process_id=process_id,
             intent=intent,
             position_snapshot=position_snapshot.to_metadata(),

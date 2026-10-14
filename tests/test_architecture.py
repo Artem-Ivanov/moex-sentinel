@@ -76,6 +76,7 @@ LAYER_RULES = {
         "root",
     },
     ("moex_sentinel", "entrypoint"): {"composition", "api", "config", "root"},
+    ("moex_sentinel", "operator_entrypoint"): {"domain", "config", "root"},
     ("moex_sentinel", "config"): {"config", "domain", "root"},
     ("moex_sentinel", "migrations"): {"migrations", "storage", "domain", "config", "root"},
     ("moex_sentinel", "worker_entrypoint"): {"composition", "storage", "domain", "services", "config", "root"},
@@ -139,6 +140,8 @@ def _layer(module: str) -> tuple[str | None, str]:
         if parts[1] == "__main__":
             return owner, "entrypoint"
         return owner, "analytics_transport" if parts[1] in {"app", "market_source"} else "analytics_pure"
+    if owner == "moex_sentinel" and module == "moex_sentinel.operator_admission":
+        return owner, "operator_entrypoint"
     layer = parts[1]
     if layer == "__main__":
         return owner, "entrypoint"
@@ -205,6 +208,8 @@ def _external_allowed(owner: str, layer: str, target: str) -> bool:
         return False
     if layer == "adapters":
         return top in TRANSPORT_EXTERNALS
+    if owner == "moex_sentinel" and layer == "operator_entrypoint":
+        return top == "httpx"
     if owner == "market_analytics":
         if layer == "analytics_transport":
             return top in {"httpx", "fastapi"}
@@ -323,3 +328,10 @@ def test_import_fixtures_reject_forbidden_dependency_directions(importer, source
 def test_import_fixtures_allow_intended_layer_dependencies(importer, source) -> None:
     modules = FIXTURE_MODULES | {"moex_sentinel.services.ports", "trading_automaton.composition"}
     assert _dependency_violations(importer, ast.parse(source), modules) == [], (importer, source)
+
+
+def test_operator_cli_allows_only_its_explicit_http_transport() -> None:
+    modules = FIXTURE_MODULES
+    assert _dependency_violations("moex_sentinel.operator_admission", ast.parse("import httpx"), modules) == []
+    assert _dependency_violations("moex_sentinel.operator_admission", ast.parse("import sqlalchemy"), modules)
+    assert _dependency_violations("moex_sentinel.services.new_service", ast.parse("import httpx"), modules)

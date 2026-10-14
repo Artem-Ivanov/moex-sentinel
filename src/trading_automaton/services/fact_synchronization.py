@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter
 
+from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationCommand,
     AutomationStatusesResult,
@@ -53,7 +54,7 @@ class FactRepositoryPort(Protocol):
         self,
         automation_id: str,
         *,
-        state: str,
+        state: AutomationState,
         revision: int,
         last_sequence_number: int,
     ) -> None: ...
@@ -185,6 +186,8 @@ class FactSynchronizationService:
                 state=status.state.value,
                 revision=status.revision,
                 last_sequence_number=status.last_sequence_number,
+                settings_revision=status.settings_revision,
+                order_quota_percent=status.order_quota_percent,
             )
 
     def _schedule_rows(self, rows: list[FactOutboxRecord]) -> None:

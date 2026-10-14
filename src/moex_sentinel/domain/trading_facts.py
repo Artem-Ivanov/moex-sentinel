@@ -1,5 +1,6 @@
 """Typed values for the user-broker-scoped Core trading fact schema."""
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -91,6 +92,31 @@ class TradingFactPersistenceError(RuntimeError):
         self.constraint_name = constraint_name
         detail = f" ({constraint_name})" if constraint_name is not None else ""
         super().__init__(f"{code.value}: {entity_type}{detail}")
+
+
+@dataclass(frozen=True)
+class FactRuntimeAuthorization:
+    recovery_only: bool
+
+
+@dataclass(frozen=True)
+class FactSubmitReservation:
+    automation_id: str
+    idempotency_key: str
+    request_fingerprint: str
+    state: str
+    runtime_instance_id: str
+    generation: int
+    configuration_fingerprint: str
+    permit_id: str | None
+    side: str
+    quantity_lots: int
+    limit_price: Decimal
+    requested_amount: Decimal
+    reserved_cash: Decimal
+    reserved_position_units: Decimal
+    payload: dict[str, object]
+    origin_registration_status: str | None
 
 
 class TradingAutomationDraft(FrozenFactModel):

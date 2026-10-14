@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 from typing import Protocol
 
+from sentinel_contracts.broker_execution import BrokerOrderStatus
+from sentinel_contracts.broker_order_policy import BROKER_TERMINAL_STATES
 from trading_automaton.domain.dtos import ActiveCashReservation, CommittedCashReservation, _Reservation
 
 __all__ = [
@@ -21,8 +23,9 @@ _ACTIVE_STATES = {
     "ACCEPTED",
     "PARTIALLY_FILLED",
     "UNCERTAIN",
+    "FAILED",
 }
-_TERMINAL_STATES = {"FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
+_TERMINAL_STATES = BROKER_TERMINAL_STATES
 
 
 class ActiveCashReservationPort(Protocol):
@@ -31,7 +34,7 @@ class ActiveCashReservationPort(Protocol):
     currency: str
     amount: Decimal
     side: str
-    state: str
+    state: BrokerOrderStatus
 
 
 class AccountCashReservationService:
@@ -85,7 +88,7 @@ class AccountCashReservationService:
                 additions[value.intent_id] = reservation
             self._reservations.update(additions)
 
-    async def complete(self, intent_id: str, state: str) -> None:
+    async def complete(self, intent_id: str, state: BrokerOrderStatus) -> None:
         if state not in _TERMINAL_STATES:
             return
         async with self._lock:

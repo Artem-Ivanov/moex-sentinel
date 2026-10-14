@@ -21,6 +21,8 @@ def command(
     state: AutomationState = AutomationState.IN_WORK,
     revision: int = 1,
     last_sequence_number: int = 0,
+    settings_revision: int = 0,
+    order_quota_percent: Decimal | None = None,
     bootstrap: BrokerPositionBootstrap | None = None,
 ) -> AutomationCommand:
     return AutomationCommand(
@@ -36,7 +38,9 @@ def command(
         state=state,
         revision=revision,
         last_sequence_number=last_sequence_number,
+        settings_revision=settings_revision,
         resume_requested=False,
+        order_quota_percent=order_quota_percent,
         bootstrap=bootstrap,
     )
 

@@ -12,6 +12,7 @@ from moex_sentinel.views.schemas.automations import (
     CreateAutomationSchema,
     TradingAutomationDetailsSchema,
     TradingSessionsStatusSchema,
+    UpdateAutomationSettingsSchema,
 )
 
 router = APIRouter(tags=["trading-automations"])
@@ -84,3 +85,21 @@ async def close_automation(automation_id: str, request: Request) -> AutomationSc
     return AutomationSchema.from_domain(
         await run_sync(partial(_usecases(request).close_automation.execute, automation_id))
     )
+
+
+@router.patch("/trading-automations/{automation_id}/settings", response_model=AutomationSchema)
+async def update_automation_settings(
+    automation_id: str,
+    payload: UpdateAutomationSettingsSchema,
+    request: Request,
+) -> AutomationSchema:
+    result = await run_sync(
+        partial(
+            _usecases(request).update_trading_automation_settings.execute,
+            automation_id,
+            expected_revision=payload.expected_revision,
+            expected_settings_revision=payload.expected_settings_revision,
+            order_quota_percent=payload.order_quota_percent,
+        )
+    )
+    return AutomationSchema.from_domain(result)

@@ -1,5 +1,6 @@
 """HTTP contract for baseline command, status and fact routes."""
 
+import asyncio
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,8 +9,12 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from moex_sentinel.api.app import create_app
+from moex_sentinel.api.worker_auth import WorkerPrincipal
+from moex_sentinel.views.internal_trading_facts import publish_automation_facts
+from moex_sentinel.views.schemas.trading_facts import PublishFactsRequestSchema
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationCommand,
@@ -29,9 +34,11 @@ class Execute:
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[tuple[object, ...]] = []
+        self.keyword_calls: list[dict[str, object]] = []
 
-    def execute(self, *args: object) -> object:
+    def execute(self, *args: object, **kwargs: object) -> object:
         self.calls.append(args)
+        self.keyword_calls.append(kwargs)
         return self.result
 
 
@@ -84,6 +91,7 @@ def test_baseline_routes_delegate_strict_typed_values(
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
         lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(),
             claim_automation_commands=claims,
             view_automation_statuses=statuses,
             publish_trading_facts=publish,
@@ -138,7 +146,9 @@ def test_malformed_fact_batch_returns_422_without_calling_usecase(
     publish = Execute(FactBatchResult(results=()))
     monkeypatch.setattr(
         "moex_sentinel.api.app.build_application_usecases",
-        lambda _factory, *, settings: SimpleNamespace(publish_trading_facts=publish),
+        lambda _factory, *, settings: SimpleNamespace(
+            daily_admission_preparation=SimpleNamespace(), publish_trading_facts=publish
+        ),
     )
     malformed = all_envelopes()[0].model_dump(mode="json")
     malformed["payload"]["unexpected"] = True
@@ -152,3 +162,64 @@ def test_malformed_fact_batch_returns_422_without_calling_usecase(
     assert publish.calls == []
     assert response.json()["detail"]["fields"][0]["path"].endswith("payload.unexpected")
     assert "Synthetic fact" not in response.text
+
+
+def test_fact_route_passes_only_runtime_identity_scalars_to_usecase(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime_id = UUID("00000000-0000-4000-8000-000000000071")
+    publish = Execute(FactBatchResult(results=()))
+    monkeypatch.setattr(
+        "moex_sentinel.views.internal_trading_facts._usecases",
+        lambda _request: SimpleNamespace(publish_trading_facts=publish),
+    )
+
+    async def direct_run_sync(function):
+        return function()
+
+    monkeypatch.setattr("moex_sentinel.views.internal_trading_facts.run_sync", direct_run_sync)
+    request = Request({"type": "http", "method": "POST", "path": "/internal/automation-facts", "headers": []})
+    request.state.worker_principal = WorkerPrincipal(
+        worker_id="worker-prod",
+        runtime_instance_id=runtime_id,
+        broker_id=SCOPE_ID,
+        environment="PROD",
+        access_mode="TRADE",
+        strategy_enabled=True,
+        generation=7,
+        registration_status="OWNER",
+        recovery_only=False,
+    )
+    facts = [all_envelopes()[0]]
+
+    result = asyncio.run(publish_automation_facts(PublishFactsRequestSchema(facts=facts), request))
+
+    assert result == FactBatchResult(results=())
+    assert publish.calls == [(facts,)]
+    assert publish.keyword_calls == [{"runtime_instance_id": runtime_id, "generation": 7}]
+
+
+def test_fact_route_rejects_scope_mismatch_before_usecase(monkeypatch: pytest.MonkeyPatch) -> None:
+    publish = Execute(FactBatchResult(results=()))
+    monkeypatch.setattr(
+        "moex_sentinel.views.internal_trading_facts._usecases",
+        lambda _request: SimpleNamespace(publish_trading_facts=publish),
+    )
+    request = Request({"type": "http", "method": "POST", "path": "/internal/automation-facts", "headers": []})
+    request.state.worker_principal = WorkerPrincipal(
+        worker_id="worker-prod",
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000071"),
+        broker_id=SCOPE_ID,
+        environment="PROD",
+        access_mode="TRADE",
+        strategy_enabled=True,
+        generation=7,
+        registration_status="OWNER",
+        recovery_only=False,
+    )
+    foreign_fact = all_envelopes()[0].model_copy(
+        update={"user_broker_id": UUID("00000000-0000-4000-8000-000000000099")}
+    )
+
+    response = asyncio.run(publish_automation_facts(PublishFactsRequestSchema(facts=[foreign_fact]), request))
+
+    assert response.status_code == 403
+    assert publish.calls == []

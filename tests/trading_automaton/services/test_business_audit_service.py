@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from sentinel_contracts.business_audit import BusinessAuditLevel, BusinessAuditStage
 from trading_automaton.services.business_audit import BusinessAuditService
 
@@ -12,7 +14,8 @@ class Repository:
         self.events.extend(events)
 
 
-def test_decision_process_audit_uses_one_process_id_and_safe_allowlist() -> None:
+@pytest.mark.parametrize("kind", ["WAIT", "BUY_MORE", "SELL_PART", "SELL_ALL"])
+def test_decision_process_audit_uses_one_process_id_and_safe_allowlist(kind) -> None:
     repository = Repository()
     service = BusinessAuditService(repository, now=lambda: datetime(2026, 8, 7, 12, tzinfo=UTC))
 
@@ -22,7 +25,7 @@ def test_decision_process_audit_uses_one_process_id_and_safe_allowlist() -> None
         broker_id="broker-1",
         account_id="account-1",
         instrument_id="instrument-1",
-        decision="WAIT",
+        decision=kind,
         reason_code="NO_THRESHOLD",
         current_price="100.00",
         best_bid="99.99",
@@ -39,20 +42,23 @@ def test_decision_process_audit_uses_one_process_id_and_safe_allowlist() -> None
         cycle_pending_low_before="99.50",
         cycle_pending_low_after="99.00",
         unsafe_value="must-not-be-stored",
+        position_snapshot={"raw": "unsafe"},
     )
 
     assert {event.process_id for event in repository.events} == {"process-1"}
-    assert [event.stage for event in repository.events] == [
-        BusinessAuditStage.MARKET_DATA_RECEIVED,
-        BusinessAuditStage.TRADING_CYCLE_UPDATED,
-        BusinessAuditStage.POSITION_SNAPSHOT_RECEIVED,
-        BusinessAuditStage.STRATEGY_CALCULATION_STARTED,
-        BusinessAuditStage.STRATEGY_DECISION_MADE,
-        BusinessAuditStage.TRADING_STEP_COMPLETED,
-    ]
-    decision = repository.events[4]
+    assert [event.stage for event in repository.events] == [BusinessAuditStage.STRATEGY_DECISION_MADE]
+    decision = repository.events[0]
+    assert decision.level is BusinessAuditLevel.INFO
+    assert not decision.critical
+    assert decision.occurred_at == datetime(2026, 8, 7, 12, tzinfo=UTC)
+    assert (decision.automation_id, decision.broker_id, decision.account_id, decision.instrument_id) == (
+        "automation-1",
+        "broker-1",
+        "account-1",
+        "instrument-1",
+    )
     assert decision.data == {
-        "decision": "WAIT",
+        "decision": kind,
         "reason_code": "NO_THRESHOLD",
         "current_price": "100.00",
         "best_bid": "99.99",

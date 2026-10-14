@@ -3,17 +3,92 @@ import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import pytest
 from grpc import StatusCode
 from t_tech.invest import AioRequestError
+from t_tech.invest.schemas import OrderIdType
 
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import OrderSide
+from sentinel_contracts.broker_execution import BrokerConnection, OrderSide
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAuthorizationRequest,
+    SubmitDenialReason,
+    SubmitDenied,
+    SubmitPermit,
+    submit_request_fingerprint,
+)
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession, _order_state
+from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.services.account_commission_profile import CommissionRefreshRequest
 from trading_automaton.services.order_dispatch import DispatchRequest
+from trading_automaton.services.trading_admission import SubmitGate
 from trading_automaton.storage.repository import AccountCommissionProfileKey
+
+PROD_BROKER_ID = "00000000-0000-4000-8000-000000000001"
+PROD_TOKEN = "synthetic-token"
+PROD_TARGET = "invest-public-api.tbank.ru:443"
+PROD_CONFIGURATION_FINGERPRINT = "a" * 64
+
+
+def prod_connection(fingerprint=PROD_CONFIGURATION_FINGERPRINT):
+    return BrokerConnection(
+        broker_id=PROD_BROKER_ID,
+        adapter_code="TINVEST_PROD",
+        target=PROD_TARGET,
+        token=PROD_TOKEN,
+        is_test=False,
+        environment="PROD",
+        access_mode="TRADE",
+        account_id="account",
+        configuration_fingerprint=fingerprint,
+    )
+
+
+def prod_dispatch_request(configuration_fingerprint=PROD_CONFIGURATION_FINGERPRINT):
+    deadline = datetime(2099, 1, 1, tzinfo=UTC)
+    return DispatchRequest(
+        idempotency_key="00000000-0000-4000-8000-000000000003",
+        account_id="account",
+        instrument_id="uid-1",
+        side=OrderSide.BUY,
+        quantity_lots=1,
+        limit_price=Decimal("100"),
+        lot_size=10,
+        reservation_currency="RUB",
+        broker_id=PROD_BROKER_ID,
+        automation_id="00000000-0000-4000-8000-000000000004",
+        market_valid_until=deadline,
+        submit_deadline=deadline,
+        admission_runtime_instance_id="00000000-0000-4000-8000-000000000002",
+        admission_generation=1,
+        admission_revision=1,
+        configuration_fingerprint=configuration_fingerprint,
+    )
+
+
+def prod_request_fingerprint(request):
+    return submit_request_fingerprint(
+        SubmitAuthorizationRequest(
+            broker_id=UUID(request.broker_id),
+            account_id=request.account_id,
+            automation_id=UUID(request.automation_id),
+            idempotency_key=UUID(request.idempotency_key),
+            generation=request.admission_generation,
+            revision=request.admission_revision,
+            configuration_fingerprint=request.configuration_fingerprint,
+            instrument_uid=request.instrument_id,
+            lot_size=request.lot_size,
+            currency=request.reservation_currency,
+            side=request.side.value,
+            quantity_lots=request.quantity_lots,
+            limit_price=request.limit_price,
+            market_valid_until=request.market_valid_until,
+            submit_deadline=request.submit_deadline,
+        )
+    )
 
 
 class FakeClient:
@@ -146,11 +221,19 @@ class FakeSandbox:
             raise RuntimeError("portfolio refresh failed")
         position = SimpleNamespace(
             instrument_uid="instrument",
+            instrument_type="INSTRUMENT_TYPE_SHARE",
             quantity_lots=SimpleNamespace(units=2, nano=0),
             average_position_price=SimpleNamespace(units=100, nano=0, currency="rub"),
             current_price=SimpleNamespace(units=101, nano=0, currency="rub"),
         )
-        return SimpleNamespace(positions=[position])
+        currency = SimpleNamespace(
+            instrument_uid="rub-currency",
+            instrument_type="INSTRUMENT_TYPE_CURRENCY",
+            quantity_lots=SimpleNamespace(units=5000, nano=0),
+            average_position_price=SimpleNamespace(units=1, nano=0, currency="rub"),
+            current_price=SimpleNamespace(units=1, nano=0, currency="rub"),
+        )
+        return SimpleNamespace(positions=[position, currency])
 
     async def get_sandbox_positions(self, *, account_id):
         self.money_calls += 1
@@ -263,9 +346,220 @@ def test_positions_dispatch_and_quotes_reuse_existing_sdk_context() -> None:
 
     assert client.entered == 1
     assert positions[0].quantity_lots == Decimal("2")
+    assert len(positions) == 1
     assert order.status == "ACCEPTED"
     assert order.executed_at is None
     assert client.orders.posted["order_id"] == "intent-1"
+
+
+def test_prod_submit_denial_never_enters_sdk_post():
+    class Admission:
+        async def authorize_submit(self, request):
+            return SubmitGate(denial=SubmitDenied(reason=SubmitDenialReason.DISARMED, outcome_uncertain=False))
+
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        state = await session.dispatch_limit_order(prod_dispatch_request())
+        await session.close()
+        return client, state
+
+    client, state = asyncio.run(scenario())
+    assert state.status == "CANCELLED"
+    assert state.executed_lots == 0
+    assert state.pre_rpc_abort_proof is None
+    assert not hasattr(client.orders, "posted")
+
+
+def test_prod_already_consumed_submit_is_uncertain_and_never_fake_cancelled():
+    class Admission:
+        async def authorize_submit(self, request):
+            return SubmitGate(denial=SubmitDenied(reason=SubmitDenialReason.ALREADY_CONSUMED, outcome_uncertain=True))
+
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        with pytest.raises(CoreOperationError) as error:
+            await session.dispatch_limit_order(prod_dispatch_request())
+        await session.close()
+        return client, error.value
+
+    client, error = asyncio.run(scenario())
+
+    assert error.retryable is True
+    assert not hasattr(client.orders, "posted")
+
+
+def test_prod_sdk_boundary_rejects_request_fingerprint_different_from_session_binding():
+    class Admission:
+        async def authorize_submit(self, request):
+            return SubmitGate(permit=permit, expires_monotonic=100.0)
+
+    permit = SubmitPermit(
+        permit_id=uuid4(),
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000002"),
+        idempotency_key=UUID("00000000-0000-4000-8000-000000000003"),
+        generation=1,
+        revision=1,
+        configuration_fingerprint="a" * 64,
+        request_fingerprint="b" * 64,
+        issued_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 7, 12, 0, 1, tzinfo=UTC),
+        server_response_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        risk_snapshot_id=uuid4(),
+    )
+
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        try:
+            await session.dispatch_limit_order(prod_dispatch_request(configuration_fingerprint="c" * 64))
+        finally:
+            await session.close()
+        return client
+
+    with pytest.raises(CoreOperationError):
+        asyncio.run(scenario())
+
+
+def test_prod_sdk_permit_fingerprint_binds_actual_lot_size_before_sdk_post():
+    request = prod_dispatch_request()
+    permit = SubmitPermit(
+        permit_id=uuid4(),
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000002"),
+        idempotency_key=UUID(request.idempotency_key),
+        generation=1,
+        revision=1,
+        configuration_fingerprint=PROD_CONFIGURATION_FINGERPRINT,
+        request_fingerprint=prod_request_fingerprint(request),
+        issued_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 7, 12, 0, 1, tzinfo=UTC),
+        server_response_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        risk_snapshot_id=uuid4(),
+    )
+    observed = []
+    clients = []
+
+    class Admission:
+        async def authorize_submit(self, authorization):
+            observed.append(authorization)
+            return SubmitGate(permit=permit, expires_monotonic=100.0)
+
+    async def scenario():
+        client = FakeClient()
+        clients.append(client)
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        try:
+            await session.dispatch_limit_order(request.model_copy(update={"lot_size": 1}))
+        finally:
+            await session.close()
+        return client
+
+    with pytest.raises(CoreOperationError):
+        asyncio.run(scenario())
+
+    assert observed[0].lot_size == 1
+    assert observed[0].reservation_currency == "RUB"
+    assert not hasattr(clients[0].orders, "posted")
+
+
+def test_accepted_permit_expiry_before_sdk_entry_emits_zero_fill_proof():
+    class Admission:
+        async def authorize_submit(self, request):
+            return SubmitGate(permit=permit, expires_monotonic=1.0)
+
+        def abort_proof(self, request, granted, reason):
+            return PreRpcAbortProof(
+                permit_id=granted.permit_id,
+                idempotency_key=granted.idempotency_key,
+                request_fingerprint=granted.request_fingerprint,
+                runtime_instance_id=granted.runtime_instance_id,
+                generation=granted.generation,
+                configuration_fingerprint=granted.configuration_fingerprint,
+                aborted_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+                reason=reason,
+            )
+
+    request = prod_dispatch_request()
+    permit = SubmitPermit(
+        permit_id=uuid4(),
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000002"),
+        idempotency_key=UUID("00000000-0000-4000-8000-000000000003"),
+        generation=1,
+        revision=1,
+        configuration_fingerprint="a" * 64,
+        request_fingerprint=prod_request_fingerprint(request),
+        issued_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 7, 12, 0, 1, tzinfo=UTC),
+        server_response_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        risk_snapshot_id=uuid4(),
+    )
+
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            monotonic=lambda: 2.0,
+            now=lambda: datetime(2026, 8, 7, 12, tzinfo=UTC),
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        state = await session.dispatch_limit_order(request)
+        await session.close()
+        return client, state
+
+    client, state = asyncio.run(scenario())
+    assert state.status == "CANCELLED"
+    assert state.requested_amount == Decimal("1000")
+    assert state.pre_rpc_abort_proof.reason == "PERMIT_EXPIRED_BEFORE_POST"
+    assert state.pre_rpc_abort_proof.idempotency_key == permit.idempotency_key
+    assert not hasattr(client.orders, "posted")
 
 
 def test_order_state_prefers_latest_execution_stage_time() -> None:
@@ -290,6 +584,63 @@ def test_order_state_prefers_latest_execution_stage_time() -> None:
     )
 
     assert _order_state(response).executed_at == later
+
+
+def test_prod_recovery_looks_up_exact_request_id_without_listing_orders():
+    async def scenario():
+        client = FakeClient()
+        requests = []
+
+        async def get_order_state(**values):
+            requests.append(values)
+            return await FakeOrders().get_order_state(**values)
+
+        async def unexpected_get_orders(**_values):
+            pytest.fail("PROD recovery must query the attributable request key directly")
+
+        client.orders.get_order_state = get_order_state
+        client.orders.get_orders = unexpected_get_orders
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "invest-public-api.tbank.ru:443",
+            environment="PROD",
+            account_id="account",
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        state = await session.find_by_idempotency_key("account", "intent-1")
+        await session.close()
+        return state, requests
+
+    state, requests = asyncio.run(scenario())
+    assert state.status == "FILLED"
+    assert requests[0]["order_id"] == "intent-1"
+    assert requests[0]["order_id_type"] is OrderIdType.ORDER_ID_TYPE_REQUEST
+
+
+@pytest.mark.parametrize("status", [StatusCode.NOT_FOUND, StatusCode.UNIMPLEMENTED])
+def test_prod_request_key_lookup_treats_sdk_absence_as_unknown(status):
+    async def scenario():
+        client = FakeClient()
+
+        async def missing(**_values):
+            raise AioRequestError(status, "request key not visible", None)
+
+        client.orders.get_order_state = missing
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "invest-public-api.tbank.ru:443",
+            environment="PROD",
+            account_id="account",
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        try:
+            return await session.find_by_idempotency_key("account", "intent-1")
+        finally:
+            await session.close()
+
+    assert asyncio.run(scenario()) is None
 
 
 def test_order_state_falls_back_to_order_date_without_execution_stages() -> None:

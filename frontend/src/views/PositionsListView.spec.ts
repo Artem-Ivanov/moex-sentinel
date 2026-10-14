@@ -201,6 +201,47 @@ it.each([{}, { bootstrap_pending: true }])("resumes a TEST TRADE HOLD once, incl
   await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/resume"))).toHaveLength(1))
 })
 
+it("allows PROD TRADE resume and close commands once at a time", async () => {
+  runtime.value = { environment: "PROD", access_mode: "TRADE" }
+  const pendingResume = deferred<Response>()
+  const pendingClose = deferred<Response>()
+  const fetchMock = vi.fn().mockImplementation((url: string) => {
+    if (url === "/api/trading/summary") return Response.json(summary)
+    if (url.startsWith("/api/operations")) return Response.json({ items: [], errors: [] })
+    if (url.endsWith("/resume")) return pendingResume.promise
+    if (url.endsWith("/close")) return pendingClose.promise
+    return Response.json({ items: [heldAutomation] })
+  })
+  vi.stubGlobal("fetch", fetchMock)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: "/positions", name: "positions", component: PositionsListView }] })
+  await router.push("/positions"); await router.isReady()
+  render(PositionsListView, { global: { plugins: [router] } })
+  const row = await screen.findByRole("row", { name: /HELD Broker a1/ })
+  await fireEvent.click(row)
+
+  const resume = screen.getByRole("button", { name: "Resume" }) as HTMLButtonElement
+  const close = screen.getByRole("button", { name: "Закрыть автомат" }) as HTMLButtonElement
+  expect(resume.disabled).toBe(false)
+  expect(close.disabled).toBe(false)
+  await fireEvent.click(resume)
+  await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/resume"))).toHaveLength(1))
+  expect(resume.disabled).toBe(true)
+  expect(close.disabled).toBe(true)
+  await fireEvent.click(resume)
+  expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/resume"))).toHaveLength(1)
+
+  pendingResume.resolve(Response.json({ ...heldAutomation, state: "IN_QUEUE" }))
+  await waitFor(() => expect(close.disabled).toBe(false))
+  expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/resume"))).toHaveLength(1)
+
+  await fireEvent.click(close)
+  await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/close"))).toHaveLength(1))
+  expect(close.disabled).toBe(true)
+  await fireEvent.click(close)
+  expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/close"))).toHaveLength(1)
+  pendingClose.resolve(Response.json({ ...heldAutomation, state: "CLOSED" }))
+})
+
 it.each([
   [{ state: "IN_WORK" }, "Возобновление доступно только для автомата в HOLD."],
   [{ resume_requested: true }, "Запрос на возобновление уже принят."],

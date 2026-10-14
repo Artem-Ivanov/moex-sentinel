@@ -10,6 +10,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
+from moex_sentinel.services.trading_admission import TradingAdmissionService
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
 from moex_sentinel.services.trading_fact_mapping import TradingFactMapper
 from moex_sentinel.storage.models import (
@@ -25,9 +26,11 @@ from moex_sentinel.storage.models import (
     Base as CoreBase,
 )
 from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
+from moex_sentinel.storage.repositories.trading_admission import TradingAdmissionRepository
 from moex_sentinel.storage.repositories.trading_facts_uow import TradingFactsUnitOfWork
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerPosition
 from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.trading_admission import RuntimeRegistrationRequest, RuntimeRegistrationStatus
 from sentinel_contracts.trading_facts import (
     BrokerPositionBootstrap,
     FactEnvelope,
@@ -98,7 +101,6 @@ def bootstrap_context(
                 updated_at=NOW,
             )
         )
-
     worker_engine = create_engine("sqlite:///:memory:" if worker_db_path is None else f"sqlite:///{worker_db_path}")
     WorkerBase.metadata.create_all(worker_engine)
     worker = LocalAutomationRepository(
@@ -263,6 +265,18 @@ def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ac
                 test_automation, user_broker_id=test_scope, instrument_id=test_instrument, state="IN_QUEUE"
             )
         )
+    runtime = TradingAdmissionService(TradingAdmissionRepository(core_factory), clock=lambda: NOW).register_runtime(
+        RuntimeRegistrationRequest(
+            worker_id="prod-worker",
+            runtime_instance_id=UUID("00000000-0000-4000-8000-000000000614"),
+            broker_id=SCOPE_ID,
+            application_environment="PROD",
+            access_mode="READ_ONLY",
+            strategy_enabled=False,
+        ),
+        "d" * 64,
+    )
+    assert runtime.registration_status is RuntimeRegistrationStatus.OWNER
     commands = AutomationCommandRepository(core_factory, environment="PROD").claim(10)
     assert len(commands) == 1
     value = commands[0]
@@ -331,7 +345,7 @@ def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ac
             FactSynchronizationService._envelope(row) for row in worker.ready_fact_outbox(10, now=NOW, deadline_ms=0)
         ]
         assert len(facts) == 4
-        first = ingress.publish(facts)
+        first = ingress.publish(facts, runtime_instance_id=runtime.runtime_instance_id, generation=runtime.generation)
         assert first.failures == ()
         assert first.results[0].accepted_through_sequence == 4
         assert worker.get_active_intent(str(AUTOMATION_ID)) is None
@@ -347,7 +361,9 @@ def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ac
             FactSynchronizationService._envelope(row) for row in reopened.ready_fact_outbox(10, now=NOW, deadline_ms=0)
         ]
         assert replay == facts
-        retried = ingress.publish(replay)
+        retried = ingress.publish(
+            replay, runtime_instance_id=runtime.runtime_instance_id, generation=runtime.generation
+        )
         assert retried.failures == ()
         assert retried.results[0].accepted_through_sequence == 4
         reopened.acknowledge_fact_outbox(str(AUTOMATION_ID), accepted_through_sequence=4, current_revision=2)
@@ -385,7 +401,12 @@ def test_composed_prod_read_only_bootstrap_survives_analytics_outage_and_lost_ac
                 assert event.payload.critical is False
                 assert event.payload.data["broker_quantity_lots"] == event.payload.data["worker_quantity_lots"] == 2
                 assert event.payload.broker_order_id is event.payload.execution_id is event.payload.decision_id is None
-            assert ingress.publish(audits).failures == ()
+            assert (
+                ingress.publish(
+                    audits, runtime_instance_id=runtime.runtime_instance_id, generation=runtime.generation
+                ).failures
+                == ()
+            )
             reopened.acknowledge_fact_outbox(
                 str(AUTOMATION_ID), accepted_through_sequence=accepted_sequence, current_revision=2
             )

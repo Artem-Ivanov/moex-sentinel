@@ -9,7 +9,7 @@ from pydantic import ConfigDict
 
 from sentinel_contracts.analytics import AdaptiveThresholds, MarketIndicators
 from sentinel_contracts.base import PositionalModel
-from sentinel_contracts.broker_execution import BrokerPosition, OrderSide
+from sentinel_contracts.broker_execution import BrokerOrderStatus, BrokerPosition, OrderSide
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.config import StrategySettings
@@ -30,7 +30,7 @@ class ActiveCashReservation(PositionalModel):
     currency: str
     amount: Decimal
     side: str
-    state: str
+    state: BrokerOrderStatus
 
 
 class _Reservation(PositionalModel):
@@ -118,6 +118,7 @@ class DecisionContext(PositionalModel):
     reserved_cash: Decimal = Decimal()
     available_free_cash: Decimal = Decimal()
     required_order_cash: Decimal = Decimal()
+    requested_buy_lots: int | None = None
 
 
 class TradeDecision(PositionalModel):
@@ -153,12 +154,17 @@ class DispatchRequest(PositionalModel):
     required_cash: Decimal = Decimal()
 
     market_valid_until: datetime | None = None
+    submit_deadline: datetime | None = None
+    admission_runtime_instance_id: str | None = None
+    admission_generation: int | None = None
+    admission_revision: int | None = None
+    configuration_fingerprint: str | None = None
 
 
 class PostCommitCleanupContext(PositionalModel):
     model_config = ConfigDict(frozen=True)
     intent_id: str
-    terminal_state: str
+    terminal_state: BrokerOrderStatus
     request: DispatchRequest
 
 

@@ -38,19 +38,20 @@ def check_populated_archive_migration(url) -> None:
     engine = create_database_engine(url)
     try:
         seed_archive_graph(engine)
-        before = archive_graph_snapshot(engine, include_archive=False)
+        historical_tables = tuple(name for name in inspect(engine).get_table_names() if name != "alembic_version")
+        before = archive_graph_snapshot(engine, include_archive=False, table_names=historical_tables)
         before_constraints = inspect(engine).get_check_constraints("user_brokers")
         before_indexes = broker_indexes(engine)
-        before_fks = {name: inspect(engine).get_foreign_keys(name) for name in before}
+        before_fks = {name: inspect(engine).get_foreign_keys(name) for name in historical_tables}
 
-        command.upgrade(config, "head")
-        command.upgrade(config, "head")
+        command.upgrade(config, REVISION)
+        command.upgrade(config, REVISION)
 
         assert current_schema_revision(engine) == REVISION
-        assert archive_graph_snapshot(engine, include_archive=False) == before
+        assert archive_graph_snapshot(engine, include_archive=False, table_names=historical_tables) == before
         assert inspect(engine).get_check_constraints("user_brokers") == before_constraints
         assert broker_indexes(engine) == before_indexes
-        assert {name: inspect(engine).get_foreign_keys(name) for name in before} == before_fks
+        assert {name: inspect(engine).get_foreign_keys(name) for name in historical_tables} == before_fks
         assert UserBrokerRepository(create_session_factory(engine)).get("scope-1").archived_at is None
         if engine.dialect.name == "sqlite":
             with engine.connect() as connection:
@@ -58,15 +59,15 @@ def check_populated_archive_migration(url) -> None:
 
         command.downgrade(config, PREVIOUS)
         assert current_schema_revision(engine) == PREVIOUS
-        assert archive_graph_snapshot(engine, include_archive=False) == before
-        command.upgrade(config, "head")
+        assert archive_graph_snapshot(engine, include_archive=False, table_names=historical_tables) == before
+        command.upgrade(config, REVISION)
         archived = UserBrokerRepository(create_session_factory(engine)).archive("scope-1", expected_environment="TEST")
         assert archived.archived_at is not None
-        after_archive = archive_graph_snapshot(engine)
+        after_archive = archive_graph_snapshot(engine, table_names=historical_tables)
         with pytest.raises(RuntimeError, match="archived"):
             command.downgrade(config, PREVIOUS)
         assert current_schema_revision(engine) == REVISION
-        assert archive_graph_snapshot(engine) == after_archive
+        assert archive_graph_snapshot(engine, table_names=historical_tables) == after_archive
         assert {name: rows for name, rows in before.items() if name != "user_brokers"} == {
             name: rows for name, rows in after_archive.items() if name != "user_brokers"
         }
@@ -81,7 +82,7 @@ def test_populated_archive_migration_preserves_history_and_refuses_lossy_downgra
 def test_sqlite_downgrade_blocks_archive_between_empty_check_and_column_drop(tmp_path: Path) -> None:
     url = f"sqlite:///{tmp_path / 'concurrent-downgrade.db'}"
     config = migration_config(url)
-    command.upgrade(config, "head")
+    command.upgrade(config, REVISION)
     engine = create_database_engine(url)
 
     @event.listens_for(engine, "connect")

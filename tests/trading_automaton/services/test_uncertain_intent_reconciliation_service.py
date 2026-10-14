@@ -10,17 +10,29 @@ from sqlalchemy.orm import sessionmaker
 from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
 from sentinel_contracts.business_audit import BusinessAuditStage
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAbsenceBasis,
+    SubmitAttemptView,
+    SubmitAuthorizationRequest,
+    submit_request_fingerprint,
+)
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from tests.trading_automaton.command_factory import decision_item
+from tests.trading_automaton.storage.worker_storage_helpers import filled_buy
+from trading_automaton.domain.dtos import DispatchRequest
+from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.business_audit import BusinessAuditService
+from trading_automaton.services.order_tracking import OrderTrackingService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
 )
-from trading_automaton.storage.database import create_worker_engine
+from trading_automaton.storage.database import create_worker_engine, initialize_worker_schema
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
-from trading_automaton.storage.models import Base
-from trading_automaton.storage.repository import LocalAutomationRepository
+from trading_automaton.storage.models import Base, LocalIntentModel
+from trading_automaton.storage.repository import ExecutionFinalization, LocalAutomationRepository
 
 NOW = datetime(2026, 8, 7, 13, 21, tzinfo=UTC)
 CREATED_AT = NOW - timedelta(seconds=11)
@@ -38,7 +50,7 @@ def intent():
         side="SELL",
         state="UNCERTAIN",
         quantity_lots=1,
-        limit_price=Decimal("253.08"),
+        limit_price=Decimal("100"),
         estimated_commission=Decimal("0.12654"),
         broker_order_id="broker-order",
         created_at=CREATED_AT,
@@ -235,6 +247,528 @@ def test_exact_broker_order_state_wins_over_ambiguous_operation_search() -> None
     assert result.resolved == 1
     assert repository.holds == []
     assert repository.finalizations[0][0].state == "FILLED"
+
+
+def test_prod_recovery_never_fabricates_fill_from_matching_operations():
+    class TrackingBroker(Broker):
+        operation_reads = 0
+
+        async def inspect_recent_operations(self, account_id, instrument_id, limit):
+            self.operation_reads += 1
+            return await super().inspect_recent_operations(account_id, instrument_id, limit)
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        broker = TrackingBroker((sell_operation(),))
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, result
+
+    repository, broker, result = asyncio.run(scenario())
+    assert result.unresolved == 1
+    assert broker.operation_reads == 0
+    assert repository.finalizations == []
+    assert repository.holds
+
+
+def test_retired_generation_proven_no_grant_cancels_queued_intent_without_broker_lookup():
+    class Admission:
+        async def submit_attempt(self, idempotency_key, *, origin_runtime_instance_id, origin_generation):
+            assert idempotency_key == intent_value.idempotency_key
+            assert origin_runtime_instance_id == UUID("00000000-0000-4000-8000-000000000801")
+            assert origin_generation == 3
+            return SubmitAttemptView(
+                broker_id=command().broker_id,
+                account_id=command().account_id,
+                idempotency_key=UUID(idempotency_key),
+                consumed_state=None,
+                proven_not_granted=True,
+                original_runtime_instance_id=origin_runtime_instance_id,
+                original_generation=origin_generation,
+                original_generation_retired=True,
+                absence_basis=SubmitAbsenceBasis.RETIRED_GENERATION,
+            )
+
+    class TrackingBroker(Broker):
+        lookups = 0
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.lookups += 1
+            return await super().find_by_idempotency_key(account_id, idempotency_key)
+
+        async def inspect_position(self, account_id, instrument_id):
+            self.lookups += 1
+            return await super().inspect_position(account_id, instrument_id)
+
+    intent_value = intent()
+    intent_value.state = "SUBMITTING"
+    intent_value.idempotency_key = "00000000-0000-4000-8000-000000000802"
+    intent_value.broker_order_id = None
+    intent_value.requested_amount = Decimal("253.08")
+    intent_value.executed_lots = 0
+    intent_value.strategy_snapshot = {
+        "admission_origin": {
+            "runtime_instance_id": "00000000-0000-4000-8000-000000000801",
+            "generation": 3,
+        }
+    }
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = intent_value
+        broker = TrackingBroker((sell_operation(),))
+        cash = Cash()
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            admission=Admission(),
+            cash=cash,
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, cash, result
+
+    repository, broker, cash, result = asyncio.run(scenario())
+    assert result.resolved == 1
+    assert repository.updates[0][1]["state"] == "CANCELLED"
+    assert repository.updates[0][1]["terminal_at"] == NOW
+    assert broker.lookups == 0
+    assert repository.finalizations == []
+    assert cash.calls == [(intent_value.idempotency_key, "CANCELLED")]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "FAILED",
+        "CREATED",
+        "DISPATCH_PENDING",
+        "SUBMITTING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "PARTIALLY_FILLED",
+        "UNCERTAIN",
+        "FILLED",
+        "REJECTED",
+        "CANCELLED",
+        "EXPIRED",
+    ],
+)
+def test_prod_restart_reconciles_retained_and_unfinalized_terminal_phases_by_request_key(tmp_path, state):
+    class RequestBroker(Broker):
+        request_lookups = 0
+        operation_reads = 0
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.request_lookups += 1
+            return rejected_order_state()
+
+        async def inspect_recent_operations(self, account_id, instrument_id, limit):
+            self.operation_reads += 1
+            return await super().inspect_recent_operations(account_id, instrument_id, limit)
+
+    database_url = f"sqlite:///{tmp_path / 'retained-intent.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW), environment="PROD")
+    command_value = command()
+    repo.cache_command(command_value)
+    batch = repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    intent_id = batch.intents[0].idempotency_key
+    with factory.begin() as session:
+        session.get(LocalIntentModel, intent_id).state = state
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=2)),
+        environment="PROD",
+    )
+    broker = RequestBroker(())
+    service = UncertainIntentReconciliationService(
+        reopened,
+        broker,
+        now=lambda: NOW + timedelta(seconds=2),
+        environment="PROD",
+    )
+
+    result = asyncio.run(service.reconcile((command_value,)))
+
+    assert result.resolved == 1
+    assert broker.request_lookups == 1
+    assert broker.operation_reads == 0
+    assert reopened.get_active_intent(str(command_value.automation_id)) is None
+    assert reopened.get_latest_intent(str(command_value.automation_id)).state == "REJECTED"
+    reopened_engine.dispose()
+
+
+def test_prod_restart_finalizes_persisted_pre_rpc_proof_without_sdk_lookup(tmp_path):
+    class NoBrokerAccess(Broker):
+        lookups = 0
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.lookups += 1
+            raise AssertionError("Persisted pre-RPC proof must not query the broker")
+
+        async def inspect_position(self, account_id, instrument_id):
+            self.lookups += 1
+            raise AssertionError("Persisted pre-RPC proof must not inspect positions")
+
+    database_url = f"sqlite:///{tmp_path / 'proof-recovery.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW), environment="PROD")
+    command_value = command()
+    origin = {
+        "runtime_instance_id": "00000000-0000-4000-8000-000000000801",
+        "generation": 3,
+        "revision": 8,
+        "configuration_fingerprint": "d" * 64,
+        "lot_size": command_value.lot_size,
+        "currency": command_value.currency,
+        "instrument_uid": command_value.external_instrument_id,
+        "fact_instrument_id": str(command_value.instrument_id),
+    }
+    decision = decision_item(command_value).model_copy(update={"strategy_snapshot": {"admission_origin": origin}})
+    repo.cache_command(command_value)
+    batch = repo.save_decision_batch((decision,), occurred_at=NOW)
+    intent_id = batch.intents[0].idempotency_key
+    repo.update_intent(intent_id, state="SUBMITTING", occurred_at=NOW + timedelta(milliseconds=1))
+    authorization = SubmitAuthorizationRequest(
+        broker_id=command_value.broker_id,
+        account_id=command_value.account_id,
+        automation_id=command_value.automation_id,
+        idempotency_key=UUID(intent_id),
+        generation=origin["generation"],
+        revision=origin["revision"],
+        configuration_fingerprint=origin["configuration_fingerprint"],
+        instrument_uid=command_value.external_instrument_id,
+        lot_size=origin["lot_size"],
+        currency=origin["currency"],
+        side="BUY",
+        quantity_lots=1,
+        limit_price=Decimal("100"),
+        market_valid_until=NOW,
+        submit_deadline=NOW,
+    )
+    proof = PreRpcAbortProof(
+        permit_id=UUID("00000000-0000-4000-8000-000000000802"),
+        idempotency_key=UUID(intent_id),
+        request_fingerprint=submit_request_fingerprint(authorization),
+        runtime_instance_id=UUID(origin["runtime_instance_id"]),
+        generation=origin["generation"],
+        configuration_fingerprint=origin["configuration_fingerprint"],
+        aborted_at=NOW,
+        reason="PERMIT_EXPIRED_BEFORE_POST",
+    )
+    repo.update_intent(
+        intent_id,
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        requested_amount=Decimal("100"),
+        estimated_commission=Decimal(),
+        executed_amount=Decimal(),
+        executed_commission=Decimal(),
+        executed_lots=0,
+        executed_price=Decimal(),
+        pre_rpc_abort_proof=proof,
+    )
+    before_cache_state = repo.get_state(str(command_value.automation_id))
+    changed_command = command_value.model_copy(
+        update={
+            "lot_size": 10,
+            "currency": "USD",
+            "external_instrument_id": "changed-uid",
+            "instrument_id": UUID("00000000-0000-4000-8000-000000000899"),
+            "revision": before_cache_state.revision,
+            "last_sequence_number": before_cache_state.last_sequence_number,
+        }
+    )
+    assert repo.cache_command(changed_command)
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=2)),
+        environment="PROD",
+    )
+    broker = NoBrokerAccess(())
+    service = UncertainIntentReconciliationService(
+        reopened,
+        broker,
+        now=lambda: NOW + timedelta(seconds=2),
+        environment="PROD",
+    )
+
+    result = asyncio.run(service.reconcile((changed_command,)))
+
+    assert result.resolved == 1
+    assert broker.lookups == 0
+    terminal = reopened.get_latest_intent(str(command_value.automation_id))
+    assert terminal.state == "CANCELLED"
+    assert terminal.terminal_at is not None
+    order_facts = list(reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=3), deadline_ms=0))
+    proof_facts = [item for item in order_facts if item.payload.get("pre_rpc_abort_proof") is not None]
+    assert proof_facts
+    assert len(proof_facts) == 1
+    assert proof_facts[-1].payload["pre_rpc_abort_proof"] == proof.model_dump(mode="json")
+    assert proof_facts[-1].payload["instrument_id"] == origin["fact_instrument_id"]
+    assert order_facts[-1].payload.get("pre_rpc_abort_proof") is None
+
+    original_request = DispatchRequest(
+        idempotency_key=intent_id,
+        account_id=command_value.account_id,
+        instrument_id=origin["instrument_uid"],
+        side=OrderSide.BUY,
+        quantity_lots=1,
+        limit_price=Decimal("100"),
+        automation_id=str(command_value.automation_id),
+        lot_size=origin["lot_size"],
+        process_id=decision.process_id,
+        broker_id=str(command_value.broker_id),
+        reservation_currency=origin["currency"],
+    )
+    original_response = BrokerOrderState(
+        broker_order_id="",
+        idempotency_key=intent_id,
+        status="CANCELLED",
+        requested_lots=1,
+        executed_lots=0,
+        requested_amount=Decimal("100"),
+        executed_amount=Decimal(),
+        estimated_commission=Decimal(),
+        executed_commission=Decimal(),
+        currency=origin["currency"],
+        pre_rpc_abort_proof=proof,
+    )
+    facts_before_tracking = reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=4), deadline_ms=0)
+
+    async def replay_tracking():
+        tracking = OrderTrackingService(reopened, now=lambda: NOW + timedelta(seconds=4))
+        dispatch_task = asyncio.create_task(asyncio.sleep(0, result=original_response))
+        tracking.track(intent_id, dispatch_task, request=original_request)
+        await tracking.wait_all()
+
+    asyncio.run(replay_tracking())
+    facts_after_tracking = reopened.ready_fact_outbox(20, now=NOW + timedelta(seconds=5), deadline_ms=0)
+    assert facts_after_tracking == facts_before_tracking
+    assert reopened.get_state(str(command_value.automation_id)).state != "HOLD"
+
+    finalization = ExecutionFinalization(
+        intent_id=intent_id,
+        automation_id=str(command_value.automation_id),
+        broker_id=str(command_value.broker_id),
+        account_id=command_value.account_id,
+        instrument_id=origin["instrument_uid"],
+        side="BUY",
+        quantity_lots=1,
+        requested_price=Decimal("100"),
+        currency=origin["currency"],
+        state="CANCELLED",
+        occurred_at=NOW + timedelta(seconds=4),
+        broker_order_id="",
+        requested_amount=Decimal("100"),
+        executed_amount=Decimal(),
+        estimated_commission=Decimal(),
+        executed_commission=Decimal(),
+        executed_lots=0,
+        executed_price=Decimal(),
+        executed_at=None,
+        terminal_at=NOW + timedelta(seconds=4),
+        lot_size=origin["lot_size"],
+        process_id=decision.process_id,
+    )
+    for mismatch in (
+        {"lot_size": 10},
+        {"currency": "USD"},
+        {"instrument_id": "changed-uid"},
+        {"requested_amount": Decimal("101")},
+    ):
+        with pytest.raises(ValueError, match="conflicts"):
+            reopened.finalize_execution(finalization.model_copy(update=mismatch))
+    reopened_engine.dispose()
+
+
+@pytest.mark.parametrize("terminal_status", ["FILLED", "CANCELLED"])
+def test_prod_restart_finalizes_positive_execution_once_with_fees_and_ledger(tmp_path, terminal_status):
+    class ExactStateBroker(Broker):
+        def __init__(self, state, position_lots):
+            super().__init__((), position_lots=str(position_lots), exact_state=state)
+            self.request_lookups = 0
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.request_lookups += 1
+            assert account_id == command().account_id
+            assert idempotency_key == self.exact_state.idempotency_key
+            return self.exact_state
+
+        async def inspect_recent_operations(self, account_id, instrument_id, limit):
+            raise AssertionError("PROD recovery must not infer execution from operations")
+
+    database_url = f"sqlite:///{tmp_path / f'positive-{terminal_status.lower()}.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW), environment="PROD")
+    command_value = command()
+    repo.cache_command(command_value)
+
+    if terminal_status == "FILLED":
+        intent_id = "00000000-0000-4000-8000-000000000901"
+        item = decision_item(command_value, intent_id=intent_id)
+        expected_position = 1
+        exact_state = BrokerOrderState(
+            "filled-order",
+            intent_id,
+            "FILLED",
+            1,
+            1,
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("0.20"),
+            Decimal("0.25"),
+            "RUB",
+            executed_price=Decimal("101"),
+            executed_at=NOW + timedelta(seconds=2),
+        )
+    else:
+        seed_item = decision_item(command_value, intent_id="00000000-0000-4000-8000-000000000902").model_copy(
+            update={
+                "intent": decision_item(command_value).intent.model_copy(
+                    update={
+                        "idempotency_key": "00000000-0000-4000-8000-000000000902",
+                        "quantity_lots": 2,
+                        "limit_price": Decimal("100"),
+                    }
+                ),
+                "quantity_lots": 2,
+                "decision_quantity_lots": 2,
+            }
+        )
+        repo.save_decision_batch((seed_item,), occurred_at=NOW)
+        repo.finalize_execution(
+            filled_buy().model_copy(
+                update={
+                    "intent_id": "00000000-0000-4000-8000-000000000902",
+                    "automation_id": str(command_value.automation_id),
+                    "broker_id": str(command_value.broker_id),
+                    "account_id": command_value.account_id,
+                    "instrument_id": command_value.external_instrument_id,
+                    "quantity_lots": 2,
+                    "executed_lots": 2,
+                    "requested_amount": Decimal("200"),
+                    "executed_amount": Decimal("200"),
+                    "estimated_commission": Decimal("0.40"),
+                    "executed_commission": Decimal("0.50"),
+                    "lot_size": 1,
+                }
+            )
+        )
+        intent_id = "00000000-0000-4000-8000-000000000903"
+        item = decision_item(command_value, intent_id=intent_id).model_copy(
+            update={
+                "decision": "SELL_PART",
+                "intent": decision_item(command_value).intent.model_copy(
+                    update={"idempotency_key": intent_id, "kind": "SELL_PART", "side": "SELL", "quantity_lots": 2}
+                ),
+                "quantity_lots": 2,
+                "decision_quantity_lots": 2,
+            }
+        )
+        expected_position = 1
+        exact_state = BrokerOrderState(
+            "partial-cancel-order",
+            intent_id,
+            "CANCELLED",
+            2,
+            1,
+            Decimal("200"),
+            Decimal("101"),
+            Decimal("0.40"),
+            Decimal("0.25"),
+            "RUB",
+            executed_price=Decimal("101"),
+            executed_at=NOW + timedelta(seconds=2),
+        )
+
+    item_time = NOW + timedelta(seconds=1) if terminal_status == "CANCELLED" else NOW
+    repo.save_decision_batch((item,), occurred_at=item_time)
+    persisted_id = intent_id
+    repo.update_intent(
+        persisted_id,
+        state=terminal_status,
+        occurred_at=NOW + timedelta(seconds=1),
+        broker_order_id=exact_state.broker_order_id,
+        requested_amount=exact_state.requested_amount,
+        executed_amount=exact_state.executed_amount,
+        estimated_commission=exact_state.estimated_commission,
+        executed_commission=exact_state.executed_commission,
+        executed_lots=exact_state.executed_lots,
+        executed_price=exact_state.executed_price,
+        executed_at=exact_state.executed_at,
+    )
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened_factory = sessionmaker(reopened_engine, expire_on_commit=False)
+    reopened = LocalAutomationRepository(
+        reopened_factory,
+        fact_writer=FactOutboxWriter(clock=lambda: NOW + timedelta(seconds=3)),
+        environment="PROD",
+    )
+    broker = ExactStateBroker(exact_state, expected_position)
+    service = UncertainIntentReconciliationService(
+        reopened,
+        broker,
+        now=lambda: NOW + timedelta(seconds=3),
+        environment="PROD",
+    )
+
+    first = asyncio.run(service.reconcile((command_value,)))
+    facts_after_first = reopened.ready_fact_outbox(100, now=NOW + timedelta(seconds=4), deadline_ms=0)
+    second = asyncio.run(service.reconcile((command_value,)))
+    facts_after_second = reopened.ready_fact_outbox(100, now=NOW + timedelta(seconds=5), deadline_ms=0)
+    execution_facts = [fact for fact in facts_after_first if fact.fact_kind == "TRADE_EXECUTION_RECORDED"]
+    lots = reopened.list_open_lots(str(command_value.automation_id))
+
+    assert first.resolved == 1
+    assert second.resolved == 0
+    assert broker.request_lookups == 1
+    assert facts_after_second == facts_after_first
+    expected_side = "BUY" if terminal_status == "FILLED" else "SELL"
+    target_execution_facts = [fact for fact in execution_facts if fact.payload["side"] == expected_side]
+    assert len(target_execution_facts) == 1
+    assert target_execution_facts[0].payload["broker_commission"] == "0.25"
+    assert sum(lot.remaining_lots for lot in lots) == expected_position
+    assert reopened.get_latest_intent(str(command_value.automation_id)).terminal_at is not None
+    reopened_engine.dispose()
+
+
+def rejected_order_state() -> BrokerOrderState:
+    return BrokerOrderState(
+        "broker-order",
+        "intent",
+        "REJECTED",
+        1,
+        0,
+        Decimal("253.08"),
+        Decimal(),
+        Decimal("0.12654"),
+        Decimal(),
+        "RUB",
+    )
 
 
 def test_resolved_uncertain_intent_clears_matching_active_gate() -> None:
@@ -552,3 +1086,200 @@ def test_recovery_matches_instrument_units_instead_of_lots(quantity_units):
         assert result.unresolved == (0 if quantity_units == 10 else 1)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("environment", ["TEST", "PROD"])
+@pytest.mark.parametrize("state", ["FAILED", "ACCEPTED", "PARTIALLY_FILLED"])
+@pytest.mark.parametrize("observation", ["missing", "nonterminal", "position_mismatch"])
+def test_known_open_ambiguous_result_holds_and_keeps_same_key_and_reservation(
+    tmp_path, environment, state, observation
+):
+
+    class MissingBroker(Broker):
+        keys = []
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.keys.append(idempotency_key)
+            if observation == "nonterminal":
+                return rejected_order_state().model_copy(update={"status": "SUBMITTED"})
+            if observation == "position_mismatch":
+                return filled_order_state()
+
+        async def get_order_state(self, account_id, broker_order_id):
+            raise AssertionError("Known open recovery must use the stable request key")
+
+        async def inspect_recent_operations(self, account_id, instrument_id, limit):
+            raise AssertionError("Known open recovery must not infer a broker result from operations")
+
+    engine = create_worker_engine(f"sqlite:///{tmp_path / 'failed.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, environment=environment)
+    value = command()
+    repo.cache_command(value)
+    key = repo.save_decision_batch((decision_item(value),), occurred_at=NOW).intents[0].idempotency_key
+    with factory.begin() as session:
+        row = session.get(LocalIntentModel, key)
+        row.state = state
+        row.broker_order_id = "historical-order"
+    broker = MissingBroker(())
+
+    async def scenario():
+        cash = AccountCashReservationService()
+        await cash.restore(tuple(repo.list_active_buy_intent_reservations()))
+        reserved = await cash.reserved(value.account_id, "RUB")
+        assert reserved > 0
+        recovery = UncertainIntentReconciliationService(
+            repo, broker, now=lambda: NOW, environment=environment, cash=cash
+        )
+        result = await recovery.reconcile((value,))
+        assert result.unresolved == 1
+        assert await cash.reserved(value.account_id, "RUB") == reserved
+
+    asyncio.run(scenario())
+    assert broker.keys == [key]
+    assert repo.get_active_intent(str(value.automation_id)).state == state
+    assert repo.get_state(str(value.automation_id)).state == "HOLD"
+    assert repo.list_open_lots(str(value.automation_id)) == []
+    facts = repo.ready_fact_outbox(100, now=NOW + timedelta(seconds=1), deadline_ms=0)
+    assert not any(fact.fact_kind == "TRADE_EXECUTION_RECORDED" for fact in facts)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("open_state", "terminal_state", "executed_lots"),
+    [("ACCEPTED", "REJECTED", 0), ("PARTIALLY_FILLED", "CANCELLED", 1), ("PARTIALLY_FILLED", "FILLED", 2)],
+)
+@pytest.mark.parametrize("restart", [False, True])
+def test_test_failed_open_observation_reaches_terminal_after_delay_or_restart(
+    tmp_path, open_state, terminal_state, executed_lots, restart
+):
+    value = command()
+    automation_id = str(value.automation_id)
+    database_url = f"sqlite:///{tmp_path / 'failed-open.db'}"
+    clock = [NOW]
+
+    class RequestBroker(Broker):
+        def __init__(self):
+            super().__init__((), position_lots="0")
+            self.keys = []
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.keys.append(idempotency_key)
+            return self.exact_state
+
+        async def get_order_state(self, account_id, broker_order_id):
+            raise AssertionError("Known open recovery must keep the stable request key")
+
+        async def inspect_recent_operations(self, account_id, instrument_id, limit):
+            raise AssertionError("Known open recovery must not infer fills from operations")
+
+        async def post_order(self, *args, **kwargs):
+            raise AssertionError("Recovery must never repeat submission")
+
+    def open_repository():
+        engine = create_worker_engine(database_url)
+        initialize_worker_schema(engine)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: clock[0]))
+        return engine, factory, repo
+
+    engine, factory, repo = open_repository()
+    try:
+        repo.cache_command(value)
+        item = decision_item(value)
+        item = item.model_copy(
+            update={"intent": item.intent.model_copy(update={"quantity_lots": 2}), "decision_quantity_lots": 2}
+        )
+        key = repo.save_decision_batch((item,), occurred_at=NOW).intents[0].idempotency_key
+        with factory.begin() as session:
+            row = session.get(LocalIntentModel, key)
+            row.state = "FAILED"
+            row.broker_order_id = "historical-order"
+        broker = RequestBroker()
+        open_lots = 1 if open_state == "PARTIALLY_FILLED" else 0
+        broker.exact_state = BrokerOrderState(
+            "broker-order",
+            key,
+            open_state,
+            2,
+            open_lots,
+            Decimal("200"),
+            Decimal(100 * open_lots),
+            Decimal("1"),
+            Decimal("0.25") if open_lots else Decimal(),
+            "RUB",
+            executed_price=Decimal("100") if open_lots else Decimal(),
+            executed_at=NOW if open_lots else None,
+        )
+        broker.position_lots = str(open_lots)
+
+        async def scenario():
+            nonlocal engine, repo
+            cash = AccountCashReservationService()
+            await cash.restore(tuple(repo.list_active_buy_intent_reservations()))
+            reserved = await cash.reserved(value.account_id, "RUB")
+            assert reserved == Decimal("201")
+            gate = ActiveIntentGateService()
+            gate.activate(automation_id, key)
+            recovery = UncertainIntentReconciliationService(
+                repo, broker, now=lambda: clock[0], cash=cash, active_intents=gate
+            )
+            pending = await recovery.reconcile((value,))
+            assert pending.resolved == pending.unresolved == 0
+            assert repo.get_active_intent(automation_id).state == open_state
+            assert repo.list_open_lots(automation_id) == []
+            assert await cash.reserved(value.account_id, "RUB") == reserved
+            assert gate.has_active_intent(automation_id)
+            await recovery.reconcile((value,))
+            assert broker.keys == [key]
+            clock[0] += timedelta(seconds=11)
+            if restart:
+                engine.dispose()
+                engine, _, repo = open_repository()
+                cash = AccountCashReservationService()
+                await cash.restore(tuple(repo.list_active_buy_intent_reservations()))
+                assert await cash.reserved(value.account_id, "RUB") == reserved
+                gate = ActiveIntentGateService()
+                gate.activate(automation_id, key)
+                recovery = UncertainIntentReconciliationService(
+                    repo, broker, now=lambda: clock[0], cash=cash, active_intents=gate
+                )
+            broker.exact_state = broker.exact_state.model_copy(
+                update={
+                    "status": terminal_state,
+                    "executed_lots": executed_lots,
+                    "executed_amount": Decimal(100 * executed_lots),
+                    "executed_commission": Decimal("0.25") if executed_lots else Decimal(),
+                    "executed_price": Decimal("100") if executed_lots else Decimal(),
+                    "executed_at": clock[0] if executed_lots else None,
+                }
+            )
+            broker.position_lots = str(executed_lots)
+            result = await recovery.reconcile((value,))
+            assert result.resolved == 1
+            assert result.unresolved == 0
+            assert await cash.reserved(value.account_id, "RUB") == 0
+            assert not gate.has_active_intent(automation_id)
+            assert repo.get_active_intent(automation_id) is None
+            terminal = repo.get_latest_intent(automation_id)
+            assert terminal.state == terminal_state
+            assert terminal.terminal_at == clock[0]
+            assert terminal.executed_lots == executed_lots
+            assert sum(lot.remaining_lots for lot in repo.list_open_lots(automation_id)) == executed_lots
+            facts = repo.ready_fact_outbox(100, now=clock[0] + timedelta(seconds=1), deadline_ms=0)
+            order_facts = [fact for fact in facts if fact.fact_kind == "BROKER_ORDER_STATE_CHANGED"]
+            assert order_facts[-1].payload["to_state"] == terminal_state
+            execution_facts = [fact for fact in facts if fact.fact_kind == "TRADE_EXECUTION_RECORDED"]
+            assert len(execution_facts) == (1 if executed_lots else 0)
+            if execution_facts:
+                assert execution_facts[0].payload["executed_lots"] == executed_lots
+                assert execution_facts[0].payload["broker_commission"] == "0.25"
+            repeated = await recovery.reconcile((value,))
+            assert repeated.resolved == repeated.unresolved == 0
+            assert repo.ready_fact_outbox(100, now=clock[0] + timedelta(seconds=1), deadline_ms=0) == facts
+            assert broker.keys == [key, key]
+
+        asyncio.run(scenario())
+    finally:
+        engine.dispose()

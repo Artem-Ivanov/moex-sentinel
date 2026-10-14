@@ -2,15 +2,35 @@
 
 import sqlite3
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect
 
 from trading_automaton.storage.models import TRADE_DECISION_INTENT_INDEX, Base
+from trading_automaton.storage.state_schema import migrate_state_checks
 
 
 def initialize_worker_schema(engine: Engine) -> None:
-    """Create Worker tables and add the decision lookup index to existing databases without replacing rows."""
-    Base.metadata.create_all(engine)
-    TRADE_DECISION_INTENT_INDEX.create(engine, checkfirst=True)
+    """Upgrade private SQLite atomically while preserving existing rows and extensions."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        migrate_state_checks(connection)
+        Base.metadata.create_all(connection)
+        columns = {column["name"] for column in inspect(connection).get_columns("cached_automations")}
+        if "settings_revision" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE cached_automations ADD COLUMN settings_revision INTEGER NOT NULL DEFAULT 0"
+            )
+        if "order_quota_percent" not in columns:
+            connection.exec_driver_sql("ALTER TABLE cached_automations ADD COLUMN order_quota_percent NUMERIC(28, 9)")
+        TRADE_DECISION_INTENT_INDEX.create(connection, checkfirst=True)
+        connection.commit()
+
+
+def downgrade_worker_states(engine: Engine) -> None:
+    """Remove only revision 1 CHECKs; retain quota, financial rows and later extensions."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        migrate_state_checks(connection, downgrade=True)
+        connection.commit()
 
 
 def create_worker_engine(database_url: str) -> Engine:

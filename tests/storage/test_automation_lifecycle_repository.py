@@ -1,6 +1,7 @@
 """Public lifecycle commands cannot overwrite a concurrent revision."""
 
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, local
 
@@ -24,6 +25,37 @@ def test_public_state_write_rejects_stale_revision() -> None:
         repo.set_state(AUTOMATION_ID, AutomationState.CLOSED, expected_revision=1)
 
     assert repo.get(AUTOMATION_ID) == first
+
+
+def test_settings_compare_both_revisions_without_changing_execution_revision() -> None:
+    _, factory = repository()
+    repo = AutomationRepository(factory)
+
+    updated = repo.update_settings(
+        AUTOMATION_ID,
+        expected_revision=1,
+        expected_settings_revision=0,
+        order_quota_percent=Decimal("12.5"),
+    )
+
+    assert updated.revision == 1
+    assert updated.settings_revision == 1
+    assert updated.order_quota_percent == Decimal("12.5")
+    with pytest.raises(RevisionConflictError):
+        repo.update_settings(
+            AUTOMATION_ID,
+            expected_revision=0,
+            expected_settings_revision=1,
+            order_quota_percent=None,
+        )
+    with pytest.raises(RevisionConflictError):
+        repo.update_settings(
+            AUTOMATION_ID,
+            expected_revision=1,
+            expected_settings_revision=0,
+            order_quota_percent=None,
+        )
+    assert repo.get(AUTOMATION_ID) == updated
 
 
 def test_concurrent_public_commands_have_only_one_revision_winner(tmp_path: Path) -> None:

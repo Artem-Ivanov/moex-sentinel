@@ -2,8 +2,9 @@
 
 from decimal import Decimal
 from typing import Literal, Self
+from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,7 +73,7 @@ class StrategySettings(BaseSettings):
 
 
 class AutomatonSettings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False)
+    model_config = SettingsConfigDict(extra="ignore", case_sensitive=False, hide_input_in_errors=True)
 
     application_environment: Literal["TEST", "PROD"] = Field("TEST", validation_alias="APPLICATION_ENVIRONMENT")
     broker_access_mode: Literal["READ_ONLY", "TRADE"] = Field(validation_alias="BROKER_ACCESS_MODE")
@@ -84,6 +85,9 @@ class AutomatonSettings(BaseSettings):
         validation_alias="AUTOMATON_DATABASE_URL",
     )
     worker_id: str = Field("trading-automaton-1", validation_alias="AUTOMATON_WORKER_ID")
+    internal_worker_id: str | None = Field(None, validation_alias="INTERNAL_WORKER_ID")
+    internal_worker_broker_id: UUID | None = Field(None, validation_alias="INTERNAL_WORKER_BROKER_ID")
+    internal_worker_token: SecretStr | None = Field(None, validation_alias="INTERNAL_WORKER_TOKEN")
     iteration_seconds: float = Field(1.0, validation_alias="AUTOMATON_ITERATION_SECONDS")
     sandbox_retry_limit: int = Field(5, validation_alias="SANDBOX_RETRY_LIMIT", ge=0)
     heartbeat_interval_seconds: float = Field(3.0, validation_alias="AUTOMATON_HEARTBEAT_INTERVAL_SECONDS")
@@ -92,10 +96,23 @@ class AutomatonSettings(BaseSettings):
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")
     log_format: str = Field("json", validation_alias="LOG_FORMAT")
 
+    @field_validator("internal_worker_id", "internal_worker_broker_id", "internal_worker_token", mode="before")
+    @classmethod
+    def empty_identity_is_unset(cls, value: object) -> object:
+        return None if value == "" else value
+
     @model_validator(mode="after")
     def validate_runtime(self) -> Self:
-        if self.application_environment == "PROD" and self.broker_access_mode == "TRADE":
-            raise ValueError("PROD TRADE is not enabled in this phase")
+        if self.application_environment == "PROD":
+            token = None if self.internal_worker_token is None else self.internal_worker_token.get_secret_value()
+            if (
+                self.internal_worker_id != self.worker_id
+                or self.internal_worker_broker_id is None
+                or token is None
+                or len(token) != 64
+                or any(character not in "0123456789abcdef" for character in token)
+            ):
+                raise ValueError("PROD requires Core worker credentials matching AUTOMATON_WORKER_ID")
         if not self.database_url.startswith("sqlite:///"):
             raise ValueError("Trading worker supports only SQLite.")
         if self.iteration_seconds <= 0:

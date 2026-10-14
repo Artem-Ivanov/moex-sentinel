@@ -3,10 +3,11 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from time import monotonic as system_monotonic
 from typing import Any, Literal
+from uuid import UUID
 
 from grpc import StatusCode
 from t_tech.invest import AioRequestError, AsyncClient
@@ -14,6 +15,7 @@ from t_tech.invest.schemas import (
     GetOperationsByCursorRequest,
     GetOrderPriceRequest,
     OrderDirection,
+    OrderIdType,
     OrderType,
     PriceType,
     Quotation,
@@ -21,10 +23,22 @@ from t_tech.invest.schemas import (
 
 from moex_sentinel.adapters.tinvest.converters import enum_name, execution_unit_price, quotation_to_decimal
 from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
-from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation, OrderSide
+from sentinel_contracts.broker_execution import (
+    BrokerConnection,
+    BrokerOrderState,
+    BrokerPosition,
+    BrokerRecoveryOperation,
+    OrderSide,
+)
 from sentinel_contracts.time import floor_utc_millisecond
 from sentinel_contracts.tinvest import resolve_tinvest_endpoint
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAuthorizationRequest,
+    submit_request_fingerprint,
+)
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
+from trading_automaton.domain.errors import CoreOperationError
 
 LOGGER = logging.getLogger(__name__)
 _TLS_UNWRAP_FAILURE = "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))"
@@ -43,20 +57,43 @@ class BrokerSdkSession:
         environment: str = "TEST",
         access_mode: str = "READ_ONLY",
         account_id: str = "",
+        broker_connection: BrokerConnection | None = None,
+        submit_admission: Any | None = None,
         client_factory: Callable[..., Any] = _default_client_factory,
         snapshot_ttl_seconds: float = 60.0,
         monotonic: Callable[[], float] = system_monotonic,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         resolve_tinvest_endpoint(environment, "TINVEST_SANDBOX" if environment == "TEST" else "TINVEST_PROD", target)
         if access_mode not in {"READ_ONLY", "TRADE"}:
             raise ValueError("Invalid broker access mode")
         if environment == "PROD" and not account_id.strip():
             raise ValueError("PROD requires selected account_id")
-        if environment == "PROD" and access_mode == "TRADE":
-            raise ValueError("PROD TRADE is not enabled in this phase")
+        if environment == "PROD" and access_mode == "TRADE" and (submit_admission is None or broker_connection is None):
+            raise ValueError("PROD TRADE requires a validated Core broker connection and submit admission")
+        if broker_connection is not None and (
+            broker_connection.token != token
+            or broker_connection.target != target
+            or broker_connection.environment != environment
+            or broker_connection.access_mode != access_mode
+            or broker_connection.account_id != account_id
+        ):
+            raise ValueError("SDK session configuration differs from the validated Core broker connection")
+        if (
+            environment == "PROD"
+            and access_mode == "TRADE"
+            and broker_connection is not None
+            and broker_connection.configuration_fingerprint is None
+        ):
+            raise ValueError("PROD TRADE Core broker connection requires a configuration fingerprint")
         self._environment = environment
         self._access_mode = access_mode
         self._account_id = account_id
+        self._broker_connection = broker_connection
+        self._configuration_fingerprint = (
+            None if broker_connection is None else broker_connection.configuration_fingerprint
+        )
+        self._submit_admission = submit_admission
         if snapshot_ttl_seconds <= 0:
             raise ValueError("Account snapshot TTL must be positive.")
         self._token = token
@@ -64,6 +101,7 @@ class BrokerSdkSession:
         self._client_factory = client_factory
         self._snapshot_ttl_seconds = snapshot_ttl_seconds
         self._monotonic = monotonic
+        self._now = now
         self._client: Any | None = None
         self._services: Any | None = None
         self._snapshot_lock = asyncio.Lock()
@@ -148,6 +186,7 @@ class BrokerSdkSession:
                     or quotation_to_decimal(getattr(item, "blocked_lots", Quotation(units=0, nano=0))) != 0,
                 )
                 for item in response.positions
+                if str(getattr(item, "instrument_type", "")).upper().split("_")[-1] != "CURRENCY"
             )
             self._positions_cache[account_id] = (now + self._snapshot_ttl_seconds, positions)
             return positions
@@ -188,25 +227,137 @@ class BrokerSdkSession:
         if self._access_mode != "TRADE":
             raise ValueError("READ_ONLY forbids broker mutation")
         self._validate_account(request.account_id)
-        response = await self._broker_request(
-            self.services.orders.post_order(
-                instrument_id=request.instrument_id,
-                quantity=request.quantity_lots,
-                price=_quotation(request.limit_price),
-                direction=(
-                    OrderDirection.ORDER_DIRECTION_BUY
-                    if request.side.value == "BUY"
-                    else OrderDirection.ORDER_DIRECTION_SELL
-                ),
-                account_id=request.account_id,
-                order_type=OrderType.ORDER_TYPE_LIMIT,
-                order_id=request.idempotency_key,
-                price_type=PriceType.PRICE_TYPE_CURRENCY,
-            )
+        if self._environment == "PROD":
+            self._validate_connection_binding(request)
+            gate = await self._submit_admission.authorize_submit(request)
+            if gate.denial is not None:
+                if gate.denial.outcome_uncertain:
+                    raise CoreOperationError(retryable=True)
+                return self._cancel_before_post(request)
+            if gate.abort_proof is not None:
+                if gate.permit is None:
+                    raise CoreOperationError(retryable=False)
+                self._validate_permit_binding(request, gate.permit)
+                if (
+                    gate.abort_proof.permit_id != gate.permit.permit_id
+                    or gate.abort_proof.idempotency_key != gate.permit.idempotency_key
+                    or gate.abort_proof.request_fingerprint != gate.permit.request_fingerprint
+                    or gate.abort_proof.runtime_instance_id != gate.permit.runtime_instance_id
+                    or gate.abort_proof.generation != gate.permit.generation
+                    or gate.abort_proof.configuration_fingerprint != gate.permit.configuration_fingerprint
+                ):
+                    raise CoreOperationError(retryable=False)
+                return self._cancel_before_post(request, gate.abort_proof)
+            if gate.permit is None or gate.expires_monotonic is None:
+                raise CoreOperationError(retryable=False)
+            self._validate_permit_binding(request, gate.permit)
+            if self._market_expired(request) or self._monotonic() >= gate.expires_monotonic:
+                reason = "MARKET_EXPIRED_BEFORE_POST" if self._market_expired(request) else "PERMIT_EXPIRED_BEFORE_POST"
+                proof = self._submit_admission.abort_proof(request, gate.permit, reason)
+                return self._cancel_before_post(request, proof)
+        post = self.services.orders.post_order(
+            instrument_id=request.instrument_id,
+            quantity=request.quantity_lots,
+            price=_quotation(request.limit_price),
+            direction=(
+                OrderDirection.ORDER_DIRECTION_BUY
+                if request.side.value == "BUY"
+                else OrderDirection.ORDER_DIRECTION_SELL
+            ),
+            account_id=request.account_id,
+            order_type=OrderType.ORDER_TYPE_LIMIT,
+            order_id=request.idempotency_key,
+            price_type=PriceType.PRICE_TYPE_CURRENCY,
         )
+        response = await self._broker_request(post)
         state = _order_state(response)
         await self._invalidate_if_terminal(request.account_id, state)
         return state
+
+    def is_bound_to(self, connection: BrokerConnection, admission: Any) -> bool:
+        return (
+            self._broker_connection is connection
+            and self._submit_admission is admission
+            and self._token == connection.token
+            and self._target == connection.target
+            and self._account_id == connection.account_id
+            and self._configuration_fingerprint == connection.configuration_fingerprint
+        )
+
+    def _validate_connection_binding(self, request: DispatchRequest) -> None:
+        connection = self._broker_connection
+        if (
+            connection is None
+            or request.broker_id != connection.broker_id
+            or request.account_id != connection.account_id
+            or request.configuration_fingerprint != connection.configuration_fingerprint
+        ):
+            raise CoreOperationError(retryable=False)
+
+    def _validate_permit_binding(self, request: DispatchRequest, permit: Any) -> None:
+        if (
+            request.market_valid_until is None
+            or request.submit_deadline is None
+            or request.admission_runtime_instance_id is None
+            or request.admission_generation is None
+            or request.admission_revision is None
+            or request.configuration_fingerprint is None
+        ):
+            raise CoreOperationError(retryable=False)
+        try:
+            authorization = SubmitAuthorizationRequest(
+                broker_id=UUID(request.broker_id),
+                account_id=request.account_id,
+                automation_id=UUID(request.automation_id),
+                idempotency_key=UUID(request.idempotency_key),
+                generation=request.admission_generation,
+                revision=request.admission_revision,
+                configuration_fingerprint=request.configuration_fingerprint,
+                instrument_uid=request.instrument_id,
+                lot_size=request.lot_size,
+                currency=request.reservation_currency,
+                side=request.side.value,
+                quantity_lots=request.quantity_lots,
+                limit_price=request.limit_price,
+                market_valid_until=floor_utc_millisecond(request.market_valid_until),
+                submit_deadline=floor_utc_millisecond(request.submit_deadline),
+            )
+            runtime_instance_id = UUID(request.admission_runtime_instance_id)
+        except (TypeError, ValueError) as error:
+            raise CoreOperationError(retryable=False) from error
+        if (
+            permit.runtime_instance_id != runtime_instance_id
+            or permit.idempotency_key != authorization.idempotency_key
+            or permit.generation != authorization.generation
+            or permit.revision != authorization.revision
+            or permit.configuration_fingerprint != authorization.configuration_fingerprint
+            or permit.request_fingerprint != submit_request_fingerprint(authorization)
+        ):
+            raise CoreOperationError(retryable=False)
+
+    def _market_expired(self, request: DispatchRequest) -> bool:
+        return (
+            request.market_valid_until is not None and floor_utc_millisecond(self._now()) >= request.market_valid_until
+        )
+
+    @staticmethod
+    def _cancel_before_post(
+        request: DispatchRequest,
+        proof: PreRpcAbortProof | None = None,
+    ) -> BrokerOrderState:
+        return BrokerOrderState(
+            broker_order_id="",
+            idempotency_key=request.idempotency_key,
+            status="CANCELLED",
+            requested_lots=request.quantity_lots,
+            executed_lots=0,
+            requested_amount=request.limit_price * request.quantity_lots * request.lot_size,
+            executed_amount=Decimal(),
+            estimated_commission=Decimal(),
+            executed_commission=Decimal(),
+            currency=request.reservation_currency,
+            pre_rpc_abort_proof=proof,
+        )
 
     def _validate_account(self, account_id: str) -> None:
         if self._account_id and account_id != self._account_id:
@@ -235,6 +386,25 @@ class BrokerSdkSession:
         idempotency_key: str,
     ) -> BrokerOrderState | None:
         self._validate_account(account_id)
+        if self._environment == "PROD":
+            try:
+                response = await self._broker_request(
+                    self.services.orders.get_order_state(
+                        account_id=account_id,
+                        order_id=idempotency_key,
+                        price_type=PriceType.PRICE_TYPE_CURRENCY,
+                        order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST,
+                    )
+                )
+            except TInvestAdapterError as error:
+                if error.code in {"BROKER_ORDER_NOT_FOUND", "BROKER_REQUEST_LOOKUP_UNSUPPORTED"}:
+                    return None
+                raise
+            if response.order_request_id != idempotency_key:
+                return None
+            state = _order_state(response, order_state=True)
+            await self._invalidate_if_terminal(account_id, state)
+            return state
         response = await self._broker_request(self.services.orders.get_orders(account_id=account_id))
         for order in response.orders:
             if order.order_request_id == idempotency_key:
@@ -254,6 +424,8 @@ class BrokerSdkSession:
         mapping = {
             "UNAUTHENTICATED": ("BROKER_AUTH_FAILED", "Проверка токена не пройдена.", False),
             "PERMISSION_DENIED": ("BROKER_FORBIDDEN", "Недостаточно прав доступа.", False),
+            "NOT_FOUND": ("BROKER_ORDER_NOT_FOUND", "Состояние заявки пока недоступно.", False),
+            "UNIMPLEMENTED": ("BROKER_REQUEST_LOOKUP_UNSUPPORTED", "Поиск заявки по ключу недоступен.", False),
             "RESOURCE_EXHAUSTED": ("BROKER_RATE_LIMITED", "Превышен лимит запросов.", True),
             "UNAVAILABLE": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
             "DEADLINE_EXCEEDED": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
@@ -384,7 +556,7 @@ def _order_state(response: Any, *, order_state: bool = False) -> BrokerOrderStat
     return BrokerOrderState(
         broker_order_id=response.order_id,
         idempotency_key=response.order_request_id,
-        status=statuses.get(status, status),
+        status=statuses.get(status, "UNCERTAIN"),
         requested_lots=response.lots_requested,
         executed_lots=response.lots_executed,
         requested_amount=quotation_to_decimal(initial),

@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, StrictInt, model_validator
 
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.views.schemas.market_data import HistoricCandleSchema
@@ -22,6 +22,7 @@ from sentinel_contracts.business_audit import (
 from sentinel_contracts.runtime_versions import RuntimeVersion
 from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
 from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.trading_facts import OrderQuotaPercent
 from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
 
 if TYPE_CHECKING:
@@ -34,6 +35,12 @@ class StrictSchema(PositionalModel):
 
 class CreateAutomationSchema(StrictSchema):
     account_id: str
+
+
+class UpdateAutomationSettingsSchema(StrictSchema):
+    expected_revision: StrictInt = Field(gt=0)
+    expected_settings_revision: StrictInt = Field(ge=0)
+    order_quota_percent: OrderQuotaPercent | None
 
 
 class AutomationSchema(StrictSchema):
@@ -60,6 +67,8 @@ class AutomationSchema(StrictSchema):
     ticker: str
     instrument_name: str
     bootstrap_pending: bool = False
+    order_quota_percent: Decimal | None
+    settings_revision: int = 0
 
     @classmethod
     def from_domain(cls, value: AutomationRecord) -> AutomationSchema:
@@ -183,6 +192,7 @@ class BrokerConnectionSchema(StrictSchema):
     environment: BrokerEnvironment | None = None
     access_mode: BrokerAccessMode = "READ_ONLY"
     account_id: str = ""
+    configuration_fingerprint: str | None = None
 
     @classmethod
     def from_domain(cls, value: BrokerConnection) -> BrokerConnectionSchema:

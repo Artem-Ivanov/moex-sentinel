@@ -85,6 +85,7 @@ class PortfolioSnapshotModel(UuidPrimaryKeyMixin, Base):
         String(36),
         ForeignKey("portfolio_snapshot_runs.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
     user_broker_id: Mapped[str] = mapped_column(
         String(36),

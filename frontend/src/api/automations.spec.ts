@@ -7,6 +7,7 @@ import {
   holdAutomation,
   resumeAutomation,
   closeAutomation,
+  updateAutomationSettings,
 } from "./automations"
 
 afterEach(() => vi.unstubAllGlobals())
@@ -25,6 +26,7 @@ describe("automation API", () => {
     await holdAutomation("automation-1")
     await resumeAutomation("automation-1")
     await closeAutomation("automation-1")
+    await updateAutomationSettings("automation-1", 4, 2, "12.5")
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/api/instruments/broker-1/instrument-1/trade",
@@ -33,10 +35,15 @@ describe("automation API", () => {
       "/api/trading-automations/automation-1/hold",
       "/api/trading-automations/automation-1/resume",
       "/api/trading-automations/automation-1/close",
+      "/api/trading-automations/automation-1/settings",
     ])
     expect(fetchMock.mock.calls[0][1]).toMatchObject({
       method: "POST",
       body: JSON.stringify({ account_id: "account-1" }),
+    })
+    expect(fetchMock.mock.calls[6][1]).toMatchObject({
+      method: "PATCH",
+      body: JSON.stringify({ expected_revision: 4, expected_settings_revision: 2, order_quota_percent: "12.5" }),
     })
   })
 })
