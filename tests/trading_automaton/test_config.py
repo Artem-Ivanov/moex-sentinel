@@ -37,6 +37,77 @@ def test_settings_read_runtime_environment(monkeypatch) -> None:
     assert settings.fact_outbox_deadline_ms == 1000
 
 
+@pytest.mark.parametrize("field", ["CORE_URL", "ANALYTICS_URL"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "ftp://core",
+        "http:///missing-host",
+        "https://",
+        "http://user:password@core:8000",
+        "http://core:not-a-port",
+        "https://core:65536",
+        "http://[::1",
+    ],
+)
+def test_worker_http_urls_reject_unsafe_or_malformed_values(field, url) -> None:
+    with pytest.raises(ValidationError) as error:
+        AutomatonSettings(**{field: url})
+
+    if url not in {"", "https://"}:
+        assert url not in str(error.value)
+    assert "password" not in str(error.value)
+
+
+@pytest.mark.parametrize("field", ["CORE_URL", "ANALYTICS_URL"])
+@pytest.mark.parametrize("url", ["http://localhost:8000", "https://127.0.0.1:8443/api"])
+def test_worker_http_urls_accept_local_hosts_and_explicit_ports(field, url) -> None:
+    settings = AutomatonSettings(**{field: url})
+
+    assert getattr(settings, field.lower()) == url
+
+
+def test_worker_operational_timeouts_and_cache_values_are_configurable() -> None:
+    settings = AutomatonSettings(
+        AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS="13.5",
+        AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS="2.5",
+        AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS="75",
+        AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS="90",
+    )
+
+    assert settings.core_http_timeout_seconds == 13.5
+    assert settings.analytics_http_timeout_seconds == 2.5
+    assert settings.broker_recovery_probe_seconds == 75
+    assert settings.account_snapshot_ttl_seconds == 90
+
+
+def test_worker_operational_settings_keep_existing_timeouts_and_recovery_defaults() -> None:
+    settings = AutomatonSettings()
+
+    assert settings.core_http_timeout_seconds == 10
+    assert settings.analytics_http_timeout_seconds == 1
+    assert settings.broker_recovery_probe_seconds == 60
+    assert settings.account_snapshot_ttl_seconds == 60
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AUTOMATON_ITERATION_SECONDS",
+        "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS",
+        "AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS",
+        "AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS",
+        "AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS",
+        "AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "-Infinity"])
+def test_worker_numeric_settings_reject_nonpositive_or_nonfinite(name, value) -> None:
+    with pytest.raises(ValidationError):
+        AutomatonSettings(**{name: value})
+
+
 def test_settings_reject_postgresql_for_worker_storage() -> None:
     with pytest.raises(ValidationError, match="supports only SQLite"):
         AutomatonSettings(AUTOMATON_DATABASE_URL="postgresql+psycopg://database/worker")

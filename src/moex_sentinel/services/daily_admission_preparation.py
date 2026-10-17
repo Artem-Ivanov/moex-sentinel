@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time, timedelta
+from math import isfinite
 from zoneinfo import ZoneInfo
 
 from moex_sentinel.domain.daily_admission_preparation import (
@@ -27,8 +28,10 @@ class DailyAdmissionPreparationService:
         broker_id: str | None,
         enabled: bool,
         environment: str,
-        canary_uid: str,
         access_mode: str = "TRADE",
+        check_interval_seconds: float = _DAY_CHECK_SECONDS,
+        attempt_timeout_seconds: float = _ATTEMPT_TIMEOUT_SECONDS,
+        retry_delays_seconds: tuple[float, ...] = _RETRY_DELAYS_SECONDS,
         clock: Callable[[], datetime] = utc_now_ms,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -37,9 +40,20 @@ class DailyAdmissionPreparationService:
         self._enabled = enabled
         self._environment = environment
         self._access_mode = access_mode
-        self._canary_uid = canary_uid
         self._clock = clock
         self._sleep = sleep
+        if (
+            not isfinite(check_interval_seconds)
+            or check_interval_seconds <= 0
+            or not isfinite(attempt_timeout_seconds)
+            or attempt_timeout_seconds <= 0
+            or not retry_delays_seconds
+            or any(not isfinite(delay) or delay <= 0 for delay in retry_delays_seconds)
+        ):
+            raise ValueError("Daily preparation timings must be finite and positive.")
+        self._check_interval_seconds = check_interval_seconds
+        self._attempt_timeout_seconds = attempt_timeout_seconds
+        self._retry_delays_seconds = retry_delays_seconds
         self._observation: DailyAdmissionPreparationView | None = None
 
     async def prepare_once(self) -> DailyAdmissionPreparationView:
@@ -52,7 +66,7 @@ class DailyAdmissionPreparationService:
             result = self._blocked(DailyAdmissionPreparationReason.SCOPE_UNAVAILABLE)
         else:
             try:
-                result = await self._admission.prepare_daily(self._broker_id, canary_uid=self._canary_uid)
+                result = await self._admission.prepare_daily(self._broker_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -103,10 +117,10 @@ class DailyAdmissionPreparationService:
                 ).astimezone(now.tzinfo)
                 wait_until_retry = (retry_at - now).total_seconds()
                 wait_until_day_check = (next_midnight - now).total_seconds()
-                await self._sleep(min(_DAY_CHECK_SECONDS, wait_until_retry, wait_until_day_check))
+                await self._sleep(min(self._check_interval_seconds, wait_until_retry, wait_until_day_check))
                 continue
             try:
-                async with asyncio.timeout(_ATTEMPT_TIMEOUT_SECONDS):
+                async with asyncio.timeout(self._attempt_timeout_seconds):
                     observation = await self.prepare_once()
             except TimeoutError:
                 observation = self._blocked(DailyAdmissionPreparationReason.CORE_UNAVAILABLE)
@@ -116,10 +130,10 @@ class DailyAdmissionPreparationService:
                 DailyAdmissionPreparationStatus.WAITING,
             }:
                 failures += 1
-                retry_delay = _RETRY_DELAYS_SECONDS[min(failures - 1, len(_RETRY_DELAYS_SECONDS) - 1)]
+                retry_delay = self._retry_delays_seconds[min(failures - 1, len(self._retry_delays_seconds) - 1)]
             else:
                 failures = 0
-                retry_delay = _DAY_CHECK_SECONDS
+                retry_delay = self._check_interval_seconds
             retry_at = self._clock() + timedelta(seconds=retry_delay)
 
     def _empty(

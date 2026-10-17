@@ -111,7 +111,7 @@ def test_run_propagates_cancellation_to_its_lifecycle_owner():
     asyncio.run(scenario())
 
 
-def test_stop_required_sends_one_safe_alert_and_recovery_says_recovered_not_resumed():
+def test_legacy_stop_status_is_diagnostic_warning_and_recovers_without_manual_permission():
     current = [observation(account_status="STOP_REQUIRED", recovery_only=True)]
     transport = Transport()
     service = TradingReadinessAlertService(
@@ -131,14 +131,29 @@ def test_stop_required_sends_one_safe_alert_and_recovery_says_recovered_not_resu
     stopped, repeated, recovered, recovered_incident, restarted = asyncio.run(scenario())
 
     assert [event.state for event in stopped] == ["ACTIVE"]
+    assert stopped[0].signal == "LEGACY_STOP_STATUS"
+    assert stopped[0].severity == "WARNING"
     assert repeated == ()
     assert [event.state for event in recovered] == ["RECOVERED"]
     assert [event.state for event in restarted] == ["ACTIVE"]
     assert restarted[0].incident_id != recovered_incident
     assert len(transport.messages) == 3
-    assert "STOP_REQUIRED" in transport.messages[0]
+    assert "LEGACY_STOP_REQUIRED" in transport.messages[0]
     assert "RECOVERED" in transport.messages[1]
     assert "RESUMED" not in " ".join(transport.messages)
+
+
+def test_legacy_recovery_flag_does_not_report_manual_stop_when_account_is_disarmed():
+    current = [observation(account_status="DISARMED", recovery_only=True)]
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(current[0]), transport, environment="PROD", enabled=True, clock=lambda: NOW
+    )
+
+    events = asyncio.run(service.observe_once())
+
+    assert events == ()
+    assert transport.messages == []
 
 
 def test_startup_unknown_waits_for_sixty_second_grace():
@@ -414,6 +429,45 @@ def test_failed_delivery_retries_after_bounded_schedule_without_marking_alert_se
     asyncio.run(scenario())
 
     assert attempts == [0, 30, 90, 390]
+
+
+def test_configured_alert_queue_limit_and_retry_delay_reach_delivery_queue():
+    ticks = [0.0]
+
+    class FailingTransport:
+        async def send_message(self, _text):
+            raise RuntimeError("offline")
+
+    service = TradingReadinessAlertService(
+        lambda: _resolved(observation()),
+        FailingTransport(),
+        environment="PROD",
+        enabled=True,
+        retry_delays_seconds=(2, 5),
+        queue_limit=2,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+    for index in range(3):
+        service._enqueue(
+            AlertTransition(
+                signal=f"SIGNAL_{index}",
+                severity="WARNING",
+                state="ACTIVE",
+                safe_reason="UNKNOWN",
+                occurred_at=NOW,
+                incident_id=uuid4(),
+            )
+        )
+
+    async def deliver():
+        await service._deliver_due(0)
+
+    asyncio.run(deliver())
+
+    assert len(service._queue) == 2
+    assert service._queue[0].event.signal == "SIGNAL_1"
+    assert service._queue[0].retry_at == 2
 
 
 def test_alert_queue_never_exceeds_sixteen_entries():

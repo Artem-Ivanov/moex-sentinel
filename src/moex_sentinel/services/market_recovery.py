@@ -11,18 +11,26 @@ class MarketRecoveryPolicy:
         self,
         *,
         retry_seconds: float = 1.0,
+        probe_interval_seconds: float = 60.0,
         retry_limit: int = 5,
         operation_timeout_seconds: float = 10.0,
         close_timeout_seconds: float = 5.0,
         quiet_seconds: float = 30.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        values = (retry_seconds, operation_timeout_seconds, close_timeout_seconds, quiet_seconds)
+        values = (
+            retry_seconds,
+            probe_interval_seconds,
+            operation_timeout_seconds,
+            close_timeout_seconds,
+            quiet_seconds,
+        )
         if any(not isfinite(value) or value <= 0 for value in values):
             raise ValueError("Recovery intervals must be finite and positive.")
         if type(retry_limit) is not int or retry_limit < 0:
             raise ValueError("Retry limit must be a nonnegative integer.")
         self.retry_seconds = retry_seconds
+        self.probe_interval_seconds = probe_interval_seconds
         self.retry_limit = retry_limit
         self.operation_timeout_seconds = operation_timeout_seconds
         self.close_timeout_seconds = close_timeout_seconds
@@ -32,7 +40,7 @@ class MarketRecoveryPolicy:
     def delay(self, failures: int) -> float:
         # Transient outages outlive the short retry budget; keep probing slowly.
         if failures > self.retry_limit:
-            return 60.0
+            return self.probe_interval_seconds
         return self.retry_seconds * (2 * failures - 1)
 
 

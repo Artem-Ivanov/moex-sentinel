@@ -8,13 +8,62 @@ from uuid import UUID
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from market_analytics.app import create_app
+from market_analytics.config import AnalyticsSettings
 from market_analytics.market_source import HttpMarketSource
 from sentinel_contracts.analytics import MarketSourceSnapshot
 from tests.market_analytics.market_source_helpers import NOW, Source, instrument
 
 SOURCE = UUID("00000000-0000-0000-0000-000000000001")
+
+
+def test_analytics_settings_configure_core_url_and_timeout(monkeypatch):
+    monkeypatch.setenv("ANALYTICS_CORE_URL", "https://core.internal:8443")
+    monkeypatch.setenv("ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS", "3.5")
+
+    settings = AnalyticsSettings()
+
+    assert str(settings.core_url).rstrip("/") == "https://core.internal:8443"
+    assert settings.core_http_timeout_seconds == 3.5
+
+
+def test_analytics_settings_keep_core_defaults(monkeypatch):
+    monkeypatch.delenv("ANALYTICS_CORE_URL", raising=False)
+    monkeypatch.delenv("ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS", raising=False)
+
+    settings = AnalyticsSettings()
+
+    assert str(settings.core_url) == "http://backend:8000/"
+    assert settings.core_http_timeout_seconds == 2
+
+
+def test_analytics_settings_reject_credentials_without_echoing_url():
+    secret_url = "https://private-token:private-password@core.internal"
+
+    with pytest.raises(ValidationError) as error:
+        AnalyticsSettings(ANALYTICS_CORE_URL=secret_url)
+
+    assert "private-token" not in str(error.value)
+    assert "private-password" not in str(error.value)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "-Infinity"])
+def test_analytics_settings_reject_nonpositive_or_nonfinite_timeout(value):
+    with pytest.raises(ValidationError):
+        AnalyticsSettings(ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS=value)
+
+
+def test_analytics_settings_reach_upstream_http_client(monkeypatch):
+    monkeypatch.setenv("ANALYTICS_CORE_URL", "https://core.internal:8443")
+    monkeypatch.setenv("ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS", "3.5")
+
+    with TestClient(create_app()) as client:
+        upstream = client.app.state.analytics._source._client
+        assert str(upstream.base_url) == "https://core.internal:8443/"
+        assert upstream.timeout.read == 3.5
+        assert upstream._trust_env is False
 
 
 def request(ids=("instrument",), *, fallback="0.5"):

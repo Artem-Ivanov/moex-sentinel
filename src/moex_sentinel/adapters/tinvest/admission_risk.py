@@ -47,6 +47,7 @@ ClientFactory = Callable[..., Any]
 MAX_OPERATION_PAGES = 100
 OPERATIONS_PAGE_SIZE = 1000
 SNAPSHOT_VALIDITY = timedelta(seconds=1)
+INSTRUMENT_READ_CONCURRENCY = 8
 MAX_QUOTATION_UNITS = (1 << 63) - 1
 MIN_QUOTATION_UNITS = -(1 << 63)
 MAX_QUOTATION_NANO = 999_999_999
@@ -137,6 +138,7 @@ class TInvestAdmissionRiskAdapter:
         instrument_uid: str | None,
         operations_from: datetime,
         request_ids: tuple[str, ...] = (),
+        instrument_uids: tuple[str, ...] = (),
     ) -> AdmissionRiskSnapshot:
         target = self._validate_connection(connection)
         capture_started_at = floor_utc_millisecond(self._clock())
@@ -151,11 +153,6 @@ class TInvestAdmissionRiskAdapter:
                         account_id=connection.account_id,
                         status=StopOrderStatusOption.STOP_ORDER_STATUS_ACTIVE,
                     ),
-                    (
-                        self._instrument(services, instrument_uid, unknown)
-                        if instrument_uid is not None
-                        else asyncio.sleep(0, result=None)
-                    ),
                     *(
                         self._request_state(services, request_id, connection.account_id, unknown)
                         for request_id in dict.fromkeys(request_ids)
@@ -166,8 +163,21 @@ class TInvestAdmissionRiskAdapter:
                     if isinstance(result, BaseException):
                         _raise_read_failure(result)
                 reads = read_results
-                portfolio, positions_response, orders_response, stops_response, instrument = reads[:5]
-                states = tuple(reads[5:])
+                portfolio, positions_response, orders_response, stops_response = reads[:4]
+                states = tuple(reads[4:])
+                instrument_uids = self._position_instrument_uids(
+                    getattr(positions_response, "securities", None),
+                    instrument_uid,
+                    instrument_uids,
+                )
+                semaphore = asyncio.Semaphore(INSTRUMENT_READ_CONCURRENCY)
+
+                async def read_instrument(uid: str) -> tuple[str, AdmissionInstrument | None]:
+                    async with semaphore:
+                        return uid, await self._instrument(services, uid, unknown)
+
+                instruments = dict(await asyncio.gather(*(read_instrument(uid) for uid in instrument_uids)))
+                instrument = None if instrument_uid is None else instruments.get(instrument_uid)
                 captured_at = floor_utc_millisecond(self._clock())
                 operations, operations_complete = await self._operations(
                     services,
@@ -232,10 +242,19 @@ class TInvestAdmissionRiskAdapter:
         positions = self._positions(
             getattr(portfolio, "positions", None),
             getattr(positions_response, "securities", None),
-            instrument_uid,
-            instrument,
+            instruments,
             unknown,
         )
+        if any(
+            position.quantity_units > 0
+            and (
+                position.mark_captured_at is None
+                or position.mark_captured_at > captured_at
+                or captured_at - position.mark_captured_at > SNAPSHOT_VALIDITY
+            )
+            for position in positions
+        ):
+            unknown.add("POSITION_MARK_STALE")
         ordinary_orders = self._orders(getattr(orders_response, "orders", None), unknown)
         stop_orders = self._stop_orders(getattr(stops_response, "stop_orders", None), unknown)
 
@@ -261,7 +280,32 @@ class TInvestAdmissionRiskAdapter:
             operations_through=captured_at,
             instrument=instrument,
             unknown_reasons=tuple(sorted(unknown)),
+            instruments=tuple(item for item in instruments.values() if item is not None),
         )
+
+    @staticmethod
+    def _position_instrument_uids(
+        securities: Any, selected_uid: str | None, extra_uids: tuple[str, ...] = ()
+    ) -> tuple[str, ...]:
+        """Return positive security holdings plus the request UID, without currency positions."""
+        uids = {selected_uid} if selected_uid else set()
+        uids.update(uid for uid in extra_uids if isinstance(uid, str) and uid)
+        if securities is not None:
+            for item in securities:
+                uid = getattr(item, "instrument_uid", None)
+                balance = getattr(item, "balance", None)
+                blocked = getattr(item, "blocked", None)
+                if (
+                    isinstance(uid, str)
+                    and uid
+                    and isinstance(balance, int)
+                    and not isinstance(balance, bool)
+                    and isinstance(blocked, int)
+                    and not isinstance(blocked, bool)
+                    and balance + blocked > 0
+                ):
+                    uids.add(uid)
+        return tuple(sorted(uids))
 
     async def estimate_limit_order(
         self,
@@ -621,8 +665,7 @@ class TInvestAdmissionRiskAdapter:
     def _positions(
         values: Any,
         securities: Any,
-        selected_uid: str | None,
-        instrument: AdmissionInstrument | None,
+        instruments: dict[str, AdmissionInstrument | None],
         unknown: set[str],
     ) -> tuple[AdmissionPosition, ...]:
         if values is None or securities is None:
@@ -677,16 +720,19 @@ class TInvestAdmissionRiskAdapter:
             balance, blocked = units
             if quantity != Decimal(balance + blocked):
                 unknown.add("POSITION_BALANCE_MISMATCH")
-            price = instrument.mark_price if uid == selected_uid and instrument is not None else None
+            instrument = instruments.get(uid)
+            price = None if instrument is None else instrument.mark_price
             currency = None
             current_price = getattr(position, "current_price", None)
             if current_price is not None:
-                current_amount, currency = _money(current_price)
+                current_amount, current_currency = _money(current_price)
                 if current_amount is None or current_amount <= 0:
                     unknown.add("POSITION_MARK_UNKNOWN")
             else:
+                current_currency = None
+            if quantity > 0 and (instrument is None or price is None or instrument.mark_captured_at is None):
                 unknown.add("POSITION_MARK_UNKNOWN")
-            currency = currency or (instrument.currency if uid == selected_uid and instrument is not None else None)
+            currency = (None if instrument is None else instrument.currency) or current_currency
             if currency is None:
                 unknown.add("POSITION_CURRENCY_UNKNOWN")
             if quantity < 0:
@@ -698,6 +744,8 @@ class TInvestAdmissionRiskAdapter:
                     blocked_units=Decimal(blocked),
                     mark_price=price,
                     currency=currency,
+                    lot_size=None if instrument is None else instrument.lot_size,
+                    mark_captured_at=None if instrument is None else instrument.mark_captured_at,
                 )
             )
         if set(security_units) - seen_position_uids:

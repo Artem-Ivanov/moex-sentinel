@@ -45,6 +45,9 @@ Core должен иметь текущую ревизию `0003_user_broker_arc
 
 ## Runtime-схема
 
+Эксплуатационные ENV, defaults и безопасные TEST/PROD примеры описаны в
+[каталоге конфигурации](docs/configuration/environment.md).
+
 ```text
 broker catalog sync
   -> read open positions + active orders

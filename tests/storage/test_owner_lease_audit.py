@@ -211,7 +211,7 @@ def test_suppressed_success_does_not_suppress_expiry_or_allow_wrong_generation(l
         renew(repository, 600)
     with factory() as session:
         admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
-        assert admission.admission_status == "STOP_REQUIRED"
+        assert admission.admission_status == "DISARMED"
         assert admission.revision == 2
         assert session.get(WorkerRuntimeInstanceModel, str(RUNTIME_ID)).last_seen_at == NOW
         expired = list(

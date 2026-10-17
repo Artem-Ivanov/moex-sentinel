@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from datetime import datetime
+from math import isfinite
 from urllib.parse import urlsplit
 
 import httpx
@@ -16,10 +17,20 @@ _VERSION = TypeAdapter(SafeVersion)
 
 
 class AnalyticsVersionClient:
-    def __init__(self, url: str, http: httpx.AsyncClient, *, clock: Callable[[], datetime] = utc_now_ms) -> None:
+    def __init__(
+        self,
+        url: str,
+        http: httpx.AsyncClient,
+        *,
+        clock: Callable[[], datetime] = utc_now_ms,
+        timeout_seconds: float = 1.0,
+    ) -> None:
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("Analytics version timeout must be finite and positive.")
         self._url = url.rstrip("/")
         self._http = http
         self._clock = clock
+        self._timeout_seconds = timeout_seconds
 
     async def observe(self) -> VersionObservation:
         if not self._url:
@@ -28,9 +39,9 @@ class AnalyticsVersionClient:
             target = urlsplit(self._url)
             if target.scheme not in {"http", "https"} or not target.hostname or target.username or target.password:
                 return VersionObservation(reason="INVALID_RESPONSE")
-            async with asyncio.timeout(1.0):
+            async with asyncio.timeout(self._timeout_seconds):
                 async with self._http.stream(
-                    "GET", self._url + "/health", follow_redirects=False, timeout=1.0
+                    "GET", self._url + "/health", follow_redirects=False, timeout=self._timeout_seconds
                 ) as response:
                     if response.status_code != 200:
                         return VersionObservation(reason="INVALID_RESPONSE")

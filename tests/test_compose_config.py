@@ -53,38 +53,51 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert frontend["depends_on"]["backend"]["condition"] == "service_healthy"
     assert automaton["depends_on"]["backend"]["condition"] == "service_healthy"
     assert automaton["volumes"] == ["automaton-data:/app/data"]
-    assert automaton["environment"] == {
+    assert {
+        key: automaton["environment"][key]
+        for key in (
+            "APPLICATION_ENVIRONMENT",
+            "BROKER_ACCESS_MODE",
+            "INTERNAL_WORKER_ID",
+            "INTERNAL_WORKER_BROKER_ID",
+            "INTERNAL_WORKER_TOKEN",
+            "AUTOMATON_WORKER_ID",
+            "AUTOMATON_DATABASE_URL",
+            "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS",
+            "CORE_URL",
+            "ANALYTICS_URL",
+            "FACT_OUTBOX_BATCH_SIZE",
+            "FACT_OUTBOX_DEADLINE_MS",
+            "LOG_LEVEL",
+            "LOG_FORMAT",
+            "SANDBOX_RETRY_LIMIT",
+            "STRATEGY_ENABLED",
+        )
+    } == {
         "APPLICATION_ENVIRONMENT": "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}",
         "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
         "INTERNAL_WORKER_ID": "${INTERNAL_WORKER_ID:-}",
         "INTERNAL_WORKER_BROKER_ID": "${INTERNAL_WORKER_BROKER_ID:-}",
         "INTERNAL_WORKER_TOKEN": "${INTERNAL_WORKER_TOKEN:-}",
-        "AUTOMATON_WORKER_ID": "${INTERNAL_WORKER_ID:-trading-automaton-1}",
-        "AUTOMATON_DATABASE_URL": "sqlite:////app/data/trading_automaton.db",
-        "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS": "3",
-        "CORE_URL": "http://backend:8000",
-        "ANALYTICS_URL": "http://analytics:8001",
-        "FACT_OUTBOX_BATCH_SIZE": "100",
-        "FACT_OUTBOX_DEADLINE_MS": "1000",
-        "LOG_LEVEL": "INFO",
-        "LOG_FORMAT": "json",
+        "AUTOMATON_WORKER_ID": "${AUTOMATON_WORKER_ID:-${INTERNAL_WORKER_ID:-trading-automaton-1}}",
+        "AUTOMATON_DATABASE_URL": "${AUTOMATON_DATABASE_URL:-sqlite:////app/data/trading_automaton.db}",
+        "AUTOMATON_HEARTBEAT_INTERVAL_SECONDS": "${AUTOMATON_HEARTBEAT_INTERVAL_SECONDS:-3}",
+        "CORE_URL": "${CORE_URL:-http://backend:8000}",
+        "ANALYTICS_URL": "${ANALYTICS_URL:-http://analytics:8001}",
+        "FACT_OUTBOX_BATCH_SIZE": "${FACT_OUTBOX_BATCH_SIZE:-100}",
+        "FACT_OUTBOX_DEADLINE_MS": "${FACT_OUTBOX_DEADLINE_MS:-1000}",
+        "LOG_LEVEL": "${LOG_LEVEL:-INFO}",
+        "LOG_FORMAT": "${LOG_FORMAT:-json}",
         "SANDBOX_RETRY_LIMIT": "${SANDBOX_RETRY_LIMIT:-5}",
-        "STRATEGY_BUY_ORDER_LOTS": "${STRATEGY_BUY_ORDER_LOTS:-1}",
-        "STRATEGY_STOP_LOSS_PERCENT": "${STRATEGY_STOP_LOSS_PERCENT:-5}",
-        "STRATEGY_TAKE_PROFIT_PERCENT": "${STRATEGY_TAKE_PROFIT_PERCENT:-6}",
-        "STRATEGY_AVERAGING_STEP_PERCENT": "${STRATEGY_AVERAGING_STEP_PERCENT:-0.5}",
-        "STRATEGY_PARTIAL_TAKE_PROFIT_PERCENT": "${STRATEGY_PARTIAL_TAKE_PROFIT_PERCENT:-0.5}",
-        "STRATEGY_PARTIAL_SELL_PERCENT": "${STRATEGY_PARTIAL_SELL_PERCENT:-25}",
-        "STRATEGY_MAX_PARTIAL_SELL_STEPS": "${STRATEGY_MAX_PARTIAL_SELL_STEPS:-3}",
-        "STRATEGY_ORDER_TTL_SECONDS": "${STRATEGY_ORDER_TTL_SECONDS:-10}",
-        "STRATEGY_ORDER_RETRY_LIMIT": "${STRATEGY_ORDER_RETRY_LIMIT:-3}",
-        "STRATEGY_CORE_RETRY_LIMIT": "${STRATEGY_CORE_RETRY_LIMIT:-5}",
         "STRATEGY_ENABLED": "${STRATEGY_ENABLED:-false}",
     }
     assert "volumes" not in backend
     assert backend["environment"]["SANDBOX_RETRY_LIMIT"] == "${SANDBOX_RETRY_LIMIT:-5}"
     analytics = compose["services"]["analytics"]
-    assert analytics["environment"] == {"ANALYTICS_CORE_URL": "http://backend:8000"}
+    assert analytics["environment"] == {
+        "ANALYTICS_CORE_URL": "${ANALYTICS_CORE_URL:-http://backend:8000}",
+        "ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS": "${ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS:-2}",
+    }
     assert "volumes" not in analytics
     assert "ports" not in analytics
     assert automaton["depends_on"]["analytics"]["condition"] == "service_healthy"
@@ -104,7 +117,6 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert {key: backend["environment"][key] for key in admission_environment} == admission_environment
     preparation_environment = {
         "DAILY_ADMISSION_PREPARATION_ENABLED": "${DAILY_ADMISSION_PREPARATION_ENABLED:-false}",
-        "DAILY_ADMISSION_CANARY_UID": "${DAILY_ADMISSION_CANARY_UID:-}",
     }
     alert_environment = {
         "TELEGRAM_ALERTS_ENABLED": "${TELEGRAM_ALERTS_ENABLED:-false}",
@@ -115,15 +127,25 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
     assert {key: backend["environment"][key] for key in core_only_environment} == core_only_environment
     assert snapshot_worker["build"]["dockerfile"] == "docker/portfolio-snapshot-worker.Dockerfile"
     assert snapshot_worker["depends_on"] == {"database": {"condition": "service_healthy"}}
-    assert snapshot_worker["environment"] == {
+    assert {
+        key: snapshot_worker["environment"][key]
+        for key in (
+            "APPLICATION_ENVIRONMENT",
+            "BROKER_ACCESS_MODE",
+            "DATABASE_URL",
+            "LOG_FORMAT",
+            "LOG_LEVEL",
+            "PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS",
+        )
+    } == {
         "APPLICATION_ENVIRONMENT": "${APPLICATION_ENVIRONMENT:?APPLICATION_ENVIRONMENT must be configured}",
         "BROKER_ACCESS_MODE": "${BROKER_ACCESS_MODE:?BROKER_ACCESS_MODE must be configured}",
         "DATABASE_URL": (
             "postgresql+psycopg://${POSTGRES_USER}:"
             "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}@${DATABASE_HOST:-database}:5432/${POSTGRES_DB}"
         ),
-        "LOG_FORMAT": "json",
-        "LOG_LEVEL": "INFO",
+        "LOG_FORMAT": "${LOG_FORMAT:-json}",
+        "LOG_LEVEL": "${LOG_LEVEL:-INFO}",
         "PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS": "${PORTFOLIO_SNAPSHOT_INTERVAL_SECONDS:-60}",
     }
     for name in set(compose["services"]) - {"backend", "trading-automaton"}:
@@ -132,7 +154,7 @@ def test_compose_has_expected_services_and_single_backend_process() -> None:
         assert not set(core_only_environment) & set(compose["services"][name].get("environment", {}))
     assert {key: automaton["environment"][key] for key in (*admission_environment, "AUTOMATON_WORKER_ID")} == {
         **admission_environment,
-        "AUTOMATON_WORKER_ID": "${INTERNAL_WORKER_ID:-trading-automaton-1}",
+        "AUTOMATON_WORKER_ID": "${AUTOMATON_WORKER_ID:-${INTERNAL_WORKER_ID:-trading-automaton-1}}",
     }
     assert "ports" not in snapshot_worker
     assert "volumes" not in snapshot_worker
@@ -255,12 +277,19 @@ def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
             INTERNAL_WORKER_ID="compose-test-worker",
             INTERNAL_WORKER_BROKER_ID="11111111-2222-4333-8444-555555555555",
             INTERNAL_WORKER_TOKEN="a" * 64,
+            CORE_ANALYTICS_URL="http://core-analytics-marker.test:8101",
+            ANALYTICS_URL="http://worker-analytics-marker.test:8102",
+            DAILY_ADMISSION_ATTEMPT_TIMEOUT_SECONDS="17",
+            AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS="23",
+            ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS="11",
+            DOCKER_LOG_MAX_SIZE="7m",
+            DOCKER_LOG_MAX_FILES="4",
             DAILY_ADMISSION_PREPARATION_ENABLED="true",
-            DAILY_ADMISSION_CANARY_UID="uid-compose-test-marker",
             TELEGRAM_ALERTS_ENABLED="true",
             TELEGRAM_BOT_TOKEN="compose-test-token-marker",  # noqa: S106 - never used for delivery.
             TELEGRAM_CHAT_ID="compose-test-chat-marker",
         )
+        environment["AUTOMATON_WORKER_ID"] = "compose-worker-marker" if contour == "TEST" else "compose-test-worker"
         environment["REMOTE_ENV_FILE"] = "/dev/null"
         result = subprocess.run(
             [
@@ -296,7 +325,6 @@ def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
     assert prod["services"]["backend"]["environment"]["INTERNAL_WORKER_ID"] == "compose-test-worker"
     for name, value in {
         "DAILY_ADMISSION_PREPARATION_ENABLED": "true",
-        "DAILY_ADMISSION_CANARY_UID": "uid-compose-test-marker",
         "TELEGRAM_ALERTS_ENABLED": "true",
         "TELEGRAM_BOT_TOKEN": "compose-test-token-marker",
         "TELEGRAM_CHAT_ID": "compose-test-chat-marker",
@@ -313,7 +341,22 @@ def test_remote_shared_database_compose_resolves_without_daemon(monkeypatch):
             for service_name, service in prod["services"].items()
             if service_name != "backend"
         )
-    assert prod["services"]["trading-automaton"]["environment"]["AUTOMATON_WORKER_ID"] == "compose-test-worker"
+    assert test["services"]["trading-automaton"]["environment"]["AUTOMATON_WORKER_ID"] == ("compose-worker-marker")
+    assert prod["services"]["trading-automaton"]["environment"]["AUTOMATON_WORKER_ID"] == ("compose-test-worker")
+    for config in (test, prod):
+        assert config["services"]["backend"]["environment"]["ANALYTICS_URL"] == (
+            "http://core-analytics-marker.test:8101"
+        )
+        assert config["services"]["trading-automaton"]["environment"]["ANALYTICS_URL"] == (
+            "http://worker-analytics-marker.test:8102"
+        )
+        assert config["services"]["backend"]["environment"]["DAILY_ADMISSION_ATTEMPT_TIMEOUT_SECONDS"] == "17"
+        assert config["services"]["trading-automaton"]["environment"]["AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS"] == "23"
+        assert config["services"]["analytics"]["environment"]["ANALYTICS_CORE_HTTP_TIMEOUT_SECONDS"] == "11"
+        assert config["services"]["backend"]["logging"]["options"] == {
+            "max-size": "7m",
+            "max-file": "4",
+        }
 
     module_spec = importlib.util.spec_from_file_location(
         "shared_preflight", PROJECT_ROOT / "deploy/remote/preflight.py"
@@ -371,7 +414,9 @@ def test_production_wrapper_defaults_to_separate_environment_file():
 
 def test_core_analytics_target_is_explicit_test_and_empty_in_prod_override():
     compose = load_compose()
-    assert compose["services"]["backend"]["environment"]["ANALYTICS_URL"] == "http://analytics:8001"
+    assert compose["services"]["backend"]["environment"]["ANALYTICS_URL"] == (
+        "${CORE_ANALYTICS_URL-http://analytics:8001}"
+    )
 
     class ProductionLoader(yaml.SafeLoader):
         pass
@@ -382,9 +427,52 @@ def test_core_analytics_target_is_explicit_test_and_empty_in_prod_override():
         (PROJECT_ROOT / "deploy/remote/compose.remote.yml").read_text(),
         Loader=ProductionLoader,  # noqa: S506 - SafeLoader subclass only handles Compose tags.
     )
-    assert remote["services"]["backend"]["environment"]["ANALYTICS_URL"] == "http://analytics:8001"
+    assert remote["services"]["backend"]["environment"]["ANALYTICS_URL"] == (
+        "${CORE_ANALYTICS_URL-http://analytics:8001}"
+    )
     production = yaml.load(
         (PROJECT_ROOT / "deploy/remote/compose.production.yml").read_text(),
         Loader=ProductionLoader,  # noqa: S506 - SafeLoader subclass only handles Compose tags.
     )
-    assert production["services"]["backend"]["environment"]["ANALYTICS_URL"] == ""
+    assert production["services"]["backend"]["environment"]["ANALYTICS_URL"] == "${CORE_ANALYTICS_URL:-}"
+
+
+def test_core_analytics_default_and_empty_values_render_without_services():
+    if shutil.which("docker") is None:
+        pytest.skip("Docker Compose CLI unavailable")
+
+    cases = (
+        ("TEST", "compose.sh", ".env.example", None, "http://analytics:8001"),
+        ("PROD", "compose.production.sh", ".env.production.example", "", ""),
+    )
+    for contour, wrapper, example, alias, expected_core_url in cases:
+        environment = os.environ.copy()
+        environment.update(
+            line.split("=", 1)
+            for line in (PROJECT_ROOT / "deploy/remote" / example).read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        )
+        if alias is None:
+            environment.pop("CORE_ANALYTICS_URL", None)
+        else:
+            environment["CORE_ANALYTICS_URL"] = alias
+        environment["REMOTE_ENV_FILE"] = "/dev/null"
+        environment["REMOTE_CONTOUR"] = contour
+        result = subprocess.run(
+            [
+                shutil.which("sh"),
+                str(PROJECT_ROOT / "deploy/remote" / wrapper),
+                "--profile",
+                "trading",
+                "config",
+                "--format",
+                "json",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        config = json.loads(result.stdout)
+        assert config["services"]["backend"]["environment"]["ANALYTICS_URL"] == expected_core_url
+        assert config["services"]["trading-automaton"]["environment"]["ANALYTICS_URL"] == "http://analytics:8001"

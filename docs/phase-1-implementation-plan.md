@@ -1,10 +1,31 @@
 # Актуальный план развития
 
-Актуализировано 2026-10-10 по текущему checkout и сохранённым материалам.
+Актуализировано 2026-10-16: добавлена локальная веха допуска торговли через IN_WORK.
 Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
 содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
 объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
 сохранена как история приёмок, а не инструкция к повторному выполнению.
+
+## Дополнение 16.10.2026: торговля по IN_WORK без ручного допуска — LOCAL DONE, NOT DEPLOYED
+
+По прямому решению пользователя отдельные ручные допуски убираются: для новой
+заявки достаточно включённого режима торговли, автомата `IN_WORK`, биржевых и
+автоматических риск-проверок, а также четырёх общих лимитов счёта. Canary только
+GOLD, ежедневный ручной ARM/срок до полуночи и ручная сверка/recovery ack не
+должны блокировать заявку. Core сохраняет достоверность брокерских данных,
+общий account risk, собственные размеры лота, средства, атомарные резервы,
+владельца/поколение, идемпотентность и fail-closed обработку UNKNOWN. HOLD,
+READ_ONLY и отключённая стратегия продолжают блокировать новую торговлю.
+
+Аудит до декомпозиции и решение: `develop/.planning/2026-10-16-position-driven-admission/task_plan.md`;
+спецификация: `docs/superpowers/specs/2026-10-16-position-driven-admission-design.md`;
+план: `docs/superpowers/plans/2026-10-16-position-driven-admission.md`.
+Реализация C1 contracts, C2 Core и C3 Worker/UI завершена; независимое
+кросс-ревью: C0/I0/M0. Целевой Core набор: 236 passed. Полный локальный Python
+suite прошёл: 2515 passed, 196 PostgreSQL-only skipped без отдельной тестовой БД.
+Рабочий checkout содержит локальный результат; deployment не запрашивался и не
+выполнялся. До отдельного выпуска runtime VPS продолжает старый ручной canary/ARM
+путь. Локальный код не подтверждает состояние VPS или live торговую приёмку.
 
 ## Дополнение 10.10.2026: процент квоты одной заявки — DEPLOYED PROD
 
@@ -521,6 +542,53 @@ Merge делает пользователь. PT7 OPEN: Telegram recipient/дос
 remaining read-only P4, stop/UNKNOWN и explicit ARM/Resume/P5. Визуальный browser
 и live trading не проверялись; обычный deploy не включает fullDBintegrity/restore.
 
+Уточнение14.10,19:54MSK: GOLD иSIBN уже IN_WORK, accountSTOP_REQUIRED/recovery-only,
+baseline10.10/reconARMlimitsnull; Workerздоров. Журнал подтверждает10.10неуспешную
+CANARYсверкуDATA_UNKNOWN и14.10controlledhandoff с повторнымrecovery. ТекущийARM
+разрешаетодинUID: immediateexistingAPI запуск возможен для выбранногоинструмента.
+ДляодновременнойторговлиGOLD/SIBN proposedрасширениеmultiUIDadmission/сверки/лимитов;
+дляunattendedсменыдня/Workerowner proposedpolicy+реализацияautoARM. Dailypreparation
+сам ARM не выдаёт. Writtenплан ифакты: `develop/reports/prod-trading-blockers-after-deploy-20261014/restore-trading-plan.md`,
+independentprod_release_architect C0/I0. Это уточнениеscope, новыефункции не реализованы,
+baseline/reconcile/ARM/конфиг в диагностике не менялись.
+
+15.10 завершена локальная доработка **ENV, документация и автоподготовка базы**:
+[план ENV1–ENV4](superpowers/plans/2026-10-15-runtime-environment-configuration.md),
+[каталог параметров](configuration/environment.md). Core/Worker/Analytics
+получают эксплуатационные параметры через Settings → потребители → Compose;
+обновлены три шаблона, исправлено игнорирование настроек пула БД HTTP Core.
+Проверки root: 2617 backend + 141 develop на отдельной локальной PostgreSQL,
+275 frontend PASS, typecheck/build и Ruff/Black PASS. Независимое итоговое
+ревью env_core_reviewer: C0/I0/M0; I1 Worker URL и M1 документации закрыты.
+Предыдущий код был закоммичен пользователем (HEAD `2f25bfd`); агенты Git не меняли.
+
+15.10 по новому явному поручению пользователя выполнен ENV5 deployment до merge:
+`vps-20261015-env-4a71589e8766`, Core/Worker/Analytics. Frontend, shared PG,
+Collector, volumes и четыре остановленных TEST-контейнера сохранены. Схема0007 /
+WorkerSQLite1 без миграций. Приватный PROD ENV изменён только daily=false→true,
+с сохранением режима TRADE, credentials и пустого canary. Старый Worker exit0,
+новый owner generation5/revision8 передан штатно в recovery-only. Техническая
+приёмка health/UI/source+image hashes/progress PASS; независимый
+`env_core_reviewer` C0/I0/M0. Отчёт: `develop/reports/runtime-env-deploy-20261015/report.md`.
+
+Автоматика создала базу за 15 октября в 19:06:54 МСК, BASELINE_REQUIRED устранён.
+На 19:08:49 МСК торговля остаётся закрыта: DISARMED, STOP_REQUIRED,
+RECONCILIATION_REQUIRED, нет reconciliation/ARM/limits. Обе позиции IN_WORK,
+повторный Resume не нужен; свежих операций в возвращённой broker-operations
+выборке нет. ARM/Resume/лимиты/принудительные заявки не выполнялись. PT7 остаётся
+OPEN: явная recovery/сверка, утверждённые UID/лимиты, отдельный ARM и торговая
+приёмка. Multi-UID и auto ARM пользователь явно отложил.
+
+15.10 последующим явным поручением пользователя выполнена штатная CANARY-сверка
+GOLD в 19:20:25 МСК: CANARY_READY/can_arm=true, active orders/stops/unresolved=0.
+Счёт перешёл STOP_REQUIRED/recovery-only/revision8 → **DISARMED,
+recovery_only=false, revision9**. Повторный GET в 19:21:50 МСК после окончания
+30-секундного срока сверки подтвердил false; owner generation5 и позиции/настройки
+сохранены. Worker OK, outbox CLEAR. Независимый env_core_reviewer C0/I0/M0.
+ARM/лимиты/торговые поручения не задавались. Задача снятия recovery-only DONE;
+торговая приёмка остаётся открытой. Proof:
+`develop/reports/prod-reconciliation-20261015/report.md`, `review-final.md`.
+
 ### M1 — оптимизация ОЗУ в O1/S1 (OPEN)
 
 Исследовать ограничение объёма каталога и истории в памяти, размеры PostgreSQL
@@ -916,3 +984,30 @@ shadow-миграции, импорт старой истории, отдель�
 БД на отдельном экземпляре, сохранять пользовательские изменения и volumes.
 При завершении обновлять этот индекс, соответствующую строку фазы 0 и приёмку;
 исторические отчёты не переписывать под новые результаты.
+
+16.10 ENV7 / PT7: по явному поручению пользователя установлены четыре caps по
+ранее утверждённой формуле на свежих данных PROD, штатные CANARY reconcile→ARM
+GOLD в12:05:36МСК. Значения5001.1RUB/order,5052.3RUB/exposure,1outstanding,
+252.6040RUB/daily loss (5%baseline5052.08); expiry17Oct00MSK.
+Fresh12:06:34MSK послеTTL: ARMED/arm12/effective=true/recovery=false/denial[],
+ownergen5 иcaps сохранены; daily baseline16Oct создана автоматически00:00МСК.
+WorkerOK/61018COMPLETED, outbox18freshpending/0failed/0retry. Новая исполненная
+сделка не подтверждена, полноценная торговая приёмка не объявляется завершённой.
+Pre-execution+final independentenv_core_reviewer C0/I0/M0;21+14mocktests и
+16artifactchecksPASS. Proof develop/reports/prod-limits-arm-20261016/report.md.
+AutoARM/multiUID/Telegram остаются отдельно; новый день/сменаowner потребуют
+штатного нового допуска. Ручные SDKзаявки/DBedits/restarts/Resume не выполнялись.
+
+16.10 ENV8 / PT7, текущая read-only проверка12:24–12:33МСК: accountARM12
+сохраняется/effective=true/recovery=false/no denies/caps/base/owner5same,
+Worker62603COMPLETED/OK; outboxfinal2freshpending/0failed/0retry. Однако успешная
+live-canary OPEN: GOLDформируетSELL_ALL/STOP_LOSS18lots; к12:32 зарегистрирован
+401localCANCELLED/zero executed/no recordedbrokerIDs плюс1SUBMITTING.
+Двасохранённыхproofs PERMIT_EXPIRED_BEFORE_POST доказываютexpiryдоSDK; уостальных
+399конкретныйCoredenialreasonнесохраняется. Не приписыватьимоднуTTLпричину
+бездоказательства. SIBNWAIT/UID_NOT_ALLOWED соответствуетsingleGOLDscope.
+Следующийнеобходимыйscope: safe SubmitDenied enum+stage latency observability,
+затем устранениеподтверждённойзадержкибезослабленияTTL иштатнаяliveприёмка.
+ПовторныйARM/reconcile/Resumeнеисправляетэтотцикл; вENV8writesнебыло.
+Independentenv_core_reviewer C0/I0/M0; sourceinterpretationenv_core_author.
+Proof develop/reports/prod-trading-check-20261016/report.md.

@@ -22,10 +22,9 @@ def test_daily_preparation_view_exposes_only_safe_operator_fields() -> None:
         reconciliation_id=UUID("00000000-0000-4000-8000-000000000003"),
         reconciliation_valid_until=datetime(2026, 10, 14, 8, 0, 30, tzinfo=UTC),
         suggested_limits=AdmissionLimits(
-            canary_uid="uid-safe-example",
             currency="RUB",
             max_order_notional=Decimal("10000.00"),
-            exposure_scope="CANARY_UID_GROSS",
+            exposure_scope="ACCOUNT_GROSS",
             max_exposure=Decimal("10000.00"),
             max_outstanding_orders=1,
             max_daily_loss=Decimal("500.00"),
@@ -45,10 +44,9 @@ def test_daily_preparation_view_exposes_only_safe_operator_fields() -> None:
         "reconciliation_id": "00000000-0000-4000-8000-000000000003",
         "reconciliation_valid_until": "2026-10-14T08:00:30.000Z",
         "suggested_limits": {
-            "canary_uid": "uid-safe-example",
             "currency": "RUB",
             "max_order_notional": "10000.00",
-            "exposure_scope": "CANARY_UID_GROSS",
+            "exposure_scope": "ACCOUNT_GROSS",
             "max_exposure": "10000.00",
             "max_outstanding_orders": 1,
             "max_daily_loss": "500.00",

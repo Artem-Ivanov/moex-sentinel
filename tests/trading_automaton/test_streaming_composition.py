@@ -14,6 +14,7 @@ from moex_sentinel.api.app import create_app
 from moex_sentinel.storage.database import create_database_engine
 from moex_sentinel.storage.models import Base as CoreBase
 from moex_sentinel.storage.models.trading_admission import TradingAccountAdmissionModel, WorkerRuntimeInstanceModel
+from sentinel_contracts.broker_errors import BrokerOperationError
 from sentinel_contracts.broker_execution import BrokerConnection, BrokerPosition
 from tests.trading_automaton.command_factory import command as make_command
 from tests.trading_automaton.command_factory import decision_item
@@ -225,6 +226,61 @@ def test_builds_streaming_coordinator_as_production_runtime(tmp_path) -> None:
     http.close()
 
     assert isinstance(runtime, StreamingRuntimeCoordinator)
+
+
+def test_worker_settings_reach_http_sdk_and_recovery_consumers(monkeypatch, tmp_path) -> None:
+    settings = AutomatonSettings(
+        CORE_URL="http://core.invalid",
+        AUTOMATON_DATABASE_URL=f"sqlite:///{tmp_path / 'worker-settings.db'}",
+        SANDBOX_RETRY_LIMIT="0",
+        AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS="13",
+        AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS="2.5",
+        AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS="77",
+        AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS="91",
+    )
+    runtime, _repository, http = build_streaming_runtime(settings, StrategySettings())
+    assert http.timeout.connect == 13
+
+    sessions = []
+
+    class CapturingSession(Session):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.snapshot_ttl_seconds = kwargs["snapshot_ttl_seconds"]
+            sessions.append(self)
+
+    monkeypatch.setattr(composition, "BrokerSdkSession", CapturingSession)
+
+    async def scenario():
+        bundle = await runtime._builder(
+            BrokerConnection(
+                "broker", "TINVEST_SANDBOX", "sandbox-invest-public-api.tbank.ru:443", "synthetic-token", True
+            )
+        )
+        broker_runtime = bundle.runtime
+        assert sessions[0].snapshot_ttl_seconds == 91
+        assert broker_runtime._analytics._http.timeout.read == 2.5
+
+        waits = []
+
+        async def unavailable():
+            raise BrokerOperationError("BROKER_UNAVAILABLE", "Synthetic outage", retryable=True)
+
+        async def complete_recovery_wait(awaitable, *, timeout):  # noqa: ASYNC109 - emulate asyncio.wait_for
+            awaitable.close()
+            waits.append(timeout)
+            broker_runtime._closed.set()
+
+        monkeypatch.setattr(broker_runtime, "run_once", unavailable)
+        monkeypatch.setattr(asyncio, "wait_for", complete_recovery_wait)
+        await broker_runtime.run()
+        assert waits == [77]
+        await bundle.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        http.close()
 
 
 def test_composition_uses_one_typed_synchronization_path(tmp_path) -> None:

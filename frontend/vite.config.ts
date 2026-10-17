@@ -7,6 +7,30 @@ import vue from "@vitejs/plugin-vue"
 const configDirectory = dirname(fileURLToPath(import.meta.url))
 const versionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const versionError = "Frontend build blocked: package.json and package-lock.json versions must match MAJOR.MINOR.PATCH."
+const defaultDevApiProxyTarget = "http://localhost:8000"
+
+export function resolveDevApiProxyTarget(value: string | undefined): string {
+  const target = value || defaultDevApiProxyTarget
+  let url: URL
+  try {
+    url = new URL(target)
+  } catch {
+    throw new Error("DEV_API_PROXY_TARGET must be an HTTP(S) origin without credentials, path, query, or fragment.")
+  }
+
+  if (
+    !["http:", "https:"].includes(url.protocol)
+    || !url.hostname
+    || url.username
+    || url.password
+    || url.pathname !== "/"
+    || url.search
+    || url.hash
+  ) {
+    throw new Error("DEV_API_PROXY_TARGET must be an HTTP(S) origin without credentials, path, query, or fragment.")
+  }
+  return url.origin
+}
 
 function checkFrontendVersionMetadata(): void {
   let packageVersion: unknown
@@ -30,11 +54,14 @@ function checkFrontendVersionMetadata(): void {
 
 export default defineConfig(({ command }) => {
   if (command === "build") checkFrontendVersionMetadata()
+  const apiProxyTarget = command === "serve"
+    ? resolveDevApiProxyTarget(process.env.DEV_API_PROXY_TARGET)
+    : defaultDevApiProxyTarget
   return {
     plugins: [vue()],
     server: {
       proxy: {
-        "/api": "http://localhost:8000",
+        "/api": apiProxyTarget,
       },
     },
   }

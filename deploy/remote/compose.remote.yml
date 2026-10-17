@@ -4,8 +4,8 @@ x-runtime: &runtime
   logging:
     driver: json-file
     options:
-      max-size: "10m"
-      max-file: "5"
+      max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+      max-file: "${DOCKER_LOG_MAX_FILES:-5}"
 
 services:
   database:
@@ -25,7 +25,7 @@ services:
     networks: [default, data]
     image: moex-sentinel-backend:${RELEASE_TAG:?Set a unique release tag}
     environment:
-      ANALYTICS_URL: http://analytics:8001
+      ANALYTICS_URL: "${CORE_ANALYTICS_URL-http://analytics:8001}"
       AUTH_INSECURE_LOOPBACK: "false"
 
   portfolio-snapshot-worker:
@@ -46,6 +46,8 @@ services:
     profiles: [trading]
     # The SQLite intent/outbox owner must remain a singleton.
     scale: 1
+    environment:
+      AUTOMATON_WORKER_ID: "${AUTOMATON_WORKER_ID:-${INTERNAL_WORKER_ID:-trading-automaton-1}}"
 
   frontend:
     <<: *runtime

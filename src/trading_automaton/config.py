@@ -1,7 +1,9 @@
 """Trading-worker runtime and strategy configuration."""
 
 from decimal import Decimal
+from math import isfinite
 from typing import Literal, Self
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -91,10 +93,39 @@ class AutomatonSettings(BaseSettings):
     iteration_seconds: float = Field(1.0, validation_alias="AUTOMATON_ITERATION_SECONDS")
     sandbox_retry_limit: int = Field(5, validation_alias="SANDBOX_RETRY_LIMIT", ge=0)
     heartbeat_interval_seconds: float = Field(3.0, validation_alias="AUTOMATON_HEARTBEAT_INTERVAL_SECONDS")
+    core_http_timeout_seconds: float = Field(10.0, validation_alias="AUTOMATON_CORE_HTTP_TIMEOUT_SECONDS", gt=0)
+    analytics_http_timeout_seconds: float = Field(
+        1.0, validation_alias="AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS", gt=0
+    )
+    broker_recovery_probe_seconds: float = Field(60.0, validation_alias="AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS", gt=0)
+    account_snapshot_ttl_seconds: float = Field(60.0, validation_alias="AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS", gt=0)
     fact_outbox_batch_size: int = Field(100, validation_alias="FACT_OUTBOX_BATCH_SIZE")
     fact_outbox_deadline_ms: int = Field(1000, validation_alias="FACT_OUTBOX_DEADLINE_MS")
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")
     log_format: str = Field("json", validation_alias="LOG_FORMAT")
+
+    @field_validator("core_url", "analytics_url")
+    @classmethod
+    def validate_service_url(cls, value: str) -> str:
+        error = "Service URL must be an absolute HTTP(S) URL with a hostname and no credentials."
+        if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError(error)
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise ValueError(error) from None
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.netloc.endswith(":")
+            or (port is not None and not 0 <= port <= 65535)
+        ):
+            raise ValueError(error)
+        return value
 
     @field_validator("internal_worker_id", "internal_worker_broker_id", "internal_worker_token", mode="before")
     @classmethod
@@ -115,10 +146,16 @@ class AutomatonSettings(BaseSettings):
                 raise ValueError("PROD requires Core worker credentials matching AUTOMATON_WORKER_ID")
         if not self.database_url.startswith("sqlite:///"):
             raise ValueError("Trading worker supports only SQLite.")
-        if self.iteration_seconds <= 0:
-            raise ValueError("Worker iteration interval must be positive.")
-        if self.heartbeat_interval_seconds <= 0:
-            raise ValueError("Worker heartbeat interval must be positive.")
+        for name in (
+            "iteration_seconds",
+            "heartbeat_interval_seconds",
+            "core_http_timeout_seconds",
+            "analytics_http_timeout_seconds",
+            "broker_recovery_probe_seconds",
+            "account_snapshot_ttl_seconds",
+        ):
+            if not isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
         if self.fact_outbox_batch_size <= 0:
             raise ValueError("Fact outbox batch size must be positive.")
         if self.fact_outbox_deadline_ms <= 0:

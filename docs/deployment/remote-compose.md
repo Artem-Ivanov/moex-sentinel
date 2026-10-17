@@ -342,7 +342,8 @@ database/credentials/volume сохранить; не заменять их пр�
 ### Файлы конфигурации
 
 - `deploy/remote/compose.remote.yml`: overlay, закрытые порты, теги образов, singleton Worker.
-- `deploy/remote/.env.example`: имена переменных и пример стратегии; не содержит реальных credentials.
+- `deploy/remote/.env.example` и `.env.production.example`: TEST/PROD профили; PROD пример включает baseline-only daily preparation при пустом canary UID.
+- [Каталог ENV](../configuration/environment.md): все сервисные параметры, alias, defaults, secret/restart правила и fixed invariants.
 - `deploy/remote/compose.sh`: единый wrapper с явными compose/env путями; запускать через `sh`.
 - `deploy/remote/compose.production.sh` и `compose.production.yml`: явный PROD wrapper и overlay общей БД.
 - `deploy/remote/preflight.py`: read-only проверка разрешённой конфигурации; не выводит её секреты.
@@ -350,6 +351,7 @@ database/credentials/volume сохранить; не заменять их пр�
 - `deploy/remote/reload-nginx.sh`: hook Certbot после успешного продления сертификата.
 
 Команды ниже выполнять из корня выбранного checkout. `REMOTE_ENV_FILE` может указать другой абсолютный путь к env. Не использовать текущий локальный `.env` для случайного запуска второго Worker.
+Заполняемый remote env держать вне Git с режимом `0600`; обычный вывод `compose config` содержит DB и service credentials.
 
 ## Подготовка релиза
 

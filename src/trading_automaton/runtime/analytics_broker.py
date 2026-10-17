@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from contextlib import suppress
+from math import isfinite
 from time import monotonic
 from typing import Protocol
 
@@ -30,6 +31,7 @@ class AnalyticsBrokerRuntime:
         *,
         tick_seconds: float = 1.0,
         retry_limit: int = 5,
+        recovery_probe_seconds: float = BROKER_RECOVERY_PROBE_SECONDS,
         account_id: str = "",
     ) -> None:
         self._account_id = account_id
@@ -38,7 +40,10 @@ class AnalyticsBrokerRuntime:
         self._tick_seconds = tick_seconds
         if retry_limit < 0:
             raise ValueError("retry_limit must be nonnegative")
+        if not isfinite(recovery_probe_seconds) or recovery_probe_seconds <= 0:
+            raise ValueError("recovery_probe_seconds must be finite and positive")
         self._retry_limit = retry_limit
+        self._recovery_probe_seconds = recovery_probe_seconds
         self._closed = asyncio.Event()
         self._run_lock = asyncio.Lock()
 
@@ -69,7 +74,7 @@ class AnalyticsBrokerRuntime:
                     await self._closed.wait()
                     return
                 if failures >= self._retry_limit:
-                    delay = BROKER_RECOVERY_PROBE_SECONDS
+                    delay = self._recovery_probe_seconds
                     if not cooling_down:
                         LOGGER.warning(
                             "Broker preparation retry budget exhausted; recovery probes continue",

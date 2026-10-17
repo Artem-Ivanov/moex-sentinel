@@ -103,6 +103,8 @@ class SubmitAbsenceBasis(StrEnum):
 
 
 class SubmitDenialReason(StrEnum):
+    LIMITS_NOT_CONFIGURED = "LIMITS_NOT_CONFIGURED"
+    AUTOMATION_NOT_ACTIVE = "AUTOMATION_NOT_ACTIVE"
     NOT_OWNER = "NOT_OWNER"
     DISARMED = "DISARMED"
     STOP_REQUIRED = "STOP_REQUIRED"
@@ -193,14 +195,44 @@ class RuntimeRegistrationResult(StrictFrozenModel):
         return self
 
 
+class PendingRuntimeCandidate(StrictFrozenModel):
+    """Publicly scoped metadata needed for a controlled owner transfer."""
+
+    broker_id: UUID
+    worker_id: str = Field(min_length=1, max_length=128)
+    runtime_instance_id: UUID
+    environment: Literal["TEST", "PROD"]
+    access_mode: Literal["READ_ONLY", "TRADE"]
+    strategy_enabled: StrictBool
+    registration_status: Literal["PENDING"]
+    registered_at: MillisecondUtc
+
+
 class AdmissionLimits(StrictFrozenModel):
-    canary_uid: str = Field(min_length=1, max_length=128)
     currency: Literal["RUB"]
     max_order_notional: PositiveFiniteDecimal
-    exposure_scope: Literal["CANARY_UID_GROSS"]
+    exposure_scope: Literal["ACCOUNT_GROSS"] = "ACCOUNT_GROSS"
     max_exposure: PositiveFiniteDecimal
     max_outstanding_orders: StrictPositiveInt
     max_daily_loss: PositiveFiniteDecimal
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_legacy_canary_limits(cls, value: object) -> object:
+        if not isinstance(value, dict) or value.get("exposure_scope") != "CANARY_UID_GROSS":
+            return value
+        uid = value.get("canary_uid")
+        if not isinstance(uid, str) or not 1 <= len(uid) <= 128:
+            raise ValueError("Legacy canary limits require a valid UID.")
+        canonical = value.copy()
+        del canonical["canary_uid"]
+        canonical["exposure_scope"] = "ACCOUNT_GROSS"
+        return canonical
+
+
+class UpdateLimitsRequest(StrictFrozenModel):
+    expected_revision: Revision
+    limits: AdmissionLimits
 
 
 class AdmissionBaseline(StrictFrozenModel):
@@ -263,6 +295,12 @@ class ReconciliationRequest(StrictFrozenModel):
     canary_uid: str | None = Field(default=None, min_length=1, max_length=128)
 
 
+class ReconciliationPositionAnchor(StrictFrozenModel):
+    instrument_uid: str = Field(min_length=1, max_length=128)
+    quantity_units: NonNegativeFiniteDecimal
+    lot_size: StrictPositiveInt
+
+
 class ReconciliationResult(StrictFrozenModel):
     reconciliation_id: UUID
     broker_id: UUID
@@ -282,6 +320,7 @@ class ReconciliationResult(StrictFrozenModel):
     unresolved_reservation_count: Annotated[int, Field(strict=True, ge=0)]
     reasons: tuple[SubmitDenialReason, ...]
     risk_snapshot_id: UUID | None
+    position_anchors: tuple[ReconciliationPositionAnchor, ...] = ()
 
     @model_validator(mode="after")
     def validate_scope(self):
@@ -291,6 +330,9 @@ class ReconciliationResult(StrictFrozenModel):
             raise ValueError("Canary reconciliation requires a UID.")
         if self.valid_until < self.captured_at:
             raise ValueError("Reconciliation cannot expire before capture.")
+        uids = [anchor.instrument_uid for anchor in self.position_anchors]
+        if len(set(uids)) != len(uids):
+            raise ValueError("Reconciliation position anchors require unique instrument UIDs.")
         return self
 
 
@@ -377,6 +419,7 @@ class SubmitPermit(StrictFrozenModel):
     expires_at: MillisecondUtc
     server_response_at: MillisecondUtc
     risk_snapshot_id: UUID
+    server_processing_ms: Annotated[int, Field(strict=True, ge=0)] = 0
 
     @model_validator(mode="after")
     def validate_response_deadline(self):

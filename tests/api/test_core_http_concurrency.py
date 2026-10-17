@@ -89,8 +89,8 @@ def test_lifespan_repeated_raw_cancellation_drains_actual_jobs_before_engine_dis
     entered, release, finished, disposed = (threading.Event() for _ in range(4))
     original_engine = app_module.create_database_engine
 
-    def engine_factory(url):
-        engine = original_engine(url)
+    def engine_factory(url, **kwargs):
+        engine = original_engine(url, **kwargs)
         original_dispose = engine.dispose
 
         def dispose():
@@ -156,8 +156,8 @@ def test_startup_failure_closes_created_pool_gateway_and_engine(tmp_path, monkey
     original_engine = app_module.create_database_engine
     pools, closed = [], []
 
-    def engine_factory(url):
-        engine = original_engine(url)
+    def engine_factory(url, **kwargs):
+        engine = original_engine(url, **kwargs)
         original_dispose = engine.dispose
 
         def dispose():

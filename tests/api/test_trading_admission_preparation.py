@@ -111,7 +111,13 @@ def test_lifespan_awaits_preparation_task_before_closing_executor(tmp_path, monk
     )
     monkeypatch.setattr(app_module, "Settings", lambda: settings)
     monkeypatch.setattr(app_module, "SyncExecutor", lambda **_kwargs: Executor())
-    monkeypatch.setattr(app_module, "create_database_engine", lambda _url: Engine())
+    pool_options = []
+
+    def create_engine(_url, **kwargs):
+        pool_options.append(kwargs)
+        return Engine()
+
+    monkeypatch.setattr(app_module, "create_database_engine", create_engine)
     monkeypatch.setattr(app_module, "create_session_factory", lambda _engine: object())
     monkeypatch.setattr(app_module, "build_market_snapshot_gateway", lambda *_args, **_kwargs: Gateway())
     monkeypatch.setattr(
@@ -128,6 +134,7 @@ def test_lifespan_awaits_preparation_task_before_closing_executor(tmp_path, monk
 
     assert events.index("task_done") < events.index("executor_closed")
     assert events.index("task_done") < events.index("engine_disposed")
+    assert pool_options == [{"pool_size": 5, "max_overflow": 10, "pool_timeout_seconds": 5.0}]
 
 
 def test_readiness_alert_observer_uses_account_effective_state_not_preparation_ttl():

@@ -37,6 +37,8 @@ from sentinel_contracts.trading_admission import (
     AdmissionView,
     ArmRequest,
     OwnerStoppedRequest,
+    PendingRuntimeCandidate,
+    ReconciliationPositionAnchor,
     ReconciliationResult,
     ReconciliationStatus,
     RevokeRequest,
@@ -51,6 +53,7 @@ from sentinel_contracts.trading_admission import (
     SubmitDenied,
     SubmitPermit,
     SubmitReservationState,
+    UpdateLimitsRequest,
     submit_request_fingerprint,
 )
 
@@ -106,6 +109,7 @@ class AdmissionSubmitContext:
     baseline: AdmissionBaseline | None
     reconciliation: ReconciliationResult | None
     automation_id: str
+    automation_state: str
     instrument_uid: str
     instrument_type: str
     currency: str
@@ -222,6 +226,37 @@ class TradingAdmissionRepository:
             session.flush()
             return self._registration_result(runtime, admission)
 
+    def pending_runtime_candidate(
+        self, broker_id: str, worker_id: str, registered_after: datetime
+    ) -> PendingRuntimeCandidate | None:
+        with self._factory() as session:
+            candidates = session.scalars(
+                select(WorkerRuntimeInstanceModel)
+                .where(
+                    WorkerRuntimeInstanceModel.user_broker_id == broker_id,
+                    WorkerRuntimeInstanceModel.worker_id == worker_id,
+                    WorkerRuntimeInstanceModel.registration_status == RuntimeRegistrationStatus.PENDING.value,
+                    WorkerRuntimeInstanceModel.registered_at > registered_after,
+                )
+                .order_by(WorkerRuntimeInstanceModel.registered_at, WorkerRuntimeInstanceModel.runtime_instance_id)
+                .limit(2)
+            ).all()
+        if len(candidates) > 1:
+            raise AdmissionConflictError("Multiple pending runtime candidates match the requested scope.")
+        if not candidates:
+            return None
+        runtime = candidates[0]
+        return PendingRuntimeCandidate(
+            broker_id=UUID(runtime.user_broker_id),
+            worker_id=runtime.worker_id,
+            runtime_instance_id=UUID(runtime.runtime_instance_id),
+            environment=runtime.environment,
+            access_mode=runtime.access_mode,
+            strategy_enabled=runtime.strategy_enabled,
+            registration_status="PENDING",
+            registered_at=runtime.registered_at,
+        )
+
     def get_runtime_credential(self, runtime_instance_id: str) -> WorkerRuntimeCredentialRecord | None:
         with self._factory() as session:
             runtime = session.get(WorkerRuntimeInstanceModel, runtime_instance_id)
@@ -284,10 +319,10 @@ class TradingAdmissionRepository:
                 raise AdmissionConflictError("Runtime is no longer the current account owner.")
             if admission.lease_expires_at is None or admission.lease_expires_at <= now:
                 admission.revision += 1
-                admission.admission_status = AdmissionStatus.STOP_REQUIRED.value
+                admission.admission_status = AdmissionStatus.DISARMED.value
                 admission.arm_revision = None
                 admission.arm_expires_at = None
-                admission.limits = None
+                self._hold_account_automations(session, runtime.user_broker_id, "OWNER_LEASE_EXPIRED")
                 self._event(session, runtime.user_broker_id, "OWNER_LEASE_EXPIRED", now, {"generation": generation})
                 expired = True
             else:
@@ -416,7 +451,7 @@ class TradingAdmissionRepository:
         risk_snapshot_captured_at: datetime,
         risk_snapshot_valid_until: datetime,
         risk_instrument: AdmissionInstrument,
-        risk_position_anchor_units: Decimal,
+        risk_position_anchors: tuple[ReconciliationPositionAnchor, ...],
         order_states: tuple[AdmissionOrderState, ...],
         risk_snapshot_id: UUID,
         reserved_cash: Decimal,
@@ -479,6 +514,8 @@ class TradingAdmissionRepository:
                 or risk_instrument.instrument_uid != request.instrument_uid
             ):
                 return SubmitDenied(reason=SubmitDenialReason.UID_NOT_ALLOWED, outcome_uncertain=False)
+            if automation.state != "IN_WORK":
+                return SubmitDenied(reason=SubmitDenialReason.AUTOMATION_NOT_ACTIVE, outcome_uncertain=False)
             if (
                 instrument.instrument_type != risk_instrument.instrument_type
                 or instrument.currency != risk_instrument.currency
@@ -518,42 +555,22 @@ class TradingAdmissionRepository:
                 or request.generation != generation
             ):
                 denial = SubmitDenialReason.NOT_OWNER
-            elif (
-                admission.admission_status != AdmissionStatus.ARMED.value
-                or admission.arm_revision != request.revision
-                or admission.revision != request.revision
-                or admission.arm_expires_at is None
-                or admission.arm_expires_at <= now
-            ):
+            elif admission.revision != request.revision:
                 denial = SubmitDenialReason.DISARMED
-            elif admission.recovery_only:
-                denial = SubmitDenialReason.STOP_REQUIRED
             elif admission.lease_expires_at is None or admission.lease_expires_at <= now:
                 denial = SubmitDenialReason.LEASE_EXPIRED
             elif owner.access_mode != "TRADE" or not owner.strategy_enabled:
                 denial = SubmitDenialReason.NOT_OWNER
+            elif automation.state != "IN_WORK":
+                denial = SubmitDenialReason.AUTOMATION_NOT_ACTIVE
             elif (
                 baseline is None
                 or admission.baseline_id != str(baseline.baseline_id)
                 or baseline.moscow_day != now.astimezone(ZoneInfo("Europe/Moscow")).date()
             ):
                 denial = SubmitDenialReason.BASELINE_REQUIRED
-            elif (
-                reconciliation is None
-                or admission.reconciliation_id != str(reconciliation.reconciliation_id)
-                or (
-                    not reconciliation.can_arm
-                    or reconciliation.owner_runtime_instance_id != str(runtime_instance_id)
-                    or reconciliation.owner_generation != generation
-                    or reconciliation.configuration_fingerprint != request.configuration_fingerprint
-                    or reconciliation.canary_uid != request.instrument_uid
-                )
-            ):
-                denial = SubmitDenialReason.RECONCILIATION_REQUIRED
             elif admission.limits is None:
-                denial = SubmitDenialReason.DATA_UNKNOWN
-            elif request.instrument_uid != AdmissionLimits.model_validate(admission.limits).canary_uid:
-                denial = SubmitDenialReason.UID_NOT_ALLOWED
+                denial = SubmitDenialReason.LIMITS_NOT_CONFIGURED
             elif admission.configuration_fingerprint != request.configuration_fingerprint or (
                 self._current_configuration_fingerprint(broker, owner.access_mode) != request.configuration_fingerprint
             ):
@@ -571,7 +588,6 @@ class TradingAdmissionRepository:
 
             expires_at = min(
                 admission.lease_expires_at,
-                admission.arm_expires_at,
                 request.market_valid_until,
                 request.submit_deadline,
                 now + timedelta(seconds=1),
@@ -582,13 +598,80 @@ class TradingAdmissionRepository:
             if not self._apply_submit_settlement(
                 session,
                 broker_id,
-                reconciliation,
-                request.instrument_uid,
-                risk_position_anchor_units,
+                admission,
+                risk_position_anchors,
                 order_states,
                 now=now,
             ):
                 return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
+
+            # Promote the proven fresh snapshot to the account anchor used by the
+            # next permit. This also upgrades legacy scalar canary anchors without DDL.
+            reconciliation_id = str(uuid4())
+            position_anchors = tuple(item.model_dump(mode="json") for item in risk_position_anchors)
+            active_order_count = sum(
+                state.status.upper() not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"} for state in order_states
+            )
+            prior_reservations = tuple(
+                session.scalars(
+                    select(TradingSubmitReservationModel).where(
+                        TradingSubmitReservationModel.user_broker_id == broker_id,
+                        TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN", "SETTLED")),
+                    )
+                )
+            )
+            unresolved_count = sum(
+                item.state in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"} for item in prior_reservations
+            )
+            reconciliation = TradingReconciliationModel(
+                reconciliation_id=reconciliation_id,
+                user_broker_id=broker_id,
+                account_id=broker.external_account_id,
+                scope="ACCOUNT",
+                owner_runtime_instance_id=str(runtime_instance_id),
+                owner_generation=generation,
+                configuration_fingerprint=request.configuration_fingerprint,
+                status=ReconciliationStatus.ACCOUNT_ONLY.value,
+                captured_at=risk_snapshot_captured_at,
+                valid_until=risk_snapshot_valid_until,
+                can_arm=True,
+                active_ordinary_order_count=active_order_count,
+                active_stop_order_count=0,
+                unresolved_reservation_count=unresolved_count + 1,
+                reasons=[],
+                risk_snapshot_id=str(risk_snapshot_id),
+                payload={
+                    "reconciliation_id": reconciliation_id,
+                    "broker_id": broker_id,
+                    "account_id": broker.external_account_id,
+                    "scope": "ACCOUNT",
+                    "owner_runtime_instance_id": str(runtime_instance_id),
+                    "owner_generation": generation,
+                    "configuration_fingerprint": request.configuration_fingerprint,
+                    "status": ReconciliationStatus.ACCOUNT_ONLY.value,
+                    "canary_uid": None,
+                    "captured_at": risk_snapshot_captured_at.isoformat(),
+                    "valid_until": risk_snapshot_valid_until.isoformat(),
+                    "can_arm": True,
+                    "position_anchor_units": None,
+                    "position_anchors": list(position_anchors),
+                    "active_ordinary_order_count": active_order_count,
+                    "active_stop_order_count": 0,
+                    "unresolved_reservation_count": unresolved_count + 1,
+                    "reasons": [],
+                    "risk_snapshot_id": str(risk_snapshot_id),
+                },
+            )
+            session.add(reconciliation)
+            admission.reconciliation_id = reconciliation_id
+            admission.recovery_only = False
+            admission.recovery_runtime_instance_id = None
+            for prior_reservation in prior_reservations:
+                prior_reservation.payload = {
+                    **prior_reservation.payload,
+                    "anchor_reconciliation_id": reconciliation_id,
+                    "anchor_executed_lots": prior_reservation.payload.get("executed_lots", 0),
+                }
 
             permit_id = uuid4()
             request_fingerprint = submit_request_fingerprint(request)
@@ -658,9 +741,8 @@ class TradingAdmissionRepository:
     def _apply_submit_settlement(
         session: Session,
         broker_id: str,
-        reconciliation: TradingReconciliationModel,
-        instrument_uid: str,
-        current_units: Decimal,
+        admission: TradingAccountAdmissionModel,
+        risk_position_anchors: tuple[ReconciliationPositionAnchor, ...],
         order_states: tuple[AdmissionOrderState, ...],
         *,
         now: datetime,
@@ -678,32 +760,63 @@ class TradingAdmissionRepository:
         for state in order_states:
             states_by_id.setdefault(state.request_id, []).append(state)
         expected_keys = {item.idempotency_key for item in unresolved}
-        instrument = session.scalar(
-            select(BrokerInstrumentModel).where(
-                BrokerInstrumentModel.user_broker_id == broker_id,
-                BrokerInstrumentModel.external_instrument_id == instrument_uid,
-            )
+        prior = (
+            session.get(TradingReconciliationModel, admission.reconciliation_id)
+            if admission.reconciliation_id is not None
+            else None
         )
-        valid = (
-            reconciliation.scope == "CANARY_UID"
-            and reconciliation.canary_uid == instrument_uid
-            and reconciliation.position_anchor_units is not None
-            and instrument is not None
+        current = {item.instrument_uid: item.quantity_units for item in risk_position_anchors}
+        anchor_result = None if prior is None else ReconciliationResult.model_validate(prior.payload)
+        anchors = (
+            {} if anchor_result is None else {item.instrument_uid: item for item in anchor_result.position_anchors}
+        )
+        legacy_scalar_anchor = anchor_result is not None and not anchors
+        if legacy_scalar_anchor:
+            legacy_uid = anchor_result.canary_uid
+            legacy_units = anchor_result.position_anchor_units
+            current_anchor = next((item for item in risk_position_anchors if item.instrument_uid == legacy_uid), None)
+            if (
+                anchor_result.scope != "CANARY_UID"
+                or anchor_result.status is not ReconciliationStatus.CANARY_READY
+                or not legacy_uid
+                or legacy_units is None
+                or not legacy_units.is_finite()
+                or legacy_units < 0
+                or current_anchor is None
+                or any(item.instrument_uid != legacy_uid for item in reservations)
+            ):
+                legacy_scalar_anchor = False
+            else:
+                anchors[legacy_uid] = ReconciliationPositionAnchor(
+                    instrument_uid=legacy_uid,
+                    quantity_units=legacy_units,
+                    lot_size=current_anchor.lot_size,
+                )
+        valid = not reservations or (
+            anchor_result is not None
+            and (
+                (anchor_result.scope == "ACCOUNT" and anchor_result.status is ReconciliationStatus.ACCOUNT_ONLY)
+                or legacy_scalar_anchor
+            )
             and set(states_by_id) == expected_keys
             and all(len(items) == 1 for items in states_by_id.values())
         )
-        expected_units = reconciliation.position_anchor_units if valid else None
+        if not reservations:
+            return True
+        expected_units = {uid: item.quantity_units for uid, item in anchors.items()}
         terminal_states = {"FILLED", "CANCELLED", "REJECTED"}
         active_states = {"NEW", "PARTIALLYFILL", "PARTIALLY_FILLED"}
         updates: list[tuple[TradingSubmitReservationModel, AdmissionOrderState, bool]] = []
-        if valid:
-            anchor_id = reconciliation.reconciliation_id
+        if valid and anchor_result is not None:
+            anchor_id = str(anchor_result.reconciliation_id)
             for reservation in reservations:
                 if reservation.payload.get("anchor_reconciliation_id") != anchor_id:
-                    if reservation.state != SubmitReservationState.SETTLED.value:
-                        valid = False
-                        break
-                    continue
+                    valid = False
+                    break
+                uid_anchor = anchors.get(reservation.instrument_uid)
+                if uid_anchor is None:
+                    valid = False
+                    break
                 anchor_lots = int(reservation.payload.get("anchor_executed_lots", 0))
                 prior_lots = int(reservation.payload.get("executed_lots", 0))
                 if reservation.state == SubmitReservationState.SETTLED.value:
@@ -753,9 +866,10 @@ class TradingAdmissionRepository:
                     valid = False
                     break
                 sign = Decimal(1) if reservation.side == "BUY" else Decimal(-1)
-                expected_units += sign * Decimal((lots - anchor_lots) * instrument.lot_size)
+                expected_units[reservation.instrument_uid] += sign * Decimal((lots - anchor_lots) * uid_anchor.lot_size)
 
-        if valid and expected_units == current_units:
+        current_keys = set(expected_units) if legacy_scalar_anchor else set(current) | set(expected_units)
+        if valid and all(current.get(uid, Decimal(0)) == expected_units.get(uid, Decimal(0)) for uid in current_keys):
             for reservation, state, is_terminal in updates:
                 if state is None:
                     return False
@@ -773,7 +887,10 @@ class TradingAdmissionRepository:
                         else Decimal(0)
                     )
                     reservation.reserved_position_units = (
-                        Decimal((reservation.quantity_lots - state.executed_lots) * instrument.lot_size)
+                        Decimal(
+                            (reservation.quantity_lots - state.executed_lots)
+                            * anchors[reservation.instrument_uid].lot_size
+                        )
                         if reservation.side == "SELL"
                         else Decimal(0)
                     )
@@ -846,7 +963,6 @@ class TradingAdmissionRepository:
             admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
             admission.arm_expires_at = None
-            admission.limits = None
             self._event(session, broker_id, "BASELINE_ACCEPTED", baseline.accepted_at, baseline.model_dump(mode="json"))
         return baseline
 
@@ -925,11 +1041,11 @@ class TradingAdmissionRepository:
             session.add(model)
             admission.baseline_id = model.baseline_id
             admission.revision += 1
-            if admission.admission_status != AdmissionStatus.STOP_REQUIRED.value:
-                admission.admission_status = AdmissionStatus.DISARMED.value
+            # Legacy STOP_REQUIRED is no longer a manual authorization state. Any
+            # active automations were moved to HOLD by the stop/revoke transition.
+            admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
             admission.arm_expires_at = None
-            admission.limits = None
             self._event(session, broker_id, "BASELINE_ACCEPTED", baseline.accepted_at, baseline.model_dump(mode="json"))
         return baseline
 
@@ -1001,6 +1117,19 @@ class TradingAdmissionRepository:
                 != result.configuration_fingerprint
             ):
                 raise AdmissionConflictError("Broker configuration changed before reconciliation was saved.")
+            if (
+                result.scope == "ACCOUNT"
+                and session.scalar(
+                    select(TradingSubmitReservationModel.reservation_id)
+                    .where(
+                        TradingSubmitReservationModel.user_broker_id == broker_id,
+                        TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+                    )
+                    .limit(1)
+                )
+                is not None
+            ):
+                raise AdmissionConflictError("Account reconciliation cannot rewrite unresolved account reservations.")
             result = self._reconcile_submit_reservations(
                 session,
                 admission,
@@ -1032,31 +1161,23 @@ class TradingAdmissionRepository:
             )
             session.add(model)
             trusted_anchor = (
-                result.status is ReconciliationStatus.CANARY_READY
-                and result.scope == "CANARY_UID"
-                and result.position_anchor_units is not None
+                result.status is ReconciliationStatus.ACCOUNT_ONLY and result.scope == "ACCOUNT" and not result.reasons
             )
             if trusted_anchor:
                 admission.reconciliation_id = model.reconciliation_id
-            else:
-                admission.recovery_only = True
-                admission.recovery_runtime_instance_id = admission.owner_runtime_instance_id
+                if (
+                    admission.recovery_only
+                    and result.unresolved_reservation_count == 0
+                    and result.active_ordinary_order_count == 0
+                    and result.active_stop_order_count == 0
+                ):
+                    admission.recovery_only = False
+                    admission.recovery_runtime_instance_id = None
             admission.revision += 1
             admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
             admission.arm_expires_at = None
-            admission.limits = None
             admission.configuration_fingerprint = result.configuration_fingerprint
-            if (
-                admission.recovery_only
-                and result.scope == "CANARY_UID"
-                and result.can_arm
-                and result.unresolved_reservation_count == 0
-                and result.active_ordinary_order_count == 0
-                and result.active_stop_order_count == 0
-            ):
-                admission.recovery_only = False
-                admission.recovery_runtime_instance_id = None
             self._event(session, broker_id, "RECONCILED", result.captured_at, result.model_dump(mode="json"))
         return result
 
@@ -1348,6 +1469,7 @@ class TradingAdmissionRepository:
                     else ReconciliationResult.model_validate(reconciliation_model.payload)
                 ),
                 automation_id=automation.id,
+                automation_state=automation.state,
                 instrument_uid=instrument.external_instrument_id,
                 instrument_type=instrument.instrument_type,
                 currency=instrument.currency,
@@ -1466,6 +1588,33 @@ class TradingAdmissionRepository:
                 recovery_only=admission.recovery_only,
             )
 
+    def update_limits(
+        self, broker_id: str, request: UpdateLimitsRequest, *, actor: str, now: datetime
+    ) -> AdmissionView:
+        with self._factory.begin() as session:
+            broker = session.get(UserBrokerModel, broker_id, with_for_update=True)
+            admission = session.get(TradingAccountAdmissionModel, broker_id, with_for_update=True)
+            if (
+                broker is None
+                or broker.environment != "PROD"
+                or broker.state != "ACTIVE"
+                or broker.archived_at is not None
+                or broker.external_account_id is None
+                or admission is None
+                or admission.revision != request.expected_revision
+            ):
+                raise AdmissionConflictError("Admission account or revision changed before limits update.")
+            admission.limits = request.limits.model_dump(mode="json")
+            admission.revision += 1
+            self._event(
+                session,
+                broker_id,
+                "LIMITS_UPDATED",
+                now,
+                {"revision": admission.revision, "limits": request.limits.model_dump(mode="json"), "actor": actor},
+            )
+        return self.get_view(broker_id, now=now)
+
     def arm(self, request: ArmRequest, *, broker_id: str, now: datetime, actor: str) -> AdmissionView:
         with self._factory.begin() as session:
             broker = session.get(UserBrokerModel, broker_id, with_for_update=True)
@@ -1488,7 +1637,6 @@ class TradingAdmissionRepository:
                 or owner.runtime_instance_id != str(request.runtime_instance_id)
                 or owner.registration_status != RuntimeRegistrationStatus.OWNER.value
                 or owner.generation != admission.owner_generation
-                or admission.recovery_only
                 or admission.baseline_id != str(request.baseline_id)
                 or admission.reconciliation_id != str(request.reconciliation_id)
                 or admission.lease_expires_at is None
@@ -1503,8 +1651,6 @@ class TradingAdmissionRepository:
                 or reconciliation.owner_generation != owner.generation
                 or not reconciliation.can_arm
                 or reconciliation.valid_until <= now
-                or reconciliation.scope != "CANARY_UID"
-                or reconciliation.canary_uid != request.limits.canary_uid
                 or reconciliation.configuration_fingerprint != request.configuration_fingerprint
                 or request.expires_at <= now
                 or request.expires_at > moscow_day_end
@@ -1525,18 +1671,6 @@ class TradingAdmissionRepository:
             )
             if unresolved or reconciliation.unresolved_reservation_count:
                 raise AdmissionConflictError("Unresolved submit reservations prevent admission arm.")
-            instrument = session.scalar(
-                select(BrokerInstrumentModel).where(
-                    BrokerInstrumentModel.user_broker_id == broker_id,
-                    BrokerInstrumentModel.external_instrument_id == request.limits.canary_uid,
-                    BrokerInstrumentModel.is_active.is_(True),
-                    BrokerInstrumentModel.api_trade_available.is_(True),
-                    BrokerInstrumentModel.currency == "RUB",
-                    BrokerInstrumentModel.instrument_type.in_(("SHARE", "FUND")),
-                )
-            )
-            if instrument is None:
-                raise AdmissionConflictError("Canary instrument is not an active supported instrument.")
             admission.revision += 1
             admission.arm_revision = admission.revision
             admission.admission_status = AdmissionStatus.ARMED.value
@@ -1600,11 +1734,18 @@ class TradingAdmissionRepository:
             admission.recovery_only = True
             admission.lease_expires_at = lease_expires_at
             admission.revision += 1
-            admission.admission_status = AdmissionStatus.STOP_REQUIRED.value
+            admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
             admission.arm_expires_at = None
-            admission.limits = None
-            admission.configuration_fingerprint = None
+            if candidate.access_mode == "TRADE" and candidate.strategy_enabled:
+                # A controlled owner transfer changes generation, not the user's
+                # IN_WORK intent. Bind the new owner to the currently stored broker scope.
+                admission.configuration_fingerprint = self._current_configuration_fingerprint(
+                    broker, candidate.access_mode
+                )
+            else:
+                self._hold_account_automations(session, broker_id, "TRADING_OWNER_CHANGED")
+                admission.configuration_fingerprint = None
             self._event(
                 session,
                 broker_id,
@@ -1632,31 +1773,45 @@ class TradingAdmissionRepository:
             admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
             admission.arm_expires_at = None
-            admission.limits = None
+            self._hold_account_automations(session, broker_id, "TRADING_ADMISSION_REVOKED")
             self._event(session, broker_id, "ADMISSION_REVOKED", now, {"actor": actor, "reason": request.reason})
         return self.get_view(broker_id, now=now)
 
     @staticmethod
+    def _hold_account_automations(session: Session, broker_id: str, reason: str) -> None:
+        automations = session.scalars(
+            select(TradingAutomationModel)
+            .where(
+                TradingAutomationModel.user_broker_id == broker_id,
+                TradingAutomationModel.state.in_(("IN_QUEUE", "OPENING", "IN_WORK")),
+                TradingAutomationModel.closed_at.is_(None),
+            )
+            .with_for_update()
+        )
+        for automation in automations:
+            automation.suspended_from_state = automation.state
+            automation.state = "HOLD"
+            automation.hold_reason = reason
+            automation.resume_requested = False
+            automation.revision += 1
+
+    @staticmethod
     def _effective_reasons(admission, owner, baseline, reconciliation, now, unresolved: int):
         reasons: list[SubmitDenialReason] = []
-        if admission.admission_status != AdmissionStatus.ARMED.value:
-            reasons.append(SubmitDenialReason.DISARMED)
-        if owner is None or owner.registration_status != "OWNER" or admission.owner_generation != owner.generation:
+        if (
+            owner is None
+            or owner.registration_status != "OWNER"
+            or admission.owner_generation != owner.generation
+            or owner.access_mode != "TRADE"
+            or not owner.strategy_enabled
+        ):
             reasons.append(SubmitDenialReason.NOT_OWNER)
-        if admission.recovery_only:
-            reasons.append(SubmitDenialReason.STOP_REQUIRED)
         if admission.lease_expires_at is None or admission.lease_expires_at <= now:
             reasons.append(SubmitDenialReason.LEASE_EXPIRED)
-        if admission.arm_expires_at is None or admission.arm_expires_at <= now:
-            reasons.append(SubmitDenialReason.DISARMED)
         if baseline is None or baseline.moscow_day != now.astimezone(ZoneInfo("Europe/Moscow")).date():
             reasons.append(SubmitDenialReason.BASELINE_REQUIRED)
-        if (
-            reconciliation is None
-            or not reconciliation.can_arm
-            or (admission.admission_status != AdmissionStatus.ARMED.value and reconciliation.valid_until <= now)
-        ):
-            reasons.append(SubmitDenialReason.RECONCILIATION_REQUIRED)
+        if admission.limits is None:
+            reasons.append(SubmitDenialReason.LIMITS_NOT_CONFIGURED)
         return tuple(dict.fromkeys(reasons))
 
     @staticmethod

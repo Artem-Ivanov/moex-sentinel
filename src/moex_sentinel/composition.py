@@ -29,6 +29,7 @@ from moex_sentinel.services.daily_admission_preparation import DailyAdmissionPre
 from moex_sentinel.services.environment import PinnedEnvironment
 from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
 from moex_sentinel.services.market_data import BrokerMarketDataService
+from moex_sentinel.services.market_recovery import MarketRecoveryPolicy
 from moex_sentinel.services.market_snapshot_gateway import MarketSnapshotGateway
 from moex_sentinel.services.portfolio import PortfolioAggregationService
 from moex_sentinel.services.portfolio_snapshot_collection import PortfolioSnapshotCollectionService
@@ -197,7 +198,21 @@ def build_market_snapshot_gateway(
     def resolve(source_id: UUID) -> BrokerConnection:
         return connections.connection(str(source_id))
 
-    return MarketSnapshotGateway(source, configuration_resolver=resolve, retry_limit=retry_limit)
+    recovery = MarketRecoveryPolicy(
+        retry_seconds=settings.market_recovery_retry_base_seconds,
+        retry_limit=retry_limit,
+        probe_interval_seconds=settings.market_recovery_probe_interval_seconds,
+        operation_timeout_seconds=settings.market_operation_timeout_seconds,
+        close_timeout_seconds=settings.market_close_timeout_seconds,
+        quiet_seconds=settings.market_quiet_seconds,
+    )
+    return MarketSnapshotGateway(
+        source,
+        configuration_resolver=resolve,
+        retry_limit=retry_limit,
+        refresh_seconds=settings.market_candles_refresh_seconds,
+        recovery=recovery,
+    )
 
 
 def build_application_usecases(factory: sessionmaker[Session], settings: Settings | None = None) -> ApplicationUsecases:
@@ -267,7 +282,9 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         enabled=settings.daily_admission_preparation_enabled,
         environment=settings.application_environment,
         access_mode=settings.broker_access_mode,
-        canary_uid=settings.daily_admission_canary_uid,
+        check_interval_seconds=settings.daily_admission_check_interval_seconds,
+        attempt_timeout_seconds=settings.daily_admission_attempt_timeout_seconds,
+        retry_delays_seconds=settings.daily_admission_retry_delays_seconds,
     )
     worker_authenticator = WorkerAuthenticator(settings, trading_admission_repository.get_runtime_credential)
     return ApplicationUsecases(

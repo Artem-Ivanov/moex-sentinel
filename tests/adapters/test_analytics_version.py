@@ -9,7 +9,7 @@ import pytest
 from moex_sentinel.adapters.analytics_version import AnalyticsVersionClient
 
 
-async def observation(response=None, *, url="http://analytics:8001", handler=None):
+async def observation(response=None, *, url="http://analytics:8001", handler=None, timeout_seconds=1.0):
     requests = []
 
     def handle(request):
@@ -19,7 +19,12 @@ async def observation(response=None, *, url="http://analytics:8001", handler=Non
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handle), trust_env=False, follow_redirects=False
     ) as http:
-        result = await AnalyticsVersionClient(url, http, clock=lambda: datetime(2026, 10, 3, tzinfo=UTC)).observe()
+        result = await AnalyticsVersionClient(
+            url,
+            http,
+            clock=lambda: datetime(2026, 10, 3, tzinfo=UTC),
+            timeout_seconds=timeout_seconds,
+        ).observe()
     return result, requests
 
 
@@ -39,6 +44,23 @@ def test_unconfigured_does_not_make_network_request():
     result, requests = asyncio.run(observation(url=""))
     assert result.reason == "NOT_CONFIGURED"
     assert requests == []
+
+
+def test_health_request_uses_configured_timeout():
+    result, requests = asyncio.run(
+        observation(
+            httpx.Response(200, json={"status": "ok", "service": "analytics", "version": "4.5.6"}),
+            timeout_seconds=0.25,
+        )
+    )
+
+    assert result.version == "4.5.6"
+    assert requests[0].extensions["timeout"] == {
+        "connect": 0.25,
+        "read": 0.25,
+        "write": 0.25,
+        "pool": 0.25,
+    }
 
 
 @pytest.mark.parametrize(

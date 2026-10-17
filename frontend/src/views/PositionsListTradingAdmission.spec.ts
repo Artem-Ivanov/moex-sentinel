@@ -38,7 +38,7 @@ it("loads read-only account status only for the selected position broker and kee
     if (url === "/api/trading-automations") return Promise.resolve(Response.json({ items: [
       automation("auto-A", brokerA, "account-A"), automation("auto-B", brokerB, "account-B"),
     ] }))
-    if (url === `/api/brokers/${brokerA}/trading-admission`) return Promise.resolve(Response.json({ broker_id: brokerA, account_id: "account-A", revision: 1, owner_runtime_instance_id: null, owner_generation: null, recovery_runtime_instance_id: null, admission_status: "STOP_REQUIRED", arm_revision: null, lease_expires_at: null, arm_expires_at: null, limits: null, configuration_fingerprint: null, baseline: null, reconciliation: null, effective_can_submit: false, effective_denial_reasons: ["STOP_REQUIRED"], unresolved_reservation_count: 0, outstanding_order_count: 0, recovery_only: true }))
+    if (url === `/api/brokers/${brokerA}/trading-admission`) return Promise.resolve(Response.json({ broker_id: brokerA, account_id: "account-A", revision: 1, owner_runtime_instance_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", owner_generation: 1, recovery_runtime_instance_id: null, admission_status: "DISARMED", arm_revision: null, lease_expires_at: "2099-10-16T12:00:00.000Z", arm_expires_at: null, limits: null, configuration_fingerprint: null, baseline: null, reconciliation: null, effective_can_submit: false, effective_denial_reasons: ["BASELINE_REQUIRED"], unresolved_reservation_count: 0, outstanding_order_count: 0, recovery_only: true }))
     if (url === `/api/brokers/${brokerA}/trading-admission/preparation`) return Promise.resolve(new Response(null, { status: 404 }))
     if (url === `/api/brokers/${brokerB}/trading-admission`) return Promise.resolve(Response.json({ broker_id: brokerB, account_id: "account-B", revision: 1, owner_runtime_instance_id: null, owner_generation: null, recovery_runtime_instance_id: null, admission_status: "DISARMED", arm_revision: null, lease_expires_at: null, arm_expires_at: null, limits: null, configuration_fingerprint: null, baseline: null, reconciliation: null, effective_can_submit: false, effective_denial_reasons: ["BASELINE_REQUIRED"], unresolved_reservation_count: 0, outstanding_order_count: 0, recovery_only: false }))
     if (url === `/api/brokers/${brokerB}/trading-admission/preparation`) return Promise.resolve(new Response(null, { status: 404 }))
@@ -55,9 +55,9 @@ it("loads read-only account status only for the selected position broker and kee
   await fireEvent.click(rowA)
   expect(await screen.findByText("Запрос Resume принят.")).toBeTruthy()
   expect(screen.getAllByText("HOLD").length).toBeGreaterThan(0)
-  expect(await screen.findByText("STOP_REQUIRED")).toBeTruthy()
+  expect(await screen.findByText("Core автоматически подготавливает дневную базу счёта.")).toBeTruthy()
   expect(fetchMock).toHaveBeenCalledWith(`/api/brokers/${brokerA}/trading-admission`, expect.objectContaining({ signal: expect.anything() }))
-  expect(fetchMock).toHaveBeenCalledWith(`/api/brokers/${brokerA}/trading-admission/preparation`, expect.objectContaining({ signal: expect.anything() }))
+  expect(fetchMock.mock.calls.some(([url]) => String(url).includes("trading-admission/preparation"))).toBe(false)
 
   await fireEvent.click(screen.getByRole("row", { name: new RegExp(`auto-B ${brokerB} account-B HOLD`) }))
   expect(await screen.findByText("Счёт: account-B")).toBeTruthy()

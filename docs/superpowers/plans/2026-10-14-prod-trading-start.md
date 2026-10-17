@@ -100,15 +100,54 @@ HOLD/STOP_REQUIRED сохранены, daily/Telegramdisabled; PT7 и реаль
 - [x] Health/ping и базовый интерфейс через HTML/assets + read APIs: correct runtime и HOLD; UI capability покрыт266frontend tests; no real control POST в deployment check. Независимое ревью фактического выпуска.
 **DoD:** Выполнено14.10 (report develop/reports/prod-trading-start-deploy-20261014/report.md, reviewers prod_release_architect C0/I0/M0): изменения развернуты, HTTP интерфейс открывается, нужные сервисы работают; технический deployment не объявляется успешной торговой приёмкой. Source0006/0007/retention/CI-CD не добавлять в критический путь без конкретной зависимости.
 
+## ENV — конфигурация и автоподготовка базы (15.10, LOCAL DONE)
+
+Пользователь подтвердил отдельную доработку: **ENV всех сервисов, документация
+каждого параметра и автоподготовка базы**. План реализации:
+[ENV configuration](2026-10-15-runtime-environment-configuration.md),
+[дизайн](../specs/2026-10-15-runtime-environment-configuration-design.md).
+ENV1 Core, ENV2 Worker/Analytics, ENV3 Compose/каталог/шаблоны, ENV4 root integration
+и независимое кросс-ревью завершены. Значения доходят до потребителей, включая
+исправленные настройки пула Core HTTP. Проверки: 2617 backend + 141 develop +
+275 frontend PASS, typecheck/build и Ruff/Black PASS. Итоговое независимое
+ревью env_core_reviewer: C0/I0/M0. [Каталог ENV](../../configuration/environment.md).
+
+Daily scheduler уже реализован. Fresh15.10 09:39MSK: actual PROD flag=false,
+поэтому ежедневная ручная база не является целевым решением — требуется явная
+активация существующей автоподготовки. Эта доработка документирует и задаёт
+PROD example profile daily=true/emptycanary, сохраняя safe app/Compose defaults.
+Применение приватного ENV на VPS и приёмка фактической базы дня — отдельный
+операционный шаг до ARM; наличие нового кода не подтверждает активацию.
+
+15.10 последующим поручением выполнен ENV5: релиз
+`vps-20261015-env-4a71589e8766`, Core/Worker/Analytics, техническая приёмка и
+независимое ревью C0/I0/M0. Daily=true создал базу за 15 октября в 19:06:54 МСК.
+На 19:08:49 МСК торговля ещё закрыта: STOP_REQUIRED/recovery-only, нет
+reconciliation/ARM/limits; обе позиции IN_WORK, новых операций в полученной
+выборке нет. PT7 не закрыт. Доказательства:
+`develop/reports/runtime-env-deploy-20261015/report.md`.
+
+MultiUID для GOLD/SIBN и автоматический ARM после смены дня/Workerowner
+**отложены пользователем**. Они не входят в ENV1–ENV4, остаются следующими
+задачами; daily baseline/reconciliation не выдаёт торговый ARM.
+
 ## PT7 — подготовить допуск и начать контролируемую торговлю
 
 **Existing interfaces:** operator `baseline`, `reconcile`, `arm`, `view`; UI Resume; Worker штатный SDK execution/outbox. Это операционный этап, не повторная реализация Core admission.
 - [ ] Свежая проверка текущего MSK дня/рынка, выбранного GOLD UID, счёта, owner/gen/lease, active ordinary/stop orders, unresolved reservations, токена/доступа. Instrument trade flags/read-only RPC не считаются доказательством права на post.
 - [ ] Сначала зачесть актуальные уже принятые доказательства и закрыть только оставшиеся P4 gates в режиме без broker writes: принять отчёт по выбранному счёту/сверке с кабинетом, полный торговый день и закрытый рынок, UI/market/facts/outbox/alerts и отсутствие app-created broker mutations. Результаты согласовать с владельцем и независимым reviewer; связанные с торговым запуском O1/O2/S1 условия сверить с текущей очередью, не втягивая несвязанные вехи или повторяя уже принятые проверки. Зафиксировать operator alert recipient, проверенную команду остановки и UNKNOWN procedure; состояние резервного копирования относится к отдельному действующему регламенту, не к обязательному full-restore каждому deployment. P3/P4 acceptance отсутствует — canary закрыт.
 - [ ] После P3/P4 acceptance и при действующей авторизации владельца на account/UID/лимиты принять current-day baseline и успешную CANARY_UID сверку с can_arm=true; установить лимиты по ранее утверждённым формулам и свежим данным; явный ARM в срок действующей сверки. Отказ/unknown не обходить.
-- [ ] Пользователь явно возобновляет HOLD; после этого контролируемая первая штатная операция в согласованных пределах. Проверить прохождение strategy→permit→SDK→terminal/частичное исполнение→outbox→Core, комиссии и отсутствие дубликата. При неопределённом результате сохранить reservation и выполнить read-only recovery.
+- [ ] По freshruntime определить состояние позиции: GOLD/SIBN14.10 уже IN_WORK, повторный Resume не нужен; если пользователь снова выставил HOLD, возобновляет его явно. Затем контролируемая первая штатная операция в согласованных пределах. Проверить прохождение strategy→permit→SDK→terminal/частичное исполнение→outbox→Core, комиссии и отсутствие дубликата. При неопределённом результате сохранить reservation и выполнить read-only recovery.
 - [ ] После initial canary P5 наблюдать дальнейший live-день: контроль остановки, восстановления, дневного убытка/outbox; PT3 отдельно принимает наступление следующего дня. Последующее расширение отдельным решением.
 **DoD:** Для закрытия initial canary нужен реальный подтверждённый цикл исполнения; права на post подтверждаются штатной операцией, а не подменным probe. При отсутствии сигнала наблюдение и торговая приёмка остаются открытыми, принудительную заявку ради теста не создавать. Предторговый full-day без broker writes — P4, первая ограниченная реальная торговля — P5, следующий день — приёмка PT3. Успех deployment этого не заменяет.
+
+15.10 в 19:20 МСК по явному поручению пользователя выполнена успешная GOLD
+CANARY-сверка: **recovery-only снят**, STOP_REQUIRED→DISARMED/revision9,
+active orders/stops/unresolved=0, same owner generation5. Повторная проверка
+19:21:50 после TTL подтвердила recovery_only=false, Worker OK/outbox CLEAR;
+ARM и лимиты отсутствуют. Сверка для снятия recovery выполнена, остальные части
+PT7 не закрыты. Independent review C0/I0/M0; evidence
+`develop/reports/prod-reconciliation-20261015/report.md`.
 
 ## Порядок
 

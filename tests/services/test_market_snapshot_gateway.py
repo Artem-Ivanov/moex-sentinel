@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+from moex_sentinel.config import Settings
 from moex_sentinel.services.market_recovery import MarketRecoveryPolicy
 from moex_sentinel.services.market_snapshot_gateway import LOGGER, MarketSnapshotGateway
 from sentinel_contracts.analytics import MarketSnapshotRequest
@@ -16,6 +17,29 @@ from sentinel_contracts.streaming_market import StreamCandle, StreamOrderBook, S
 
 NOW = datetime(2026, 9, 9, 10, tzinfo=UTC)
 SOURCE = UUID("00000000-0000-0000-0000-000000000001")
+
+
+def test_composition_passes_market_environment_timings_to_gateway() -> None:
+    from moex_sentinel.composition import build_market_snapshot_gateway  # noqa: PLC0415
+
+    settings = Settings(
+        _env_file=None,
+        broker_access_mode="READ_ONLY",
+        market_recovery_retry_base_seconds=2.5,
+        market_recovery_probe_interval_seconds=9,
+        market_operation_timeout_seconds=4,
+        market_close_timeout_seconds=3,
+        market_quiet_seconds=8,
+        market_candles_refresh_seconds=12,
+    )
+    gateway = build_market_snapshot_gateway(object(), retry_limit=5, settings=settings)
+
+    assert gateway._recovery.delay(1) == 2.5
+    assert gateway._recovery.delay(6) == 9
+    assert gateway._recovery.operation_timeout_seconds == 4
+    assert gateway._recovery.close_timeout_seconds == 3
+    assert gateway._recovery.quiet_seconds == 8
+    assert gateway._refresh == 12
 
 
 def candle(at, close="10"):

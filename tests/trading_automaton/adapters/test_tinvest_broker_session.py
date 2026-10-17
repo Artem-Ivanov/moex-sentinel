@@ -355,7 +355,10 @@ def test_positions_dispatch_and_quotes_reuse_existing_sdk_context() -> None:
 def test_prod_submit_denial_never_enters_sdk_post():
     class Admission:
         async def authorize_submit(self, request):
-            return SubmitGate(denial=SubmitDenied(reason=SubmitDenialReason.DISARMED, outcome_uncertain=False))
+            return SubmitGate(
+                denial=SubmitDenied(reason=SubmitDenialReason.DISARMED, outcome_uncertain=False),
+                authorization_elapsed_ms=25,
+            )
 
     async def scenario():
         client = FakeClient()
@@ -378,7 +381,58 @@ def test_prod_submit_denial_never_enters_sdk_post():
     assert state.status == "CANCELLED"
     assert state.executed_lots == 0
     assert state.pre_rpc_abort_proof is None
+    assert state.submit_denial_reason is SubmitDenialReason.DISARMED
+    assert state.submit_authorization_elapsed_ms == 25
     assert not hasattr(client.orders, "posted")
+
+
+def test_prod_successful_post_records_bounded_authorization_and_remaining_permit_timing():
+    request = prod_dispatch_request()
+    permit = SubmitPermit(
+        permit_id=uuid4(),
+        runtime_instance_id=UUID(request.admission_runtime_instance_id),
+        idempotency_key=UUID(request.idempotency_key),
+        generation=request.admission_generation,
+        revision=request.admission_revision,
+        configuration_fingerprint=PROD_CONFIGURATION_FINGERPRINT,
+        request_fingerprint=prod_request_fingerprint(request),
+        issued_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 7, 12, 0, 1, tzinfo=UTC),
+        server_response_at=datetime(2026, 8, 7, 12, tzinfo=UTC),
+        risk_snapshot_id=uuid4(),
+    )
+
+    class Admission:
+        async def authorize_submit(self, authorization):
+            return SubmitGate(
+                permit=permit,
+                expires_monotonic=10.9,
+                authorization_elapsed_ms=60,
+                permit_remaining_ms=900,
+            )
+
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            monotonic=lambda: 10.0,
+            client_factory=lambda *_args, **_kwargs: client,
+        )
+        await session.start()
+        state = await session.dispatch_limit_order(request)
+        await session.close()
+        return client, state
+
+    client, state = asyncio.run(scenario())
+    assert client.orders.posted["order_id"] == request.idempotency_key
+    assert state.submit_authorization_elapsed_ms == 60
+    assert state.permit_remaining_ms == 900
 
 
 def test_prod_already_consumed_submit_is_uncertain_and_never_fake_cancelled():

@@ -25,7 +25,7 @@ class Response(BytesIO):
         self.close()
 
 
-def make_transport(monkeypatch, response):
+def make_transport(monkeypatch, response, *, request_timeout_seconds=telegram_alerts.REQUEST_TIMEOUT_SECONDS):
     captured = {}
 
     class Opener:
@@ -45,7 +45,10 @@ def make_transport(monkeypatch, response):
 
     return (
         create_telegram_alert_transport(
-            bot_token=SecretStr("12345:secret_token"), chat_id="safe-chat", run_sync=run_sync
+            bot_token=SecretStr("12345:secret_token"),
+            chat_id="safe-chat",
+            run_sync=run_sync,
+            request_timeout_seconds=request_timeout_seconds,
         ),
         captured,
     )
@@ -64,6 +67,16 @@ def test_sender_posts_strict_success_json_through_fixed_https_without_proxy_or_r
     assert len(proxy_handlers) == 1
     assert proxy_handlers[0].proxies == {}
     assert any(handler.__class__.__name__ == "_NoRedirectHandler" for handler in captured["handlers"])
+
+
+def test_sender_uses_configured_request_timeout(monkeypatch):
+    transport, captured = make_transport(
+        monkeypatch, Response(b'{"ok":true,"result":{}}'), request_timeout_seconds=2.25
+    )
+
+    asyncio.run(transport.send_message("SAFE_STATUS"))
+
+    assert captured["timeout"] == 2.25
 
 
 @pytest.mark.parametrize(

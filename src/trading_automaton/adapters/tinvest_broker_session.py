@@ -5,6 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
+from math import floor
 from time import monotonic as system_monotonic
 from typing import Any, Literal
 from uuid import UUID
@@ -35,6 +36,7 @@ from sentinel_contracts.tinvest import resolve_tinvest_endpoint
 from sentinel_contracts.trading_admission import (
     PreRpcAbortProof,
     SubmitAuthorizationRequest,
+    SubmitDenialReason,
     submit_request_fingerprint,
 )
 from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
@@ -42,6 +44,7 @@ from trading_automaton.domain.errors import CoreOperationError
 
 LOGGER = logging.getLogger(__name__)
 _TLS_UNWRAP_FAILURE = "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))"
+_MAX_TIMING_MS = 2_147_483_647
 
 
 def _default_client_factory(token: str, *, target: str) -> AsyncClient:
@@ -231,9 +234,13 @@ class BrokerSdkSession:
             self._validate_connection_binding(request)
             gate = await self._submit_admission.authorize_submit(request)
             if gate.denial is not None:
-                if gate.denial.outcome_uncertain:
+                if gate.denial.outcome_uncertain or gate.denial.reason is SubmitDenialReason.ALREADY_CONSUMED:
                     raise CoreOperationError(retryable=True)
-                return self._cancel_before_post(request)
+                return self._cancel_before_post(
+                    request,
+                    submit_denial_reason=gate.denial.reason,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                )
             if gate.abort_proof is not None:
                 if gate.permit is None:
                     raise CoreOperationError(retryable=False)
@@ -247,14 +254,26 @@ class BrokerSdkSession:
                     or gate.abort_proof.configuration_fingerprint != gate.permit.configuration_fingerprint
                 ):
                     raise CoreOperationError(retryable=False)
-                return self._cancel_before_post(request, gate.abort_proof)
+                return self._cancel_before_post(
+                    request,
+                    gate.abort_proof,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                    permit_remaining_ms=gate.permit_remaining_ms,
+                )
             if gate.permit is None or gate.expires_monotonic is None:
                 raise CoreOperationError(retryable=False)
             self._validate_permit_binding(request, gate.permit)
             if self._market_expired(request) or self._monotonic() >= gate.expires_monotonic:
                 reason = "MARKET_EXPIRED_BEFORE_POST" if self._market_expired(request) else "PERMIT_EXPIRED_BEFORE_POST"
                 proof = self._submit_admission.abort_proof(request, gate.permit, reason)
-                return self._cancel_before_post(request, proof)
+                remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
+                return self._cancel_before_post(
+                    request,
+                    proof,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                    permit_remaining_ms=remaining_ms,
+                )
+            permit_remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
         post = self.services.orders.post_order(
             instrument_id=request.instrument_id,
             quantity=request.quantity_lots,
@@ -271,6 +290,13 @@ class BrokerSdkSession:
         )
         response = await self._broker_request(post)
         state = _order_state(response)
+        if self._environment == "PROD":
+            state = state.model_copy(
+                update={
+                    "submit_authorization_elapsed_ms": gate.authorization_elapsed_ms,
+                    "permit_remaining_ms": permit_remaining_ms,
+                }
+            )
         await self._invalidate_if_terminal(request.account_id, state)
         return state
 
@@ -344,6 +370,10 @@ class BrokerSdkSession:
     def _cancel_before_post(
         request: DispatchRequest,
         proof: PreRpcAbortProof | None = None,
+        *,
+        submit_denial_reason: SubmitDenialReason | None = None,
+        submit_authorization_elapsed_ms: int | None = None,
+        permit_remaining_ms: int | None = None,
     ) -> BrokerOrderState:
         return BrokerOrderState(
             broker_order_id="",
@@ -357,6 +387,9 @@ class BrokerSdkSession:
             executed_commission=Decimal(),
             currency=request.reservation_currency,
             pre_rpc_abort_proof=proof,
+            submit_denial_reason=submit_denial_reason,
+            submit_authorization_elapsed_ms=submit_authorization_elapsed_ms,
+            permit_remaining_ms=permit_remaining_ms,
         )
 
     def _validate_account(self, account_id: str) -> None:
@@ -522,6 +555,10 @@ def _money_value(item: Any) -> Decimal:
     ):
         raise ValueError("Invalid broker money units or currency")
     return quotation_to_decimal(item)
+
+
+def _bounded_milliseconds(value: float) -> int:
+    return max(-_MAX_TIMING_MS, min(_MAX_TIMING_MS, floor(value)))
 
 
 def _quotation(value: Decimal) -> Quotation:

@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest"
-import { fetchTradingAdmission, fetchTradingPreparation } from "./tradingAdmission"
+import { currentSession } from "../auth"
+import { fetchTradingAdmission, fetchTradingPreparation, updateTradingAdmissionLimits } from "./tradingAdmission"
 
 const brokerId = "11111111-1111-4111-8111-111111111111"
 const accountId = "account-1"
@@ -9,7 +10,7 @@ const reconciliationId = "44444444-4444-4444-8444-444444444444"
 const fingerprint = "a".repeat(64)
 
 const limits = {
-  canary_uid: "uid-1", currency: "RUB", max_order_notional: "1000", exposure_scope: "CANARY_UID_GROSS",
+  currency: "RUB", max_order_notional: "1000", exposure_scope: "ACCOUNT_GROSS",
   max_exposure: "5000", max_outstanding_orders: 2, max_daily_loss: "5000",
 }
 
@@ -49,7 +50,7 @@ const waiting = {
   reconciliation_id: null, reconciliation_valid_until: null, suggested_limits: null, risk_reasons: [],
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); currentSession.value = null })
 
 it("loads validated admission and daily preparation with read-only GETs", async () => {
   const preparation = { ...waiting, moscow_day: "2026-10-14", captured_at: "2026-10-14T10:00:00.000Z" }
@@ -149,6 +150,46 @@ it("treats an absent read-only admission or preparation view as unavailable", as
 
   await expect(fetchTradingAdmission(brokerId)).resolves.toBeNull()
   await expect(fetchTradingPreparation(brokerId)).resolves.toBeNull()
+})
+
+it("updates account-wide limits with the current operator CSRF token and validates the returned view", async () => {
+  const accountLimits = {
+    currency: "RUB", exposure_scope: "ACCOUNT_GROSS", max_order_notional: "1250",
+    max_exposure: "5000", max_outstanding_orders: 2, max_daily_loss: "250",
+  } as const
+  const updated = { ...admission, revision: 4, limits: accountLimits }
+  currentSession.value = { username: "operator", csrf_token: "csrf-token" }
+  const fetchMock = vi.fn().mockResolvedValue(Response.json(updated))
+  vi.stubGlobal("fetch", fetchMock)
+
+  await expect(updateTradingAdmissionLimits(brokerId, accountId, 3, accountLimits)).resolves.toEqual(updated)
+
+  const [url, init] = fetchMock.mock.calls[0]
+  expect(url).toBe(`/api/brokers/${brokerId}/trading-admission/limits`)
+  expect(init.method).toBe("PUT")
+  expect(new Headers(init.headers).get("X-CSRF-Token")).toBe("csrf-token")
+  expect(init.body).toBe(JSON.stringify({ expected_revision: 3, limits: accountLimits }))
+})
+
+it("does not accept an update response for a different account scope", async () => {
+  const accountLimits = {
+    currency: "RUB", exposure_scope: "ACCOUNT_GROSS", max_order_notional: "1250",
+    max_exposure: "5000", max_outstanding_orders: 2, max_daily_loss: "250",
+  } as const
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ ...admission, account_id: "another-account" })))
+
+  await expect(updateTradingAdmissionLimits(brokerId, accountId, 3, accountLimits)).rejects.toThrow()
+})
+
+it.each(["0.00000001", "1e-8"])("compares %s exactly with Core scientific notation", async (inputNotional) => {
+  const accountLimits = {
+    currency: "RUB", exposure_scope: "ACCOUNT_GROSS", max_order_notional: inputNotional,
+    max_exposure: "5000", max_outstanding_orders: 2, max_daily_loss: "250",
+  } as const
+  const normalized = { ...admission, revision: 4, limits: { ...accountLimits, max_order_notional: "1E-8" } }
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(normalized)))
+
+  await expect(updateTradingAdmissionLimits(brokerId, accountId, 3, accountLimits)).resolves.toEqual(normalized)
 })
 
 it("does not turn Core errors into an empty admission view", async () => {

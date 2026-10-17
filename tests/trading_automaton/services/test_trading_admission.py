@@ -95,15 +95,15 @@ def service(core, monotonic=lambda: 10.0):
     [
         (view(), "uid-1", None),
         (view(effective_can_submit=False), "uid-1", "DISARMED"),
-        (view(), "uid-2", "UID_NOT_ALLOWED"),
+        (view(), "uid-2", None),
         (view(configuration_fingerprint="b" * 64), "uid-1", "CONFIGURATION_CHANGED"),
-        (view(recovery_only=True), "uid-1", "STOP_REQUIRED"),
+        (view(recovery_only=True), "uid-1", None),
         (view(recovery_only=True, owner_runtime_instance_id=uuid4()), "uid-1", "NOT_OWNER"),
         (view(owner_generation=None), "uid-1", "NOT_OWNER"),
         (view(owner_runtime_instance_id=uuid4()), "uid-1", "NOT_OWNER"),
     ],
 )
-def test_prepare_fails_closed_unless_current_owner_can_submit_canary(current, uid, expected):
+def test_prepare_requires_current_owner_and_technical_readiness(current, uid, expected):
     result = asyncio.run(service(Core(current)).prepare(uid))
     assert (None if isinstance(result, AdmissionView) else result.value) == expected
 
@@ -111,6 +111,69 @@ def test_prepare_fails_closed_unless_current_owner_can_submit_canary(current, ui
 def test_core_failure_prevents_intent_preparation():
     result = asyncio.run(service(Core(error=TimeoutError())).prepare("uid-1"))
     assert result.value == "CORE_UNAVAILABLE"
+
+
+def test_prepare_accepts_any_automation_uid_without_arm_or_canary_binding():
+    account = view(
+        admission_status=AdmissionStatus.DISARMED,
+        arm_revision=None,
+        arm_expires_at=None,
+        baseline=None,
+        reconciliation=None,
+        recovery_only=False,
+        effective_can_submit=True,
+        effective_denial_reasons=(),
+    )
+
+    result = asyncio.run(service(Core(account)).prepare("uid-2"))
+
+    assert result is account
+
+
+def test_prepare_ignores_legacy_recovery_only_marker():
+    account = view(recovery_only=True, effective_can_submit=True, effective_denial_reasons=())
+
+    result = asyncio.run(service(Core(account)).prepare("uid-1"))
+
+    assert result is account
+
+
+def test_prepare_allows_core_on_demand_baseline_fallback_only_for_sole_baseline_reason():
+    account = view(
+        baseline=None,
+        effective_can_submit=False,
+        effective_denial_reasons=(SubmitDenialReason.BASELINE_REQUIRED,),
+    )
+
+    result = asyncio.run(service(Core(account)).prepare("uid-2"))
+
+    assert result is account
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        (SubmitDenialReason.BASELINE_REQUIRED, SubmitDenialReason.DATA_UNKNOWN),
+        (SubmitDenialReason.DATA_UNKNOWN, SubmitDenialReason.BASELINE_REQUIRED),
+        (SubmitDenialReason.BASELINE_REQUIRED, SubmitDenialReason.NOT_OWNER),
+    ],
+)
+def test_prepare_does_not_bypass_baseline_when_another_core_reason_is_present(reasons):
+    account = view(baseline=None, effective_can_submit=False, effective_denial_reasons=reasons)
+
+    result = asyncio.run(service(Core(account)).prepare("uid-2"))
+
+    assert result is reasons[0]
+
+
+@pytest.mark.parametrize(
+    "account",
+    [view(owner_runtime_instance_id=uuid4()), view(owner_generation=None)],
+)
+def test_prepare_still_requires_current_runtime_owner(account):
+    result = asyncio.run(service(Core(account)).prepare("uid-1"))
+
+    assert result is SubmitDenialReason.NOT_OWNER
 
 
 def test_submit_grant_validates_fingerprint_identity_and_conservative_http_rtt():
@@ -290,6 +353,94 @@ def test_slow_core_round_trip_exhausts_permit_and_returns_proven_abort():
 
     assert result.permit is not None
     assert result.expires_monotonic is None
+    assert result.abort_proof is not None
+    assert result.abort_proof.reason == "PERMIT_EXPIRED_BEFORE_POST"
+
+
+def test_server_processing_metadata_is_subtracted_from_round_trip_once():
+    request = DispatchRequest(
+        idempotency_key="00000000-0000-4000-8000-000000000003",
+        account_id="account",
+        instrument_id="uid-1",
+        side=OrderSide.BUY,
+        quantity_lots=1,
+        limit_price=Decimal("10"),
+        automation_id="00000000-0000-4000-8000-000000000004",
+        lot_size=1,
+        reservation_currency="RUB",
+        broker_id=str(BROKER_ID),
+        market_valid_until=NOW + timedelta(seconds=2),
+        admission_runtime_instance_id=str(RUNTIME_ID),
+        admission_generation=2,
+        admission_revision=5,
+        configuration_fingerprint=FINGERPRINT,
+    )
+
+    def authorize(value):
+        return SubmitPermit(
+            permit_id=uuid4(),
+            runtime_instance_id=RUNTIME_ID,
+            idempotency_key=value.idempotency_key,
+            generation=value.generation,
+            revision=value.revision,
+            configuration_fingerprint=FINGERPRINT,
+            request_fingerprint=submit_request_fingerprint(value),
+            issued_at=NOW,
+            expires_at=NOW + timedelta(seconds=1),
+            server_response_at=NOW,
+            server_processing_ms=800,
+            risk_snapshot_id=uuid4(),
+        )
+
+    samples = iter((10.0, 11.2))
+    result = asyncio.run(
+        service(Core(authorization=authorize), monotonic=lambda: next(samples)).authorize_submit(request)
+    )
+
+    assert result.abort_proof is None
+    assert result.expires_monotonic == pytest.approx(11.8)
+
+
+def test_processing_metadata_greater_than_rtt_falls_back_to_full_rtt():
+    request = DispatchRequest(
+        idempotency_key="00000000-0000-4000-8000-000000000003",
+        account_id="account",
+        instrument_id="uid-1",
+        side=OrderSide.BUY,
+        quantity_lots=1,
+        limit_price=Decimal("10"),
+        automation_id="00000000-0000-4000-8000-000000000004",
+        lot_size=1,
+        reservation_currency="RUB",
+        broker_id=str(BROKER_ID),
+        market_valid_until=NOW + timedelta(seconds=2),
+        admission_runtime_instance_id=str(RUNTIME_ID),
+        admission_generation=2,
+        admission_revision=5,
+        configuration_fingerprint=FINGERPRINT,
+    )
+
+    def authorize(value):
+        return SubmitPermit(
+            permit_id=uuid4(),
+            runtime_instance_id=RUNTIME_ID,
+            idempotency_key=value.idempotency_key,
+            generation=value.generation,
+            revision=value.revision,
+            configuration_fingerprint=FINGERPRINT,
+            request_fingerprint=submit_request_fingerprint(value),
+            issued_at=NOW,
+            expires_at=NOW + timedelta(seconds=1),
+            server_response_at=NOW,
+            server_processing_ms=1500,
+            risk_snapshot_id=uuid4(),
+        )
+
+    samples = iter((10.0, 11.2))
+    result = asyncio.run(
+        service(Core(authorization=authorize), monotonic=lambda: next(samples)).authorize_submit(request)
+    )
+
     assert result.abort_proof is not None
     assert result.abort_proof.reason == "PERMIT_EXPIRED_BEFORE_POST"
 

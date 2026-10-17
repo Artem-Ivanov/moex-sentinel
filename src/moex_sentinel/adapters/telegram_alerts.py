@@ -13,7 +13,7 @@ from pydantic import SecretStr
 
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_MESSAGE_LENGTH = 4096
-REQUEST_TIMEOUT_SECONDS = 5
+REQUEST_TIMEOUT_SECONDS = 5.0
 BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+\Z")
 DeliveryErrorCode = Literal["TIMEOUT", "HTTP_ERROR", "NETWORK_ERROR", "INVALID_RESPONSE", "RESPONSE_TOO_LARGE"]
 T = TypeVar("T")
@@ -38,10 +38,18 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 
 
 class TelegramAlertTransport:
-    def __init__(self, bot_token: SecretStr, chat_id: str, run_sync: SyncRunner) -> None:
+    def __init__(
+        self,
+        bot_token: SecretStr,
+        chat_id: str,
+        run_sync: SyncRunner,
+        *,
+        request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
         self._run_sync = run_sync
+        self._request_timeout_seconds = request_timeout_seconds
 
     async def send_message(self, text: str) -> None:
         if not text or len(text) > MAX_MESSAGE_LENGTH:
@@ -62,7 +70,7 @@ class TelegramAlertTransport:
             opener = build_opener(
                 ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context()), _NoRedirectHandler()
             )
-            with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with opener.open(request, timeout=self._request_timeout_seconds) as response:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
         except TelegramDeliveryError:
             raise
@@ -88,6 +96,10 @@ class TelegramAlertTransport:
 
 
 def create_telegram_alert_transport(
-    *, bot_token: SecretStr, chat_id: str, run_sync: SyncRunner
+    *,
+    bot_token: SecretStr,
+    chat_id: str,
+    run_sync: SyncRunner,
+    request_timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
 ) -> TelegramAlertTransport:
-    return TelegramAlertTransport(bot_token, chat_id, run_sync)
+    return TelegramAlertTransport(bot_token, chat_id, run_sync, request_timeout_seconds=request_timeout_seconds)

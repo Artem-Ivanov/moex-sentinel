@@ -3,12 +3,13 @@
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum, StrEnum
+from typing import Annotated
 
 from pydantic import ConfigDict, Field, model_validator
 
 from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
-from sentinel_contracts.trading_admission import ConfigurationFingerprint, PreRpcAbortProof
+from sentinel_contracts.trading_admission import ConfigurationFingerprint, PreRpcAbortProof, SubmitDenialReason
 
 
 class BrokerOrderStatus(StrEnum):
@@ -88,14 +89,34 @@ class BrokerOrderState(PositionalModel):
     executed_price: Decimal = Decimal()
     executed_at: datetime | None = None
     pre_rpc_abort_proof: PreRpcAbortProof | None = Field(default=None, exclude_if=lambda value: value is None)
+    submit_denial_reason: SubmitDenialReason | None = Field(default=None, exclude_if=lambda value: value is None)
+    submit_authorization_elapsed_ms: Annotated[int, Field(strict=True, ge=0)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    permit_remaining_ms: Annotated[int, Field(strict=True)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
-    def validate_pre_rpc_abort(self):
+    def validate_local_no_send(self):
         proof = self.pre_rpc_abort_proof
-        if proof is None:
+        denial = self.submit_denial_reason
+        if proof is None and denial is None:
             return self
+        if denial is SubmitDenialReason.ALREADY_CONSUMED:
+            raise ValueError("An already-consumed submit cannot be a definite local no-send.")
+        if proof is not None and str(proof.idempotency_key) != self.idempotency_key:
+            raise ValueError("Pre-RPC abort proof requires a matching idempotency key.")
         if (
-            str(proof.idempotency_key) != self.idempotency_key
+            not all(
+                value.is_finite()
+                for value in (
+                    self.requested_amount,
+                    self.executed_amount,
+                    self.executed_commission,
+                    self.executed_price,
+                )
+            )
             or self.status != "CANCELLED"
             or self.broker_order_id
             or self.requested_lots <= 0
@@ -106,7 +127,7 @@ class BrokerOrderState(PositionalModel):
             or self.executed_price != 0
             or self.executed_at is not None
         ):
-            raise ValueError("Pre-RPC abort proof requires a matching, zero-fill cancelled order.")
+            raise ValueError("Local no-send metadata requires a zero-fill cancelled order without a broker ID.")
         return self
 
 

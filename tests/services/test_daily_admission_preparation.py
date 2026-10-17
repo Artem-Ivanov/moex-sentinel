@@ -13,10 +13,7 @@ from moex_sentinel.services import trading_admission as trading_admission_module
 from moex_sentinel.services.trading_admission import TradingAdmissionService
 from moex_sentinel.services.trading_admission_ports import AdmissionInstrument, AdmissionPosition, AdmissionRiskSnapshot
 from sentinel_contracts.broker_execution import BrokerConnection
-from sentinel_contracts.trading_admission import (
-    AdmissionLimits,
-    AdmissionStatus,
-)
+from sentinel_contracts.trading_admission import AdmissionStatus
 
 NOW = datetime(2026, 10, 14, 8, tzinfo=UTC)
 
@@ -27,8 +24,8 @@ class AdmissionStub:
         self.prepared = []
         self.validated = []
 
-    async def prepare_daily(self, broker_id, *, canary_uid):
-        self.prepared.append((broker_id, canary_uid))
+    async def prepare_daily(self, broker_id):
+        self.prepared.append(broker_id)
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -62,7 +59,6 @@ def test_restart_snapshot_is_unknown_and_read_only() -> None:
         broker_id="00000000-0000-4000-8000-000000000001",
         enabled=True,
         environment="PROD",
-        canary_uid="",
         clock=lambda: NOW,
     )
 
@@ -90,7 +86,6 @@ def test_run_prepares_immediately_then_waits_for_day_poll_and_propagates_cancel(
         broker_id="00000000-0000-4000-8000-000000000001",
         enabled=True,
         environment="PROD",
-        canary_uid="",
         clock=lambda: NOW,
         sleep=sleep,
     )
@@ -108,8 +103,34 @@ def test_run_prepares_immediately_then_waits_for_day_poll_and_propagates_cancel(
 
     asyncio.run(scenario())
 
-    assert admission.prepared == [("00000000-0000-4000-8000-000000000001", "")]
+    assert admission.prepared == ["00000000-0000-4000-8000-000000000001"]
     assert delays == [60]
+
+
+def test_run_uses_configured_poll_and_retry_delays() -> None:
+    admission = AdmissionStub(RuntimeError("offline"))
+    delays = []
+
+    async def stop_after_first_wait(seconds):
+        delays.append(seconds)
+        raise RuntimeError("stop test loop")
+
+    service = service_module.DailyAdmissionPreparationService(
+        admission,
+        broker_id="00000000-0000-4000-8000-000000000001",
+        enabled=True,
+        environment="PROD",
+        check_interval_seconds=7,
+        attempt_timeout_seconds=2,
+        retry_delays_seconds=(3, 8),
+        clock=lambda: NOW,
+        sleep=stop_after_first_wait,
+    )
+
+    with pytest.raises(RuntimeError, match="stop test loop"):
+        asyncio.run(service.run())
+
+    assert delays == [3]
 
 
 def test_run_checks_moscow_day_before_retry_deadline_and_retries_on_new_day() -> None:
@@ -117,7 +138,7 @@ def test_run_checks_moscow_day_before_retry_deadline_and_retries_on_new_day() ->
     attempted_at = []
 
     class Admission:
-        async def prepare_daily(self, _broker_id, *, canary_uid):
+        async def prepare_daily(self, _broker_id):
             attempted_at.append(now[0])
             if len(attempted_at) == 3:
                 raise asyncio.CancelledError
@@ -147,7 +168,6 @@ def test_run_checks_moscow_day_before_retry_deadline_and_retries_on_new_day() ->
         broker_id="00000000-0000-4000-8000-000000000001",
         enabled=True,
         environment="PROD",
-        canary_uid="",
         clock=lambda: now[0],
         sleep=advance,
     )
@@ -182,8 +202,8 @@ def test_run_checks_moscow_day_before_retry_deadline_and_retries_on_new_day() ->
         (
             timedelta(seconds=16),
             60,
-            contract.DailyAdmissionPreparationStatus.BLOCKED,
-            contract.DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED,
+            contract.DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
+            None,
         ),
         (
             timedelta(seconds=16),
@@ -216,7 +236,6 @@ def test_validate_daily_preparation_uses_time_after_all_database_reads(
             owner_runtime_instance_id=owner_id,
             owner_generation=1,
             configuration_fingerprint=fingerprint,
-            canary_uid="safe-canary",
             can_arm=True,
             valid_until=validity,
         ),
@@ -244,23 +263,15 @@ def test_validate_daily_preparation_uses_time_after_all_database_reads(
     observation = contract.DailyAdmissionPreparationView(
         moscow_day=NOW.date(),
         captured_at=NOW,
-        status=contract.DailyAdmissionPreparationStatus.PREPARED,
-        reason=contract.DailyAdmissionPreparationReason.ARM_REQUIRED,
+        status=contract.DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
+        reason=None,
         baseline_id=baseline_id,
         owner_runtime_instance_id=owner_id,
         owner_generation=1,
         configuration_fingerprint=fingerprint,
         reconciliation_id=reconciliation_id,
         reconciliation_valid_until=validity,
-        suggested_limits=AdmissionLimits(
-            canary_uid="safe-canary",
-            currency="RUB",
-            max_order_notional=100,
-            exposure_scope="CANARY_UID_GROSS",
-            max_exposure=1000,
-            max_outstanding_orders=1,
-            max_daily_loss=500,
-        ),
+        suggested_limits=None,
         risk_reasons=(),
     )
     reads = 0
@@ -343,7 +354,7 @@ def test_blocked_observation_keeps_snapshot_reason_and_resolved_config_without_b
     accepted = service._daily_with_view(
         view,
         contract.DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
-        contract.DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED,
+        None,
         moscow_day=current_day,
         configuration_fingerprint=connection.configuration_fingerprint,
     )
@@ -351,7 +362,7 @@ def test_blocked_observation_keeps_snapshot_reason_and_resolved_config_without_b
 
     assert accepted.configuration_fingerprint == fingerprint
     assert checked_accepted.status is contract.DailyAdmissionPreparationStatus.BASELINE_ACCEPTED
-    assert checked_accepted.reason is contract.DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED
+    assert checked_accepted.reason is None
 
 
 def test_prepare_daily_revalidates_after_canary_preview(monkeypatch) -> None:
@@ -450,7 +461,7 @@ def test_prepare_daily_revalidates_after_canary_preview(monkeypatch) -> None:
 
     monkeypatch.setattr(trading_admission_module, "run_sync", run_sync)
 
-    result = asyncio.run(service.prepare_daily(broker_id, canary_uid="safe-canary"))
+    result = asyncio.run(service.prepare_daily(broker_id))
 
-    assert result.status is contract.DailyAdmissionPreparationStatus.BLOCKED
-    assert result.reason is contract.DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED
+    assert result.status is contract.DailyAdmissionPreparationStatus.BASELINE_ACCEPTED
+    assert result.reason is None

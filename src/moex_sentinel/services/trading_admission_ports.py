@@ -16,6 +16,8 @@ class AdmissionPosition:
     blocked_units: Decimal
     mark_price: Decimal | None
     currency: str | None
+    lot_size: int | None = None
+    mark_captured_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class AdmissionRiskSnapshot:
     operations_through: datetime | None
     instrument: AdmissionInstrument | None
     unknown_reasons: tuple[str, ...] = ()
+    instruments: tuple[AdmissionInstrument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,7 @@ class AdmissionRiskDataPort(Protocol):
         instrument_uid: str | None,
         operations_from: datetime,
         request_ids: tuple[str, ...] = (),
+        instrument_uids: tuple[str, ...] = (),
     ) -> AdmissionRiskSnapshot: ...
 
     async def estimate_limit_order(

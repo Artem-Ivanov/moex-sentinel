@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from functools import partial
+from time import perf_counter_ns
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -32,11 +33,12 @@ from sentinel_contracts.broker_execution import BrokerConnection
 from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.trading_admission import (
     AdmissionBaseline,
-    AdmissionLimits,
     AdmissionView,
     ArmRequest,
     CaptureBaselineRequest,
     OwnerStoppedRequest,
+    PendingRuntimeCandidate,
+    ReconciliationPositionAnchor,
     ReconciliationRequest,
     ReconciliationResult,
     ReconciliationStatus,
@@ -49,6 +51,7 @@ from sentinel_contracts.trading_admission import (
     SubmitDenied,
     SubmitPermit,
     SubmitReservationState,
+    UpdateLimitsRequest,
 )
 
 OWNER_LEASE_SECONDS = 30
@@ -85,6 +88,14 @@ class TradingAdmissionService:
 
     def view(self, broker_id: str) -> AdmissionView:
         return self._repository.get_view(broker_id, now=self._clock())
+
+    def pending_runtime_candidate(
+        self, broker_id: str, worker_id: str, registered_after: datetime
+    ) -> PendingRuntimeCandidate | None:
+        return self._repository.pending_runtime_candidate(broker_id, worker_id, registered_after)
+
+    def update_limits(self, broker_id: str, request: UpdateLimitsRequest, *, actor: str) -> AdmissionView:
+        return self._repository.update_limits(broker_id, request, actor=actor, now=self._clock())
 
     def renew_owner(self, runtime_instance_id: UUID, generation: int) -> RuntimeRegistrationResult:
         return self._repository.renew_owner(
@@ -179,8 +190,8 @@ class TradingAdmissionService:
             )
         )
 
-    async def prepare_daily(self, broker_id: str, *, canary_uid: str) -> DailyAdmissionPreparationView:
-        """Accept today's baseline idempotently and optionally prepare an unarmed canary."""
+    async def prepare_daily(self, broker_id: str) -> DailyAdmissionPreparationView:
+        """Accept today's loss baseline idempotently; trade admission remains order-scoped."""
         now = self._clock()
         day = now.astimezone(ZoneInfo("Europe/Moscow")).date()
         try:
@@ -268,30 +279,6 @@ class TradingAdmissionService:
                     configuration_fingerprint=connection.configuration_fingerprint,
                 )
 
-        if view.recovery_only or view.admission_status.value == "STOP_REQUIRED":
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.RECOVERY_REQUIRED,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-        if not canary_uid:
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
-                DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-        if view.admission_status.value != "DISARMED":
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.ARM_REQUIRED,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
         if view.baseline is None or view.baseline.moscow_day != day:
             return self._daily_with_view(
                 view,
@@ -300,125 +287,26 @@ class TradingAdmissionService:
                 moscow_day=day,
                 configuration_fingerprint=connection.configuration_fingerprint,
             )
-
-        reconciliation = view.reconciliation
-        if reconciliation is not None and (
-            reconciliation.owner_runtime_instance_id != view.owner_runtime_instance_id
-            or reconciliation.owner_generation != view.owner_generation
-            or reconciliation.configuration_fingerprint != connection.configuration_fingerprint
-            or reconciliation.canary_uid != canary_uid
-            or reconciliation.captured_at.astimezone(ZoneInfo("Europe/Moscow")).date() != day
-        ):
-            reconciliation = None
-        if reconciliation is not None and reconciliation.can_arm and reconciliation.valid_until <= self._clock():
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-
-        if reconciliation is None:
-            request = ReconciliationRequest(expected_revision=view.revision, canary_uid=canary_uid)
-            try:
-                reconciliation = await self.reconcile(
-                    broker_id,
-                    request,
-                    runtime_instance_id=view.owner_runtime_instance_id,
-                    generation=view.owner_generation,
-                    automatic=True,
-                )
-            except (ValueError, AdmissionConflictError):
-                return self._daily_with_view(
-                    view,
-                    DailyAdmissionPreparationStatus.BLOCKED,
-                    DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED,
-                    moscow_day=day,
-                    configuration_fingerprint=connection.configuration_fingerprint,
-                )
-        if not reconciliation.can_arm:
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.RISK_DATA_UNKNOWN,
-                risk_reasons=reconciliation.reasons,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-
-        checkpoint = DailyAdmissionPreparationView(
+        observation = DailyAdmissionPreparationView(
             moscow_day=day,
             captured_at=self._clock(),
             status=DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
-            reason=DailyAdmissionPreparationReason.RECONCILIATION_REQUIRED,
+            reason=None,
             baseline_id=view.baseline.baseline_id,
             owner_runtime_instance_id=view.owner_runtime_instance_id,
             owner_generation=view.owner_generation,
             configuration_fingerprint=connection.configuration_fingerprint,
-            reconciliation_id=reconciliation.reconciliation_id,
-            reconciliation_valid_until=reconciliation.valid_until,
+            reconciliation_id=None,
+            reconciliation_valid_until=None,
             suggested_limits=None,
             risk_reasons=(),
         )
-        checkpoint = await self.validate_daily_preparation(broker_id, checkpoint)
-        if checkpoint.status is not DailyAdmissionPreparationStatus.BASELINE_ACCEPTED:
-            return checkpoint
-
-        preview = await risk.collect(
-            connection,
-            instrument_uid=canary_uid,
-            operations_from=datetime.combine(day, time.min, ZoneInfo("Europe/Moscow")).astimezone(UTC),
-        )
-        now = self._clock()
-        suggested = self._suggested_limits(canary_uid, view.baseline, preview)
-        instrument = preview.instrument
-        market_invalid = (
-            instrument is None
-            or instrument.instrument_uid != canary_uid
-            or not instrument.api_trade_available
-            or instrument.mark_price is None
-            or not instrument.mark_price.is_finite()
-            or instrument.mark_price <= 0
-            or instrument.mark_captured_at is None
-            or instrument.mark_captured_at > now
-            or now - instrument.mark_captured_at > timedelta(seconds=1)
-        )
-        if (
-            suggested is None
-            or preview.account_id != account_id
-            or preview.valid_until <= now
-            or preview.unknown_reasons
-            or market_invalid
-        ):
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.RISK_DATA_UNKNOWN,
-                risk_reasons=(SubmitDenialReason.STALE_MARKET if market_invalid else SubmitDenialReason.DATA_UNKNOWN,),
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-        prepared = DailyAdmissionPreparationView(
-            moscow_day=day,
-            captured_at=now,
-            status=DailyAdmissionPreparationStatus.PREPARED,
-            reason=DailyAdmissionPreparationReason.ARM_REQUIRED,
-            baseline_id=view.baseline.baseline_id,
-            owner_runtime_instance_id=view.owner_runtime_instance_id,
-            owner_generation=view.owner_generation,
-            configuration_fingerprint=connection.configuration_fingerprint,
-            reconciliation_id=reconciliation.reconciliation_id,
-            reconciliation_valid_until=reconciliation.valid_until,
-            suggested_limits=suggested,
-            risk_reasons=(),
-        )
-        return await self.validate_daily_preparation(broker_id, prepared)
+        return await self.validate_daily_preparation(broker_id, observation)
 
     async def validate_daily_preparation(
         self, broker_id: str, observation: DailyAdmissionPreparationView
     ) -> DailyAdmissionPreparationView:
-        """Revalidate a volatile observation against current DB identity and time."""
+        """Revalidate only the automatic daily loss baseline observation."""
         try:
             account_id, environment = await run_sync(partial(self._repository.get_scope, broker_id))
             connection = await run_sync(partial(self._connection, broker_id))
@@ -464,62 +352,7 @@ class TradingAdmissionService:
                 moscow_day=day,
                 configuration_fingerprint=connection.configuration_fingerprint,
             )
-        if view.recovery_only or view.admission_status.value == "STOP_REQUIRED":
-            return self._daily_with_view(
-                view,
-                DailyAdmissionPreparationStatus.BLOCKED,
-                DailyAdmissionPreparationReason.RECOVERY_REQUIRED,
-                moscow_day=day,
-                configuration_fingerprint=connection.configuration_fingerprint,
-            )
-        if observation.status is DailyAdmissionPreparationStatus.PREPARED:
-            if (
-                observation.owner_runtime_instance_id != view.owner_runtime_instance_id
-                or observation.owner_generation != view.owner_generation
-            ):
-                return self._daily_with_view(
-                    view,
-                    DailyAdmissionPreparationStatus.BLOCKED,
-                    DailyAdmissionPreparationReason.OWNER_MISMATCH,
-                    moscow_day=day,
-                    configuration_fingerprint=connection.configuration_fingerprint,
-                )
-            if (
-                view.baseline is None
-                or view.baseline.moscow_day != day
-                or observation.baseline_id != view.baseline.baseline_id
-            ):
-                return self._daily_with_view(
-                    view,
-                    DailyAdmissionPreparationStatus.WAITING,
-                    DailyAdmissionPreparationReason.BASELINE_REQUIRED,
-                    moscow_day=day,
-                    configuration_fingerprint=connection.configuration_fingerprint,
-                )
-        elif observation.status is DailyAdmissionPreparationStatus.BASELINE_ACCEPTED:
-            if (
-                view.baseline is None
-                or view.baseline.moscow_day != day
-                or observation.baseline_id != view.baseline.baseline_id
-            ):
-                return self._daily_with_view(
-                    view,
-                    DailyAdmissionPreparationStatus.WAITING,
-                    DailyAdmissionPreparationReason.BASELINE_REQUIRED,
-                    moscow_day=day,
-                    configuration_fingerprint=connection.configuration_fingerprint,
-                )
-        configuration_changed = (
-            observation.configuration_fingerprint != connection.configuration_fingerprint
-            if observation.status
-            in {
-                DailyAdmissionPreparationStatus.PREPARED,
-                DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
-            }
-            else observation.configuration_fingerprint is not None
-            and observation.configuration_fingerprint != connection.configuration_fingerprint
-        )
-        if configuration_changed:
+        if observation.configuration_fingerprint != connection.configuration_fingerprint:
             return self._daily_with_view(
                 view,
                 DailyAdmissionPreparationStatus.BLOCKED,
@@ -527,37 +360,20 @@ class TradingAdmissionService:
                 moscow_day=day,
                 configuration_fingerprint=connection.configuration_fingerprint,
             )
+        if observation.status is not DailyAdmissionPreparationStatus.BASELINE_ACCEPTED:
+            return observation
         if (
-            observation.status
-            in {
-                DailyAdmissionPreparationStatus.PREPARED,
-                DailyAdmissionPreparationStatus.BASELINE_ACCEPTED,
-            }
-            and observation.reconciliation_id is not None
+            view.baseline is None
+            or view.baseline.moscow_day != day
+            or observation.baseline_id != view.baseline.baseline_id
         ):
-            reconciliation = view.reconciliation
-            if (
-                reconciliation is None
-                or reconciliation.reconciliation_id != observation.reconciliation_id
-                or not reconciliation.can_arm
-                or reconciliation.owner_runtime_instance_id != view.owner_runtime_instance_id
-                or reconciliation.owner_generation != view.owner_generation
-                or reconciliation.configuration_fingerprint != connection.configuration_fingerprint
-                or reconciliation.valid_until != observation.reconciliation_valid_until
-                or reconciliation.valid_until <= now
-                or (
-                    observation.suggested_limits is not None
-                    and reconciliation.canary_uid != observation.suggested_limits.canary_uid
-                )
-                or view.admission_status.value != "DISARMED"
-            ):
-                return self._daily_with_view(
-                    view,
-                    DailyAdmissionPreparationStatus.BLOCKED,
-                    DailyAdmissionPreparationReason.RECONCILIATION_EXPIRED,
-                    moscow_day=day,
-                    configuration_fingerprint=connection.configuration_fingerprint,
-                )
+            return self._daily_with_view(
+                view,
+                DailyAdmissionPreparationStatus.WAITING,
+                DailyAdmissionPreparationReason.BASELINE_REQUIRED,
+                moscow_day=day,
+                configuration_fingerprint=connection.configuration_fingerprint,
+            )
         return observation
 
     def _daily_baseline(self, broker_id, account_id, day, snapshot, *, accepted_at):
@@ -612,37 +428,43 @@ class TradingAdmissionService:
             policy="FIRST_ACCEPTED_ACCOUNT_EQUITY",
         )
 
-    @staticmethod
-    def _suggested_limits(canary_uid, baseline, snapshot):
-        cash_values = (snapshot.money, snapshot.blocked_cash)
+    async def _ensure_submit_baseline(self, broker_id: str, context) -> None:
+        now = self._clock()
+        day = now.astimezone(ZoneInfo("Europe/Moscow")).date()
+        if context.baseline is not None and context.baseline.moscow_day == day:
+            return
         if (
-            baseline is None
-            or baseline.equity <= 0
-            or snapshot.equity is None
-            or snapshot.equity <= 0
-            or snapshot.equity_currency != "RUB"
-            or not snapshot.money_loaded
-            or any(value is None or not value.is_finite() for value in cash_values)
-            or snapshot.money_currency != "RUB"
-            or snapshot.blocked_cash_currency != "RUB"
-            or snapshot.money < 0
-            or snapshot.blocked_cash < 0
-            or snapshot.blocked_cash > snapshot.money
-            or any(not item.quantity_units.is_finite() or item.quantity_units < 0 for item in snapshot.positions)
+            context.owner_runtime_instance_id is None
+            or context.owner_generation is None
+            or context.owner_access_mode != "TRADE"
+            or not context.owner_strategy_enabled
+            or context.lease_expires_at is None
+            or context.lease_expires_at <= now
         ):
-            return None
-        free_cash = snapshot.money - snapshot.blocked_cash
-        positive_positions = sum(1 for position in snapshot.positions if position.quantity_units > 0)
-        if free_cash <= 0 or positive_positions <= 0:
-            return None
-        return AdmissionLimits(
-            canary_uid=canary_uid,
-            currency="RUB",
-            max_order_notional=free_cash,
-            exposure_scope="CANARY_UID_GROSS",
-            max_exposure=snapshot.equity,
-            max_outstanding_orders=positive_positions,
-            max_daily_loss=baseline.equity * Decimal("0.05"),
+            raise ValueError("Current trade owner is unavailable for daily baseline capture.")
+        account_id, environment = await run_sync(partial(self._repository.get_scope, broker_id))
+        connection = await run_sync(partial(self._connection, broker_id))
+        if environment != "PROD" or connection.environment != "PROD" or connection.access_mode != "TRADE":
+            raise ValueError("Daily baseline requires the configured PROD TRADE account.")
+        if (
+            context.configuration_fingerprint
+            and connection.configuration_fingerprint != context.configuration_fingerprint
+        ):
+            raise ValueError("Broker configuration changed before daily baseline capture.")
+        start = datetime.combine(day, time.min, ZoneInfo("Europe/Moscow")).astimezone(UTC)
+        snapshot = await self._require_risk().collect(connection, instrument_uid=None, operations_from=start)
+        accepted_at = self._clock()
+        baseline = self._daily_baseline(broker_id, account_id, day, snapshot, accepted_at=accepted_at)
+        await run_sync(
+            partial(
+                self._repository.ensure_daily_baseline,
+                baseline,
+                configuration_fingerprint=connection.configuration_fingerprint,
+                expected_owner_runtime_instance_id=context.owner_runtime_instance_id,
+                expected_generation=context.owner_generation,
+                snapshot_valid_until=snapshot.valid_until,
+                final_clock=self._clock,
+            )
         )
 
     @staticmethod
@@ -751,26 +573,39 @@ class TradingAdmissionService:
         if any(not state.attributable or state.unknown_reason for state in snapshot.order_states):
             reasons.append(SubmitDenialReason.DATA_UNKNOWN)
         unresolved_count = await run_sync(partial(self._repository.unresolved_reservation_count, broker_id))
-        position_units = None
-        scope = "ACCOUNT" if request.canary_uid is None else "CANARY_UID"
-        if request.canary_uid is not None:
-            if snapshot.instrument is None or snapshot.instrument.instrument_uid != request.canary_uid:
+        scope = "ACCOUNT"
+        position_anchors = []
+        seen_uids = set()
+        for position in snapshot.positions:
+            if position.instrument_uid in seen_uids:
                 reasons.append(SubmitDenialReason.DATA_UNKNOWN)
-            matching = [item for item in snapshot.positions if item.instrument_uid == request.canary_uid]
-            if len(matching) > 1 or (
-                matching
-                and (
-                    matching[0].currency != "RUB"
-                    or not matching[0].quantity_units.is_finite()
-                    or not matching[0].blocked_units.is_finite()
-                    or matching[0].quantity_units < 0
-                    or matching[0].blocked_units < 0
-                    or matching[0].blocked_units > matching[0].quantity_units
-                )
+                break
+            seen_uids.add(position.instrument_uid)
+            if (
+                position.currency != "RUB"
+                or not position.quantity_units.is_finite()
+                or not position.blocked_units.is_finite()
+                or position.quantity_units < 0
+                or position.blocked_units < 0
+                or position.blocked_units > position.quantity_units
+                or position.lot_size is None
+                or position.lot_size <= 0
+                or position.mark_price is None
+                or not position.mark_price.is_finite()
+                or position.mark_price <= 0
+                or position.mark_captured_at is None
+                or position.mark_captured_at > now
+                or now - position.mark_captured_at > timedelta(seconds=1)
             ):
                 reasons.append(SubmitDenialReason.DATA_UNKNOWN)
-            else:
-                position_units = Decimal(0) if not matching else matching[0].quantity_units
+                break
+            position_anchors.append(
+                ReconciliationPositionAnchor(
+                    instrument_uid=position.instrument_uid,
+                    quantity_units=position.quantity_units,
+                    lot_size=position.lot_size,
+                )
+            )
         if (
             snapshot.equity is None
             or not snapshot.equity.is_finite()
@@ -782,7 +617,7 @@ class TradingAdmissionService:
         status = (
             ReconciliationStatus.DATA_UNKNOWN
             if SubmitDenialReason.DATA_UNKNOWN in reasons
-            else ReconciliationStatus.CANARY_READY if scope == "CANARY_UID" else ReconciliationStatus.ACCOUNT_ONLY
+            else ReconciliationStatus.ACCOUNT_ONLY
         )
         result = ReconciliationResult(
             reconciliation_id=uuid4(),
@@ -793,16 +628,17 @@ class TradingAdmissionService:
             owner_generation=generation,
             configuration_fingerprint=connection.configuration_fingerprint,
             status=status,
-            canary_uid=request.canary_uid,
+            canary_uid=None,
             captured_at=snapshot.captured_at,
             valid_until=valid_until,
-            can_arm=status is ReconciliationStatus.CANARY_READY and not reasons,
-            position_anchor_units=position_units,
+            can_arm=status is ReconciliationStatus.ACCOUNT_ONLY and not reasons,
+            position_anchor_units=None,
             active_ordinary_order_count=len(active_ordinary_orders),
             active_stop_order_count=len(snapshot.stop_orders),
             unresolved_reservation_count=unresolved_count,
             reasons=tuple(dict.fromkeys(reasons)),
             risk_snapshot_id=UUID(snapshot.snapshot_id),
+            position_anchors=tuple(position_anchors),
         )
         if automatic and not result.can_arm:
             return result
@@ -842,6 +678,7 @@ class TradingAdmissionService:
         runtime_instance_id: UUID,
         generation: int,
     ) -> SubmitAuthorizationResult:
+        processing_started_ns = perf_counter_ns()
         broker_id = str(request.broker_id)
         try:
             prior_attempt = await run_sync(
@@ -879,21 +716,24 @@ class TradingAdmissionService:
             or not context.owner_strategy_enabled
         ):
             return SubmitDenied(reason=SubmitDenialReason.NOT_OWNER, outcome_uncertain=False)
-        if context.recovery_only:
-            return SubmitDenied(reason=SubmitDenialReason.STOP_REQUIRED, outcome_uncertain=False)
+        now = self._clock()
+        current_day = now.astimezone(ZoneInfo("Europe/Moscow")).date()
+        if context.baseline is None or context.baseline.moscow_day != current_day:
+            try:
+                await self._ensure_submit_baseline(broker_id, context)
+            except (ValueError, AdmissionConflictError):
+                return SubmitDenied(reason=SubmitDenialReason.BASELINE_REQUIRED, outcome_uncertain=False)
+            return SubmitDenied(reason=SubmitDenialReason.BASELINE_REQUIRED, outcome_uncertain=False)
         if request.lot_size != context.lot_size or request.currency != context.currency:
             return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
-        if (
-            context.revision != request.revision
-            or context.arm_revision != request.revision
-            or context.admission_status != "ARMED"
-            or context.limits is None
-            or context.baseline is None
-            or context.reconciliation is None
-        ):
+        if context.revision != request.revision:
             return SubmitDenied(reason=SubmitDenialReason.DISARMED, outcome_uncertain=False)
-        if request.instrument_uid != context.limits.canary_uid:
-            return SubmitDenied(reason=SubmitDenialReason.UID_NOT_ALLOWED, outcome_uncertain=False)
+        if context.automation_state != "IN_WORK":
+            return SubmitDenied(reason=SubmitDenialReason.AUTOMATION_NOT_ACTIVE, outcome_uncertain=False)
+        if context.limits is None:
+            return SubmitDenied(reason=SubmitDenialReason.LIMITS_NOT_CONFIGURED, outcome_uncertain=False)
+        if context.baseline is None:
+            return SubmitDenied(reason=SubmitDenialReason.BASELINE_REQUIRED, outcome_uncertain=False)
         connection = await run_sync(partial(self._connection, broker_id))
         if (
             not connection.configuration_fingerprint
@@ -901,13 +741,7 @@ class TradingAdmissionService:
             or connection.configuration_fingerprint != context.configuration_fingerprint
         ):
             return SubmitDenied(reason=SubmitDenialReason.CONFIGURATION_CHANGED, outcome_uncertain=False)
-        now = self._clock()
-        if (
-            context.lease_expires_at is None
-            or context.lease_expires_at <= now
-            or context.arm_expires_at is None
-            or context.arm_expires_at <= now
-        ):
+        if context.lease_expires_at is None or context.lease_expires_at <= now:
             return SubmitDenied(reason=SubmitDenialReason.LEASE_EXPIRED, outcome_uncertain=False)
         if request.submit_deadline <= now or request.market_valid_until <= now:
             return SubmitDenied(reason=SubmitDenialReason.STALE_MARKET, outcome_uncertain=False)
@@ -933,6 +767,15 @@ class TradingAdmissionService:
                 for item in context.reservations
                 if item.state in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
             ),
+            instrument_uids=tuple(
+                sorted(
+                    {
+                        item.instrument_uid
+                        for item in context.reservations
+                        if item.state in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
+                    }
+                )
+            ),
         )
         estimate = await risk.estimate_limit_order(
             connection,
@@ -946,12 +789,17 @@ class TradingAdmissionService:
         if isinstance(safe_snapshot, SubmitDenialReason):
             return SubmitDenied(reason=safe_snapshot, outcome_uncertain=False)
 
-        quote_notional, quote_fee, position_units, blocked_units, mark_price = safe_snapshot
+        quote_notional, quote_fee, positions_by_uid, instruments_by_uid = safe_snapshot
         limits = context.limits
-        reservation_projection = self._project_submit_reservations(context, snapshot, position_units)
+        reservation_projection = self._project_submit_reservations(
+            context, snapshot, positions_by_uid, instruments_by_uid
+        )
         if isinstance(reservation_projection, SubmitDenialReason):
             return SubmitDenied(reason=reservation_projection, outcome_uncertain=False)
         effective_reservations = reservation_projection
+        selected_position = positions_by_uid.get(request.instrument_uid, (Decimal(0), Decimal(0)))
+        position_units, blocked_units = selected_position
+        mark_price = instruments_by_uid[request.instrument_uid].mark_price
         units = Decimal(context.lot_size * request.quantity_lots)
         if request.limit_price % context.min_price_increment != 0:
             return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
@@ -1024,17 +872,28 @@ class TradingAdmissionService:
             if available_units < units:
                 return SubmitDenied(reason=SubmitDenialReason.INSUFFICIENT_POSITION, outcome_uncertain=False)
 
-        mark_exposure = position_units * mark_price
+        mark_exposure = sum(
+            (
+                quantity * instruments_by_uid[uid].mark_price
+                for uid, (quantity, _) in positions_by_uid.items()
+                if quantity > 0
+            ),
+            Decimal(0),
+        )
         existing_buy_exposure = sum(
             (
                 max(
                     item.requested_amount
                     * Decimal(max(0, item.quantity_lots - item.executed_lots))
                     / Decimal(item.quantity_lots),
-                    Decimal(max(0, item.quantity_lots - item.executed_lots) * context.lot_size) * mark_price,
+                    Decimal(
+                        max(0, item.quantity_lots - item.executed_lots)
+                        * instruments_by_uid[item.instrument_uid].lot_size
+                    )
+                    * instruments_by_uid[item.instrument_uid].mark_price,
                 )
                 for item in unsettled
-                if item.side == "BUY" and item.instrument_uid == request.instrument_uid
+                if item.side == "BUY"
             ),
             Decimal(0),
         )
@@ -1044,13 +903,30 @@ class TradingAdmissionService:
 
         expires_at = min(
             context.lease_expires_at,
-            context.arm_expires_at,
             request.market_valid_until,
             request.submit_deadline,
             checked_at + timedelta(seconds=1),
         )
         if expires_at <= checked_at:
             return SubmitDenied(reason=SubmitDenialReason.STALE_MARKET, outcome_uncertain=False)
+        risk_position_anchors = self._position_anchors(snapshot, context)
+        risk_anchor_uids = {item.instrument_uid for item in risk_position_anchors}
+        if any(item.instrument_uid not in risk_anchor_uids for item in context.reservations):
+            return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
+        required_mark_uids = {
+            request.instrument_uid,
+            *(uid for uid, (quantity, _) in positions_by_uid.items() if quantity > 0),
+            *(item.instrument_uid for item in unsettled),
+        }
+        risk_instruments = instruments_by_uid
+        if any(
+            uid not in risk_instruments or risk_instruments[uid].mark_captured_at is None for uid in required_mark_uids
+        ):
+            return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
+        snapshot_valid_until = min(
+            [snapshot.valid_until]
+            + [risk_instruments[uid].mark_captured_at + timedelta(seconds=1) for uid in required_mark_uids]
+        )
         grant = await run_sync(
             partial(
                 self._repository.grant_submit,
@@ -1059,12 +935,9 @@ class TradingAdmissionService:
                 generation=generation,
                 final_clock=self._clock,
                 risk_snapshot_captured_at=snapshot.captured_at,
-                risk_snapshot_valid_until=min(
-                    snapshot.valid_until,
-                    snapshot.instrument.mark_captured_at + timedelta(seconds=1),
-                ),
+                risk_snapshot_valid_until=snapshot_valid_until,
                 risk_instrument=snapshot.instrument,
-                risk_position_anchor_units=position_units,
+                risk_position_anchors=risk_position_anchors,
                 order_states=snapshot.order_states,
                 risk_snapshot_id=UUID(snapshot.snapshot_id),
                 reserved_cash=quote_notional + quote_fee if request.side == "BUY" else Decimal(0),
@@ -1081,6 +954,7 @@ class TradingAdmissionService:
                 **{
                     **grant.model_dump(),
                     "server_response_at": server_response_at,
+                    "server_processing_ms": max(0, (perf_counter_ns() - processing_started_ns) // 1_000_000),
                 }
             )
         except ValueError:
@@ -1100,43 +974,115 @@ class TradingAdmissionService:
             )
 
     @staticmethod
+    def _position_anchors(snapshot: AdmissionRiskSnapshot, context=None) -> tuple[ReconciliationPositionAnchor, ...]:
+        """Anchor every freshly valued UID, including zero holdings for first fills."""
+        positions = {item.instrument_uid: item for item in snapshot.positions}
+        instruments = {item.instrument_uid: item for item in snapshot.instruments}
+        if snapshot.instrument is not None:
+            instruments[snapshot.instrument.instrument_uid] = snapshot.instrument
+        anchors = []
+        for uid, instrument in instruments.items():
+            position = positions.get(uid)
+            anchors.append(
+                ReconciliationPositionAnchor(
+                    instrument_uid=uid,
+                    quantity_units=Decimal(0) if position is None else position.quantity_units,
+                    lot_size=instrument.lot_size,
+                )
+            )
+        anchored_uids = {item.instrument_uid for item in anchors}
+        reconciliation = None if context is None else context.reconciliation
+        previous_anchors = (
+            {} if reconciliation is None else {item.instrument_uid: item for item in reconciliation.position_anchors}
+        )
+        for reservation in (() if context is None else context.reservations):
+            if reservation.state != SubmitReservationState.SETTLED.value or reservation.instrument_uid in anchored_uids:
+                continue
+            prior = previous_anchors.get(reservation.instrument_uid)
+            if prior is None:
+                continue
+            # Fresh complete positions omit a closed UID. Preserve its known lot
+            # for settled-history accounting without requiring a dead market quote.
+            anchors.append(
+                ReconciliationPositionAnchor(
+                    instrument_uid=reservation.instrument_uid,
+                    quantity_units=Decimal(0),
+                    lot_size=prior.lot_size,
+                )
+            )
+            anchored_uids.add(reservation.instrument_uid)
+        return tuple(anchors)
+
+    @staticmethod
     def _active_orders(orders: tuple[AdmissionOrder, ...]) -> tuple[AdmissionOrder, ...]:
         terminal = {"EXECUTED", "FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
         return tuple(order for order in orders if order.status.upper() not in terminal)
 
     @staticmethod
-    def _project_submit_reservations(context, snapshot, current_units):
+    def _project_submit_reservations(context, snapshot, current_positions, instruments_by_uid=None):
+        unsettled_items = [
+            item for item in context.reservations if item.state in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
+        ]
+        if not unsettled_items:
+            return context.reservations
         reconciliation = context.reconciliation
-        if reconciliation is None or reconciliation.position_anchor_units is None:
+        if reconciliation is None:
             return SubmitDenialReason.DATA_UNKNOWN
         anchor_id = str(reconciliation.reconciliation_id)
-        unsettled = {
-            item.idempotency_key: item
-            for item in context.reservations
-            if item.state in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
-        }
+        anchors = {item.instrument_uid: item for item in reconciliation.position_anchors}
+        legacy_scalar_anchor = not anchors
+        if legacy_scalar_anchor:
+            legacy_uid = reconciliation.canary_uid
+            legacy_units = reconciliation.position_anchor_units
+            current_value = current_positions.get(legacy_uid) if legacy_uid is not None else None
+            current_instrument = (instruments_by_uid or {}).get(legacy_uid)
+            reservations_match = all(item.instrument_uid == legacy_uid for item in context.reservations)
+            if (
+                reconciliation.scope != "CANARY_UID"
+                or reconciliation.status is not ReconciliationStatus.CANARY_READY
+                or not legacy_uid
+                or legacy_units is None
+                or not legacy_units.is_finite()
+                or legacy_units < 0
+                or current_value is None
+                or current_instrument is None
+                or type(current_instrument.lot_size) is not int
+                or current_instrument.lot_size <= 0
+                or not reservations_match
+            ):
+                return SubmitDenialReason.DATA_UNKNOWN
+            anchors[legacy_uid] = ReconciliationPositionAnchor(
+                instrument_uid=legacy_uid,
+                quantity_units=legacy_units,
+                lot_size=current_instrument.lot_size,
+            )
+        unsettled = {item.idempotency_key: item for item in unsettled_items}
         states_by_key: dict[str, list[AdmissionOrderState]] = {}
         for state in snapshot.order_states:
             states_by_key.setdefault(state.request_id, []).append(state)
         if set(states_by_key) != set(unsettled) or any(len(items) != 1 for items in states_by_key.values()):
             return SubmitDenialReason.DATA_UNKNOWN
 
-        expected_units = reconciliation.position_anchor_units
+        expected_units = {uid: anchor.quantity_units for uid, anchor in anchors.items()}
         projections = {item.idempotency_key: item for item in context.reservations}
         active_state_keys: set[str] = set()
         terminal_states = {"FILLED", "CANCELLED", "REJECTED"}
         active_states = {"NEW", "PARTIALLYFILL", "PARTIALLY_FILLED"}
         for item in context.reservations:
-            if item.anchor_reconciliation_id != anchor_id:
+            if item.state != SubmitReservationState.SETTLED.value:
                 continue
-            if item.state not in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}:
-                delta_lots = item.executed_lots - item.anchor_executed_lots
-                if delta_lots < 0:
-                    return SubmitDenialReason.DATA_UNKNOWN
-                sign = Decimal(1) if item.side == "BUY" else Decimal(-1)
-                expected_units += sign * Decimal(delta_lots * context.lot_size)
-                continue
-
+            anchor = anchors.get(item.instrument_uid)
+            if anchor is None or item.anchor_reconciliation_id != anchor_id:
+                return SubmitDenialReason.DATA_UNKNOWN
+            delta_lots = item.executed_lots - item.anchor_executed_lots
+            if delta_lots < 0:
+                return SubmitDenialReason.DATA_UNKNOWN
+            sign = Decimal(1) if item.side == "BUY" else Decimal(-1)
+            expected_units[item.instrument_uid] += sign * Decimal(delta_lots * anchor.lot_size)
+        for item in unsettled_items:
+            anchor = anchors.get(item.instrument_uid)
+            if anchor is None or item.anchor_reconciliation_id != anchor_id:
+                return SubmitDenialReason.DATA_UNKNOWN
             state = states_by_key[item.idempotency_key][0]
             status = state.status.upper()
             if (
@@ -1167,42 +1113,38 @@ class TradingAdmissionService:
             if delta_lots < 0:
                 return SubmitDenialReason.DATA_UNKNOWN
             sign = Decimal(1) if item.side == "BUY" else Decimal(-1)
-            expected_units += sign * Decimal(delta_lots * context.lot_size)
+            expected_units[item.instrument_uid] += sign * Decimal(delta_lots * anchor.lot_size)
             is_terminal = status in terminal_states
             if not is_terminal:
                 active_state_keys.add(item.idempotency_key)
-            if is_terminal:
-                projections[item.idempotency_key] = replace(
-                    item,
-                    state=SubmitReservationState.SETTLED.value,
-                    reserved_cash=Decimal(0),
-                    reserved_position_units=Decimal(0),
-                    executed_lots=state.executed_lots,
-                    executed_amount=state.executed_amount,
-                    executed_commission=state.executed_commission,
-                )
-            else:
-                delta_amount = state.executed_amount - item.executed_amount
-                delta_commission = state.executed_commission - item.executed_commission
-                projections[item.idempotency_key] = replace(
-                    item,
-                    state=SubmitReservationState.BROKER_ACTIVE.value,
-                    reserved_cash=(
-                        max(Decimal(0), item.reserved_cash - delta_amount - delta_commission)
-                        if item.side == "BUY"
-                        else Decimal(0)
-                    ),
-                    reserved_position_units=(
-                        Decimal((item.quantity_lots - state.executed_lots) * context.lot_size)
-                        if item.side == "SELL"
-                        else Decimal(0)
-                    ),
-                    executed_lots=state.executed_lots,
-                    executed_amount=state.executed_amount,
-                    executed_commission=state.executed_commission,
-                )
+            projections[item.idempotency_key] = replace(
+                item,
+                state=(
+                    SubmitReservationState.SETTLED.value if is_terminal else SubmitReservationState.BROKER_ACTIVE.value
+                ),
+                reserved_cash=(
+                    Decimal(0)
+                    if is_terminal or item.side != "BUY"
+                    else max(
+                        Decimal(0),
+                        item.reserved_cash
+                        - (state.executed_amount - item.executed_amount)
+                        - (state.executed_commission - item.executed_commission),
+                    )
+                ),
+                reserved_position_units=(
+                    Decimal(0)
+                    if is_terminal or item.side != "SELL"
+                    else Decimal((item.quantity_lots - state.executed_lots) * anchor.lot_size)
+                ),
+                executed_lots=state.executed_lots,
+                executed_amount=state.executed_amount,
+                executed_commission=state.executed_commission,
+            )
 
-        if expected_units != current_units:
+        current = {uid: units for uid, (units, _) in current_positions.items()}
+        current_keys = set(expected_units) if legacy_scalar_anchor else set(expected_units) | set(current)
+        if any(expected_units.get(uid, Decimal(0)) != current.get(uid, Decimal(0)) for uid in current_keys):
             return SubmitDenialReason.DATA_UNKNOWN
         active_order_keys = {
             order.request_id
@@ -1284,19 +1226,61 @@ class TradingAdmissionService:
             or checked_at - instrument.mark_captured_at > timedelta(seconds=1)
         ):
             return SubmitDenialReason.DATA_UNKNOWN
-        positions = [item for item in snapshot.positions if item.instrument_uid == request.instrument_uid]
-        if len(positions) > 1 or (positions and positions[0].currency != "RUB"):
-            return SubmitDenialReason.DATA_UNKNOWN
-        if positions and (
-            not positions[0].quantity_units.is_finite()
-            or not positions[0].blocked_units.is_finite()
-            or positions[0].quantity_units < 0
-            or positions[0].blocked_units < 0
-        ):
-            return SubmitDenialReason.DATA_UNKNOWN
-        quantity = Decimal(0) if not positions else positions[0].quantity_units
-        blocked = Decimal(0) if not positions else positions[0].blocked_units
-        return estimate.initial_order_amount, estimate.total_commission, quantity, blocked, instrument.mark_price
+        instruments = {item.instrument_uid: item for item in snapshot.instruments}
+        instruments.setdefault(instrument.instrument_uid, instrument)
+        positions_by_uid = {}
+        for position in snapshot.positions:
+            if position.instrument_uid in positions_by_uid:
+                return SubmitDenialReason.DATA_UNKNOWN
+            if (
+                position.currency != "RUB"
+                or not position.quantity_units.is_finite()
+                or not position.blocked_units.is_finite()
+                or position.quantity_units < 0
+                or position.blocked_units < 0
+                or position.blocked_units > position.quantity_units
+            ):
+                return SubmitDenialReason.DATA_UNKNOWN
+            if position.quantity_units > 0:
+                if (
+                    position.mark_price is None
+                    or not position.mark_price.is_finite()
+                    or position.mark_price <= 0
+                    or position.lot_size is None
+                    or position.lot_size <= 0
+                    or position.mark_captured_at is None
+                    or position.mark_captured_at > checked_at
+                    or checked_at - position.mark_captured_at > timedelta(seconds=1)
+                ):
+                    return SubmitDenialReason.DATA_UNKNOWN
+                held_instrument = instruments.get(position.instrument_uid)
+                if (
+                    held_instrument is None
+                    or held_instrument.currency != "RUB"
+                    or held_instrument.instrument_type.upper() not in {"SHARE", "FUND"}
+                    or held_instrument.lot_size != position.lot_size
+                    or held_instrument.mark_price != position.mark_price
+                ):
+                    return SubmitDenialReason.DATA_UNKNOWN
+            positions_by_uid[position.instrument_uid] = (position.quantity_units, position.blocked_units)
+        for reservation in getattr(context, "reservations", ()):
+            if reservation.state not in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}:
+                continue
+            reserved_instrument = instruments.get(reservation.instrument_uid)
+            if (
+                reserved_instrument is None
+                or reserved_instrument.currency != "RUB"
+                or reserved_instrument.instrument_type.upper() not in {"SHARE", "FUND"}
+                or reserved_instrument.mark_price is None
+                or not reserved_instrument.mark_price.is_finite()
+                or reserved_instrument.mark_price <= 0
+                or reserved_instrument.lot_size <= 0
+                or reserved_instrument.mark_captured_at is None
+                or reserved_instrument.mark_captured_at > checked_at
+                or checked_at - reserved_instrument.mark_captured_at > timedelta(seconds=1)
+            ):
+                return SubmitDenialReason.DATA_UNKNOWN
+        return estimate.initial_order_amount, estimate.total_commission, positions_by_uid, instruments
 
     def _require_risk(self) -> AdmissionRiskDataPort:
         if self._risk is None:

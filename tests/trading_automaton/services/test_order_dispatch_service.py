@@ -13,12 +13,14 @@ from sentinel_contracts.business_audit import BusinessAuditStage
 from sentinel_contracts.trading_admission import (
     PreRpcAbortProof,
     SubmitAuthorizationRequest,
+    SubmitDenialReason,
     submit_request_fingerprint,
 )
 from sentinel_contracts.trading_facts import FactKind
 from tests.trading_automaton.command_factory import command as baseline_command
 from tests.trading_automaton.command_factory import decision_item
 from trading_automaton.domain.errors import CoreOperationError
+from trading_automaton.services.business_audit import BusinessAuditService
 from trading_automaton.services.order_dispatch import (
     DispatchRequest,
     OrderDispatchService,
@@ -126,6 +128,56 @@ def test_expired_market_cancels_persisted_intent_without_broker_call(delay_in_au
         assert started.done()
 
     asyncio.run(scenario())
+
+
+def test_definitive_submit_denial_reason_and_timings_are_audited_without_raw_details():
+    async def scenario():
+        release = asyncio.Event()
+        release.set()
+        response = BrokerOrderState(
+            broker_order_id="",
+            idempotency_key="intent-1",
+            status="CANCELLED",
+            requested_lots=1,
+            executed_lots=0,
+            requested_amount=Decimal("100"),
+            executed_amount=Decimal(),
+            estimated_commission=Decimal("1"),
+            executed_commission=Decimal(),
+            currency="RUB",
+            submit_denial_reason=SubmitDenialReason.EXPOSURE_EXCEEDED,
+            submit_authorization_elapsed_ms=812,
+            permit_remaining_ms=-9,
+        )
+
+        class DeniedBroker(Broker):
+            async def dispatch_limit_order(self, request_value):
+                self.dispatch_request = request_value
+                self.called.set()
+                return response
+
+        broker = DeniedBroker(release)
+        records = []
+
+        class AuditRepository:
+            def append_audit_events(self, events):
+                records.extend(events)
+
+        audit = BusinessAuditService(AuditRepository(), now=lambda: NOW)
+        service = OrderDispatchService(Repository(), broker, now=lambda: NOW, audit=audit, access_mode="TRADE")
+        result = await service.dispatch(
+            request().model_copy(update={"process_id": "process"}), asyncio.get_running_loop().create_future()
+        )
+        return result, records
+
+    result, records = asyncio.run(scenario())
+
+    assert result.submit_denial_reason is SubmitDenialReason.EXPOSURE_EXCEEDED
+    audit_result = records[-1].data
+    assert audit_result["submit_denial_reason"] == "EXPOSURE_EXCEEDED"
+    assert audit_result["submit_authorization_elapsed_ms"] == 812
+    assert audit_result["permit_remaining_ms"] == -9
+    assert audit_result["pre_rpc_abort_reason"] is None
 
 
 def test_expired_prod_retry_with_ambiguous_consumed_key_stays_uncertain_without_false_cancel():

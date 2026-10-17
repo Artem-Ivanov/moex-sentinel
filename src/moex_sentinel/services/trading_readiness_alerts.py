@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from time import monotonic
 from typing import Literal, Protocol, get_args
 from uuid import UUID, uuid4
@@ -29,7 +30,7 @@ PreparationReason = Literal[
 ]
 SAFE_PREPARATION_REASONS = frozenset(get_args(PreparationReason))
 AlertSignal = Literal[
-    "ACCOUNT_STOP_REQUIRED",
+    "LEGACY_STOP_STATUS",
     "HEARTBEAT_UNKNOWN",
     "CONTROL_STALLED",
     "CONTROL_ERROR",
@@ -100,15 +101,44 @@ class TradingReadinessAlertService:
         *,
         environment: Environment,
         enabled: bool,
+        poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
+        startup_grace_seconds: float = STARTUP_UNKNOWN_GRACE_SECONDS,
+        heartbeat_confirmation_seconds: float = HEARTBEAT_CONFIRMATION_SECONDS,
+        control_confirmation_seconds: float = CONTROL_CONFIRMATION_SECONDS,
+        outbox_confirmation_seconds: float = OUTBOX_CONFIRMATION_SECONDS,
+        retry_delays_seconds: tuple[float, ...] = RETRY_DELAYS_SECONDS,
+        queue_limit: int = ALERT_QUEUE_LIMIT,
         clock: Callable[[], datetime] = utc_now_ms,
         monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         if enabled and transport is None:
             raise ValueError("enabled readiness alerts require a transport")
+        timings = (
+            poll_interval_seconds,
+            startup_grace_seconds,
+            heartbeat_confirmation_seconds,
+            control_confirmation_seconds,
+            outbox_confirmation_seconds,
+        )
+        if (
+            any(not isfinite(value) or value <= 0 for value in timings)
+            or not retry_delays_seconds
+            or any(not isfinite(delay) or delay <= 0 for delay in retry_delays_seconds)
+            or type(queue_limit) is not int
+            or not 0 < queue_limit <= 1024
+        ):
+            raise ValueError("Readiness alert timings and queue limit are invalid.")
         self._observe = observe
         self._transport = transport
         self._environment = environment
         self._enabled = enabled
+        self._poll_interval_seconds = poll_interval_seconds
+        self._startup_grace_seconds = startup_grace_seconds
+        self._heartbeat_confirmation_seconds = heartbeat_confirmation_seconds
+        self._control_confirmation_seconds = control_confirmation_seconds
+        self._outbox_confirmation_seconds = outbox_confirmation_seconds
+        self._retry_delays_seconds = retry_delays_seconds
+        self._queue_limit = queue_limit
         self._clock = clock
         self._monotonic = monotonic_clock
         self._started_at: float | None = None
@@ -141,7 +171,7 @@ class TradingReadinessAlertService:
             )
         if self._closed:
             return ()
-        if observation.account_status == "ARMED" and observation.account_effective_can_submit is True:
+        if observation.account_effective_can_submit is True:
             self._effective_submit_seen = True
         events = self._transitions(observation, now)
         for event in events:
@@ -153,7 +183,7 @@ class TradingReadinessAlertService:
         """Poll until cancelled by Core, which must await this task before closing its executor."""
         while not self._closed:
             await self.observe_once()
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            await asyncio.sleep(self._poll_interval_seconds)
 
     async def close(self) -> None:
         """Stop future observations; the lifecycle owner cancels and awaits ``run`` first."""
@@ -207,11 +237,9 @@ class TradingReadinessAlertService:
 
     def _candidates(self, value: ReadinessObservation) -> dict[AlertSignal, tuple[str, Severity, float]]:
         result: dict[AlertSignal, tuple[str, Severity, float]] = {}
-        if value.account_status == "STOP_REQUIRED" or value.recovery_only is True:
-            result["ACCOUNT_STOP_REQUIRED"] = ("STOP_REQUIRED", "CRITICAL", 0)
-        elif value.account_effective_can_submit is False and (
-            value.account_status == "ARMED" or self._effective_submit_seen
-        ):
+        if value.account_status == "STOP_REQUIRED":
+            result["LEGACY_STOP_STATUS"] = ("LEGACY_STOP_REQUIRED", "WARNING", 0)
+        elif value.account_effective_can_submit is False and (self._effective_submit_seen):
             result["READINESS_LOST"] = ("EFFECTIVE_SUBMIT_BLOCKED", "CRITICAL", 0)
 
         if value.preparation_status == "FAILED" and value.preparation_reason != "ARM_REQUIRED":
@@ -226,12 +254,12 @@ class TradingReadinessAlertService:
         if worker.observation == "OBSERVED":
             self._worker_seen = True
         if worker.observation == "UNKNOWN" or worker.reason in {"NOT_OBSERVED", "STALE"}:
-            confirmation = HEARTBEAT_CONFIRMATION_SECONDS if self._worker_seen else STARTUP_UNKNOWN_GRACE_SECONDS
+            confirmation = self._heartbeat_confirmation_seconds if self._worker_seen else self._startup_grace_seconds
             result["HEARTBEAT_UNKNOWN"] = ("WORKER_UNKNOWN", "CRITICAL", confirmation)
         elif worker.reason == "CONTROL_STALLED":
-            result["CONTROL_STALLED"] = ("CONTROL_STALLED", "CRITICAL", CONTROL_CONFIRMATION_SECONDS)
+            result["CONTROL_STALLED"] = ("CONTROL_STALLED", "CRITICAL", self._control_confirmation_seconds)
         elif worker.reason == "ITERATION_FAILED" or worker.last_result == "ERROR":
-            result["CONTROL_ERROR"] = ("CONTROL_ERROR", "CRITICAL", CONTROL_CONFIRMATION_SECONDS)
+            result["CONTROL_ERROR"] = ("CONTROL_ERROR", "CRITICAL", self._control_confirmation_seconds)
 
         queue = worker.outbox
         if queue.observation == "OBSERVED":
@@ -239,17 +267,17 @@ class TradingReadinessAlertService:
         if queue.reason == "FAILED":
             result["OUTBOX_FAILED"] = ("OUTBOX_FAILED", "CRITICAL", 0)
         elif queue.reason == "OLD_PENDING":
-            result["OUTBOX_OLD_PENDING"] = ("OUTBOX_OLD_PENDING", "CRITICAL", OUTBOX_CONFIRMATION_SECONDS)
+            result["OUTBOX_OLD_PENDING"] = ("OUTBOX_OLD_PENDING", "CRITICAL", self._outbox_confirmation_seconds)
         elif queue.reason in {"READ_FAILED", "STALE", "NOT_OBSERVED"}:
-            confirmation = OUTBOX_CONFIRMATION_SECONDS if self._outbox_seen else STARTUP_UNKNOWN_GRACE_SECONDS
+            confirmation = self._outbox_confirmation_seconds if self._outbox_seen else self._startup_grace_seconds
             result["OUTBOX_UNKNOWN"] = ("OUTBOX_UNKNOWN", "WARNING", confirmation)
         return result
 
     def _can_confirm_recovery(self, signal: AlertSignal, value: ReadinessObservation) -> bool:
-        if signal == "ACCOUNT_STOP_REQUIRED":
-            return value.account_status not in {"STOP_REQUIRED", "UNKNOWN"} and value.recovery_only is False
+        if signal == "LEGACY_STOP_STATUS":
+            return value.account_status not in {"STOP_REQUIRED", "UNKNOWN"}
         if signal == "READINESS_LOST":
-            return value.account_status == "ARMED" and value.account_effective_can_submit is True
+            return value.account_effective_can_submit is True
         if signal == "PREPARATION_FAILED":
             return value.preparation_status == "READY" or (
                 value.preparation_reason == "ARM_REQUIRED" and value.account_status == "DISARMED"
@@ -296,7 +324,7 @@ class TradingReadinessAlertService:
             if item.event.signal == event.signal:
                 item.event = event
                 return
-        if len(self._queue) == ALERT_QUEUE_LIMIT:
+        if len(self._queue) >= self._queue_limit:
             self._queue.pop(0)
         self._queue.append(_QueuedAlert(event))
 
@@ -310,7 +338,7 @@ class TradingReadinessAlertService:
                 await self._transport.send_message(item.event.message(self._environment))
             except Exception:
                 item.attempts += 1
-                delay_index = min(item.attempts - 1, len(RETRY_DELAYS_SECONDS) - 1)
-                item.retry_at = now + RETRY_DELAYS_SECONDS[delay_index]
+                delay_index = min(item.attempts - 1, len(self._retry_delays_seconds) - 1)
+                item.retry_at = now + self._retry_delays_seconds[delay_index]
             else:
                 self._queue.remove(item)

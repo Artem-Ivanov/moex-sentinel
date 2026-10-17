@@ -1,6 +1,5 @@
 """ASGI application for independent market analytics."""
 
-import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -10,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from market_analytics.config import AnalyticsSettings
 from market_analytics.indicators import MarketIndicatorsService
 from market_analytics.market_source import HttpMarketSource
 from market_analytics.ports import MarketSourcePort
@@ -22,9 +22,11 @@ from sentinel_contracts.version import SERVICE_VERSION
 def create_app(
     market_source: MarketSourcePort | None = None,
     *,
+    settings: AnalyticsSettings | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FastAPI:
     """Compose analytics dependencies and own the default HTTP client's lifespan."""
+    settings = settings or AnalyticsSettings()
     calculator = AnalyticsService(MarketIndicatorsService(), now=now)
 
     @asynccontextmanager
@@ -33,8 +35,8 @@ def create_app(
             yield
             return
         async with httpx.AsyncClient(
-            base_url=os.environ.get("ANALYTICS_CORE_URL", "http://backend:8000"),
-            timeout=httpx.Timeout(2.0),
+            base_url=str(settings.core_url),
+            timeout=settings.core_http_timeout_seconds,
             trust_env=False,
         ) as client:
             app.state.analytics = CalculateAnalyticsSnapshotUsecase(HttpMarketSource(client), calculator)

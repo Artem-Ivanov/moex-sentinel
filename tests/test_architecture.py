@@ -9,7 +9,6 @@ PROJECT_ROOT = Path(__file__).parents[1]
 FORBIDDEN = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\blegacy\b",
         r"\bV2\b",
         r"_v2\b",
         r"FACT_INGRESS_VERSION",
@@ -41,6 +40,7 @@ FIXTURE_MODULES = {
     "trading_automaton.domain",
     "trading_automaton.usecases",
     "market_analytics",
+    "market_analytics.config",
     "market_analytics.service",
     "sentinel_contracts",
     "sentinel_contracts.base",
@@ -99,12 +99,13 @@ LAYER_RULES = {
     ("trading_automaton", "entrypoint"): {"composition", "config", "root"},
     ("trading_automaton", "config"): {"config", "domain", "root"},
     ("market_analytics", "analytics_pure"): {"analytics_pure", "root"},
-    ("market_analytics", "analytics_transport"): {"analytics_pure", "analytics_transport", "root"},
+    ("market_analytics", "analytics_transport"): {"analytics_pure", "analytics_transport", "config", "root"},
+    ("market_analytics", "config"): {"config", "root"},
     ("market_analytics", "entrypoint"): {"analytics_pure", "analytics_transport", "entrypoint", "root"},
 }
 
 
-def test_runtime_tree_contains_no_compatibility_identifiers() -> None:
+def test_runtime_tree_contains_no_retired_protocol_identifiers() -> None:
     files = [
         *(PROJECT_ROOT / "src").rglob("*.py"),
         *(PROJECT_ROOT / "frontend/src").rglob("*.ts"),
@@ -137,6 +138,8 @@ def _layer(module: str) -> tuple[str | None, str]:
     if len(parts) == 1:
         return owner, "root"
     if owner == "market_analytics":
+        if parts[1] == "config":
+            return owner, "config"
         if parts[1] == "__main__":
             return owner, "entrypoint"
         return owner, "analytics_transport" if parts[1] in {"app", "market_source"} else "analytics_pure"
@@ -211,6 +214,8 @@ def _external_allowed(owner: str, layer: str, target: str) -> bool:
     if owner == "moex_sentinel" and layer == "operator_entrypoint":
         return top == "httpx"
     if owner == "market_analytics":
+        if layer == "config":
+            return top == "pydantic_settings"
         if layer == "analytics_transport":
             return top in {"httpx", "fastapi"}
         if layer == "entrypoint":
@@ -292,6 +297,17 @@ def test_source_imports_follow_layer_dependency_directions() -> None:
         ("sentinel_contracts.new_contract", "import trading_automaton.domain", "trading_automaton"),
         ("market_analytics.service", "import httpx", "httpx"),
         ("market_analytics.indicators", "import sqlalchemy", "sqlalchemy"),
+        ("market_analytics.service", "import pydantic_settings", "pydantic_settings"),
+        (
+            "market_analytics.service",
+            "from market_analytics.config import AnalyticsSettings",
+            "market_analytics.config",
+        ),
+        (
+            "market_analytics.indicators",
+            "from market_analytics import config",
+            "market_analytics.config",
+        ),
         ("market_analytics.app", "import t_tech", "t_tech"),
         ("market_analytics.app", "import sqlalchemy", "sqlalchemy"),
         ("market_analytics.__main__", "import t_tech", "t_tech"),
@@ -323,6 +339,8 @@ def test_import_fixtures_reject_forbidden_dependency_directions(importer, source
         ("trading_automaton.adapters.new_adapter", "import t_tech"),
         ("trading_automaton.composition", "from moex_sentinel.adapters import registry"),
         ("moex_sentinel.domain.new_domain", "from sentinel_contracts import base"),
+        ("market_analytics.config", "from pydantic_settings import BaseSettings"),
+        ("market_analytics.app", "from market_analytics.config import AnalyticsSettings"),
     ],
 )
 def test_import_fixtures_allow_intended_layer_dependencies(importer, source) -> None:

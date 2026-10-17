@@ -122,6 +122,8 @@ class OrderDispatchService:
                 ),
             )
             if self._audit is not None and request.process_id is not None:
+                denial_reason = None if response.submit_denial_reason is None else response.submit_denial_reason.value
+                abort_reason = None if response.pre_rpc_abort_proof is None else response.pre_rpc_abort_proof.reason
                 await asyncio.to_thread(
                     self._audit.record_order_stage,
                     stage=BusinessAuditStage.BROKER_ORDER_DISPATCH_RESULT,
@@ -133,6 +135,10 @@ class OrderDispatchService:
                     message="Broker order dispatch completed",
                     broker_order_state=response.status,
                     broker_order_id=response.broker_order_id,
+                    submit_denial_reason=denial_reason,
+                    pre_rpc_abort_reason=abort_reason,
+                    submit_authorization_elapsed_ms=response.submit_authorization_elapsed_ms,
+                    permit_remaining_ms=response.permit_remaining_ms,
                 )
             return response
         except Exception as error:

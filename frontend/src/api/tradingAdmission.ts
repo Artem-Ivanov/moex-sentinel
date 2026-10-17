@@ -5,7 +5,7 @@ export type AdmissionReason =
   | "UID_NOT_ALLOWED" | "STALE_MARKET" | "ORDER_NOTIONAL_EXCEEDED" | "EXPOSURE_EXCEEDED"
   | "OUTSTANDING_ORDERS_EXCEEDED" | "DAILY_LOSS_EXCEEDED" | "DATA_UNKNOWN" | "FOREIGN_ACTIVE_ORDER"
   | "INSUFFICIENT_CASH" | "INSUFFICIENT_POSITION" | "BASELINE_REQUIRED" | "RECONCILIATION_REQUIRED"
-  | "ALREADY_CONSUMED" | "CORE_UNAVAILABLE"
+  | "ALREADY_CONSUMED" | "CORE_UNAVAILABLE" | "LIMITS_NOT_CONFIGURED" | "AUTOMATION_NOT_ACTIVE"
 
 export type PreparationStatus = "DISABLED" | "WAITING" | "BASELINE_ACCEPTED" | "PREPARED" | "BLOCKED"
 export type PreparationReason =
@@ -15,10 +15,9 @@ export type PreparationReason =
   | "RECONCILIATION_EXPIRED" | "RECOVERY_REQUIRED" | "ARM_REQUIRED" | "RISK_DATA_UNKNOWN" | "CORE_UNAVAILABLE"
 
 export interface AdmissionLimits {
-  canary_uid: string
   currency: "RUB"
   max_order_notional: string
-  exposure_scope: "CANARY_UID_GROSS"
+  exposure_scope: "ACCOUNT_GROSS"
   max_exposure: string
   max_outstanding_orders: number
   max_daily_loss: string
@@ -50,6 +49,7 @@ export interface AdmissionReconciliation {
 export interface TradingAdmission {
   broker_id: string
   account_id: string
+  revision: number
   owner_runtime_instance_id: string | null
   owner_generation: number | null
   recovery_runtime_instance_id: string | null
@@ -134,14 +134,34 @@ function stringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0)
 }
 function positiveNumericString(value: unknown): value is string {
-  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:E[+-]?(?:0|[1-9]\d*))?$/.test(value)) return false
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d+)?(?:E[+-]?(?:0|[1-9]\d*))?$/i.test(value)) return false
   const numericValue = Number(value)
   return Number.isFinite(numericValue) && numericValue > 0
 }
 
+function canonicalPositiveDecimal(value: string): string | null {
+  if (!positiveNumericString(value)) return null
+  const [mantissa, exponentText] = value.toUpperCase().split("E")
+  const exponent = exponentText === undefined ? 0 : Number(exponentText)
+  const [whole, fraction = ""] = mantissa.split(".")
+  let digits = `${whole}${fraction}`.replace(/^0+/, "") || "0"
+  let scale = fraction.length - exponent
+  if (scale < 0) {
+    digits += "0".repeat(-scale)
+    scale = 0
+  }
+  while (scale > 0 && digits.endsWith("0")) {
+    digits = digits.slice(0, -1)
+    scale -= 1
+  }
+  if (scale === 0) return digits
+  if (digits.length <= scale) return `0.${"0".repeat(scale - digits.length)}${digits}`
+  return `${digits.slice(0, -scale)}.${digits.slice(-scale)}`
+}
+
 function validLimits(value: unknown): value is AdmissionLimits {
-  return record(value) && requiredString(value.canary_uid) && value.currency === "RUB" &&
-    positiveNumericString(value.max_order_notional) && value.exposure_scope === "CANARY_UID_GROSS" &&
+  return record(value) && value.currency === "RUB" &&
+    positiveNumericString(value.max_order_notional) && value.exposure_scope === "ACCOUNT_GROSS" &&
     positiveNumericString(value.max_exposure) && positiveInteger(value.max_outstanding_orders) &&
     positiveNumericString(value.max_daily_loss)
 }
@@ -164,7 +184,7 @@ function validReconciliation(value: unknown): value is AdmissionReconciliation |
 }
 
 function validAdmission(value: unknown): value is TradingAdmission {
-  if (!(record(value) && uuid(value.broker_id) && requiredString(value.account_id) &&
+  if (!(record(value) && uuid(value.broker_id) && requiredString(value.account_id) && positiveInteger(value.revision) &&
     nullableUuid(value.owner_runtime_instance_id) &&
     nullablePositiveInteger(value.owner_generation) && nullableUuid(value.recovery_runtime_instance_id) &&
     (value.admission_status === "DISARMED" || value.admission_status === "ARMED" || value.admission_status === "STOP_REQUIRED") &&
@@ -219,3 +239,30 @@ export const fetchTradingAdmission = (brokerId: string, signal?: AbortSignal) =>
 export const fetchTradingPreparation = (brokerId: string, signal?: AbortSignal) => fetchView(
   `/api/brokers/${encodeURIComponent(brokerId)}/trading-admission/preparation`, signal, "Не удалось проверить подготовку допуска.", validPreparation,
 )
+
+export async function updateTradingAdmissionLimits(
+  brokerId: string,
+  accountId: string,
+  expectedRevision: number,
+  limits: AdmissionLimits,
+): Promise<TradingAdmission> {
+  if (!uuid(brokerId) || !requiredString(accountId) || !positiveInteger(expectedRevision) || !validLimits(limits)) {
+    throw new TradingAdmissionApiError("Не удалось сохранить лимиты счёта.", 400)
+  }
+  const response = await apiFetch(`/api/brokers/${encodeURIComponent(brokerId)}/trading-admission/limits`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_revision: expectedRevision, limits }),
+  })
+  if (!response.ok) throw new TradingAdmissionApiError("Не удалось сохранить лимиты счёта.", response.status)
+  const value: unknown = await response.json()
+  if (!validAdmission(value) || value.broker_id !== brokerId || value.account_id !== accountId || value.limits === null ||
+      value.limits.currency !== limits.currency || value.limits.exposure_scope !== limits.exposure_scope ||
+      canonicalPositiveDecimal(value.limits.max_order_notional) !== canonicalPositiveDecimal(limits.max_order_notional) ||
+      canonicalPositiveDecimal(value.limits.max_exposure) !== canonicalPositiveDecimal(limits.max_exposure) ||
+      value.limits.max_outstanding_orders !== limits.max_outstanding_orders ||
+      canonicalPositiveDecimal(value.limits.max_daily_loss) !== canonicalPositiveDecimal(limits.max_daily_loss)) {
+    throw new TradingAdmissionApiError("Не удалось сохранить лимиты счёта.", response.status)
+  }
+  return value
+}

@@ -377,6 +377,134 @@ def test_collect_maps_real_account_risk_and_attributed_request_state() -> None:
     assert all(name not in mutation_calls for name, _ in services.calls)
 
 
+def test_collect_marks_each_positive_holding_and_maps_its_own_lot_size() -> None:
+    second_uid = "uid-2"
+    services = Services()
+    services.positions_response.securities.append(
+        PositionsSecurities(instrument_uid=second_uid, blocked=0, balance=10, exchange_blocked=False)
+    )
+    services.portfolio_response.positions.append(
+        PortfolioPosition(
+            instrument_uid=second_uid,
+            quantity=quote("10"),
+            quantity_lots=quote("2"),
+            current_price=money("40"),
+            average_position_price=money("39"),
+            blocked=False,
+            blocked_lots=quote("0"),
+        )
+    )
+    original_get_instrument = services.get_instrument_by
+    original_get_book = services.get_order_book
+
+    async def get_instrument_by(*, id_type, id):
+        if id != second_uid:
+            return await original_get_instrument(id_type=id_type, id=id)
+        services.calls.append(("get_instrument_by", (id_type, id)))
+        return InstrumentResponse(
+            instrument=Instrument(
+                instrument_type="share",
+                currency="rub",
+                lot=5,
+                min_price_increment=quote("0.01"),
+                api_trade_available_flag=True,
+                uid=second_uid,
+                instrument_kind=InstrumentType.INSTRUMENT_TYPE_SHARE,
+            )
+        )
+
+    async def get_order_book(*, instrument_id: str, depth: int):
+        if instrument_id != second_uid:
+            return await original_get_book(instrument_id=instrument_id, depth=depth)
+        services.calls.append(("get_order_book", (instrument_id, depth)))
+        return order_book_response(
+            instrument_uid=second_uid,
+            bids=(Order(price=quote("39.9"), quantity=2),),
+            asks=(Order(price=quote("40.1"), quantity=2),),
+        )
+
+    services.get_instrument_by = get_instrument_by
+    services.get_order_book = get_order_book
+    adapter, _ = make_adapter(services)
+
+    snapshot = asyncio.run(
+        adapter.collect(
+            connection(),
+            instrument_uid=UID,
+            operations_from=NOW - timedelta(days=1),
+        )
+    )
+
+    positions = {item.instrument_uid: item for item in snapshot.positions}
+    assert positions[UID].mark_price == Decimal("100.05")
+    assert positions[second_uid].mark_price == Decimal("40.1")
+    assert positions[UID].lot_size == 10
+    assert positions[second_uid].lot_size == 5
+    assert positions[UID].mark_captured_at == NOW
+    assert positions[second_uid].mark_captured_at == NOW
+    assert ("get_order_book", (second_uid, 20)) in services.calls
+
+
+def test_collect_marks_snapshot_unknown_for_stale_nonselected_holding() -> None:
+    second_uid = "uid-2"
+    services = Services()
+    services.positions_response.securities.append(
+        PositionsSecurities(instrument_uid=second_uid, blocked=0, balance=10, exchange_blocked=False)
+    )
+    services.portfolio_response.positions.append(
+        PortfolioPosition(
+            instrument_uid=second_uid,
+            quantity=quote("10"),
+            quantity_lots=quote("2"),
+            current_price=money("40"),
+            average_position_price=money("39"),
+            blocked=False,
+            blocked_lots=quote("0"),
+        )
+    )
+    original_get_instrument = services.get_instrument_by
+    original_get_book = services.get_order_book
+
+    async def get_instrument_by(*, id_type, id):
+        if id != second_uid:
+            return await original_get_instrument(id_type=id_type, id=id)
+        return InstrumentResponse(
+            instrument=Instrument(
+                instrument_type="share",
+                currency="rub",
+                lot=5,
+                min_price_increment=quote("0.01"),
+                api_trade_available_flag=True,
+                uid=second_uid,
+                instrument_kind=InstrumentType.INSTRUMENT_TYPE_SHARE,
+            )
+        )
+
+    async def get_order_book(*, instrument_id: str, depth: int):
+        if instrument_id != second_uid:
+            return await original_get_book(instrument_id=instrument_id, depth=depth)
+        return order_book_response(
+            instrument_uid=second_uid,
+            timestamp=NOW - timedelta(seconds=2),
+            bids=(Order(price=quote("39.9"), quantity=2),),
+            asks=(Order(price=quote("40.1"), quantity=2),),
+        )
+
+    services.get_instrument_by = get_instrument_by
+    services.get_order_book = get_order_book
+    adapter, _ = make_adapter(services)
+
+    snapshot = asyncio.run(
+        adapter.collect(
+            connection(),
+            instrument_uid=UID,
+            operations_from=NOW - timedelta(days=1),
+        )
+    )
+
+    assert "POSITION_MARK_STALE" in snapshot.unknown_reasons
+
+
 def test_collect_normalizes_sdk_etf_to_catalog_fund_type() -> None:
     services = Services()
     services.instrument_kind = InstrumentType.INSTRUMENT_TYPE_ETF

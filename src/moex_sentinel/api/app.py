@@ -203,7 +203,12 @@ def create_app(
             )
         if configure_audit:
             configure_logging("backend", level=settings.log_level, format=settings.log_format)
-        engine = create_database_engine(configured_url)
+        engine = create_database_engine(
+            configured_url,
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
+            pool_timeout_seconds=settings.database_pool_timeout_seconds,
+        )
         application.state.database_engine = engine
         executor = None
         market_gateway = None
@@ -233,7 +238,11 @@ def create_app(
                 settings.application_environment, settings.broker_access_mode
             )
             analytics_http = httpx.AsyncClient(trust_env=False, follow_redirects=False)
-            application.state.analytics_versions = AnalyticsVersionClient(settings.analytics_url, analytics_http)
+            application.state.analytics_versions = AnalyticsVersionClient(
+                settings.analytics_url,
+                analytics_http,
+                timeout_seconds=settings.analytics_version_http_timeout_seconds,
+            )
             application.state.diagnostics_usecase = GetDiagnosticsStatusUsecase(
                 application.state.readiness_usecase,
                 settings.application_environment,
@@ -246,6 +255,7 @@ def create_app(
                     bot_token=settings.telegram_bot_token,
                     chat_id=settings.telegram_chat_id,
                     run_sync=executor.run,
+                    request_timeout_seconds=settings.telegram_request_timeout_seconds,
                 )
                 if settings.telegram_alerts_enabled
                 else None
@@ -259,6 +269,13 @@ def create_app(
                 alert_transport,
                 environment=settings.application_environment,
                 enabled=settings.telegram_alerts_enabled,
+                poll_interval_seconds=settings.readiness_alert_poll_interval_seconds,
+                startup_grace_seconds=settings.readiness_alert_startup_grace_seconds,
+                heartbeat_confirmation_seconds=settings.readiness_alert_heartbeat_confirmation_seconds,
+                control_confirmation_seconds=settings.readiness_alert_control_confirmation_seconds,
+                outbox_confirmation_seconds=settings.readiness_alert_outbox_confirmation_seconds,
+                retry_delays_seconds=settings.readiness_alert_retry_delays_seconds,
+                queue_limit=settings.readiness_alert_queue_limit,
             )
             application.state.trading_readiness_alert_service = readiness_alert_service
             with bind_sync_runner(executor.run):

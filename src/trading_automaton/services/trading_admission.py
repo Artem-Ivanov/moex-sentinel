@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from math import floor, isfinite
 from time import monotonic as system_monotonic
 from typing import Protocol
 from uuid import UUID
@@ -24,6 +25,12 @@ from sentinel_contracts.trading_admission import (
 from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.domain.errors import CoreOperationError
 
+MAX_TIMING_MS = 2_147_483_647
+
+
+def _bounded_milliseconds(seconds: float) -> int:
+    return max(-MAX_TIMING_MS, min(MAX_TIMING_MS, floor(seconds * 1000)))
+
 
 class TradingAdmissionCorePort(Protocol):
     def trading_admission(self, broker_id: str) -> AdmissionView: ...
@@ -39,6 +46,8 @@ class SubmitGate:
     expires_monotonic: float | None = None
     denial: SubmitDenied | None = None
     abort_proof: PreRpcAbortProof | None = None
+    authorization_elapsed_ms: int | None = None
+    permit_remaining_ms: int | None = None
 
 
 class TradingAdmissionService:
@@ -73,13 +82,11 @@ class TradingAdmissionService:
             or view.owner_generation is None
         ):
             return SubmitDenialReason.NOT_OWNER
-        if view.recovery_only:
-            return SubmitDenialReason.STOP_REQUIRED
         if view.configuration_fingerprint != self.configuration_fingerprint:
             return SubmitDenialReason.CONFIGURATION_CHANGED
-        if view.limits is None or view.limits.canary_uid != instrument_uid:
-            return SubmitDenialReason.UID_NOT_ALLOWED
-        if not view.effective_can_submit:
+        if view.limits is None:
+            return SubmitDenialReason.LIMITS_NOT_CONFIGURED
+        if not view.effective_can_submit and view.effective_denial_reasons != (SubmitDenialReason.BASELINE_REQUIRED,):
             return view.effective_denial_reasons[0] if view.effective_denial_reasons else SubmitDenialReason.DISARMED
         return view
 
@@ -118,10 +125,13 @@ class TradingAdmissionService:
         started = self._monotonic()
         result = await asyncio.to_thread(self._core.authorize_submit, authorization)
         finished = self._monotonic()
+        observed_rtt = finished - started
+        rtt_seconds = observed_rtt if isfinite(observed_rtt) and observed_rtt >= 0 else MAX_TIMING_MS / 1000
+        authorization_elapsed_ms = min(MAX_TIMING_MS, int(rtt_seconds * 1000))
         if isinstance(result, SubmitDenied):
             if result.outcome_uncertain:
                 raise CoreOperationError(retryable=True)
-            return SubmitGate(denial=result)
+            return SubmitGate(denial=result, authorization_elapsed_ms=authorization_elapsed_ms)
         if (
             result.runtime_instance_id != self.runtime_instance_id
             or result.idempotency_key != authorization.idempotency_key
@@ -132,15 +142,24 @@ class TradingAdmissionService:
         ):
             raise CoreOperationError(retryable=False)
         permit_seconds = (result.expires_at - result.server_response_at).total_seconds()
-        rtt_seconds = finished - started
+        server_processing_ms = getattr(result, "server_processing_ms", 0)
+        transport_seconds = rtt_seconds
+        if (
+            isinstance(server_processing_ms, int)
+            and not isinstance(server_processing_ms, bool)
+            and 0 <= server_processing_ms <= rtt_seconds * 1000
+        ):
+            transport_seconds = rtt_seconds - server_processing_ms / 1000
         usable_seconds = min(
-            permit_seconds - rtt_seconds,
+            permit_seconds - transport_seconds,
             (submit_deadline - floor_utc_millisecond(self._now())).total_seconds(),
             (request.market_valid_until - floor_utc_millisecond(self._now())).total_seconds(),
         )
         if permit_seconds <= 0 or permit_seconds > 1 or usable_seconds <= 0:
             return SubmitGate(
                 permit=result,
+                authorization_elapsed_ms=authorization_elapsed_ms,
+                permit_remaining_ms=_bounded_milliseconds(usable_seconds),
                 abort_proof=self.abort_proof(
                     request,
                     result,
@@ -151,7 +170,12 @@ class TradingAdmissionService:
                     ),
                 ),
             )
-        return SubmitGate(permit=result, expires_monotonic=finished + usable_seconds)
+        return SubmitGate(
+            permit=result,
+            expires_monotonic=finished + usable_seconds,
+            authorization_elapsed_ms=authorization_elapsed_ms,
+            permit_remaining_ms=_bounded_milliseconds(usable_seconds),
+        )
 
     def abort_proof(
         self,

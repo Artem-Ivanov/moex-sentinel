@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime
+from math import isfinite
 from time import sleep
 from typing import Any, Protocol
 from uuid import UUID
@@ -149,6 +150,9 @@ async def build_broker_runtime(
     session_factory: Callable[[BrokerConnection], Any] | None = None,
     tick_seconds: float = 1.0,
     retry_limit: int = 5,
+    recovery_probe_seconds: float = 60.0,
+    account_snapshot_ttl_seconds: float = 60.0,
+    analytics_http_timeout_seconds: float = 1.0,
     analytics_url: str = "http://analytics:8001",
     analytics_client: AnalyticsPort | None = None,
     core_client: CoreClient | None = None,
@@ -161,6 +165,13 @@ async def build_broker_runtime(
         raise ValueError("Invalid Worker broker access mode")
     if worker_access_mode != connection.access_mode:
         raise ValueError("Core/Worker access mode mismatch")
+    for name, value in (
+        ("recovery_probe_seconds", recovery_probe_seconds),
+        ("account_snapshot_ttl_seconds", account_snapshot_ttl_seconds),
+        ("analytics_http_timeout_seconds", analytics_http_timeout_seconds),
+    ):
+        if not isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
     admission = None
     if connection.environment == "PROD" and worker_access_mode == "TRADE":
         if core_client is None or connection.configuration_fingerprint is None:
@@ -191,6 +202,7 @@ async def build_broker_runtime(
             account_id=connection.account_id,
             broker_connection=connection if admission is not None else None,
             submit_admission=admission,
+            snapshot_ttl_seconds=account_snapshot_ttl_seconds,
         )
     )
     if admission is not None and (
@@ -294,7 +306,9 @@ async def build_broker_runtime(
             cash=cash,
             now=now,
         )
-        analytics = analytics_client or AnalyticsClient(httpx.AsyncClient(base_url=analytics_url, timeout=1.0))
+        analytics = analytics_client or AnalyticsClient(
+            httpx.AsyncClient(base_url=analytics_url, timeout=analytics_http_timeout_seconds)
+        )
         if analytics_client is None:
             rollback.push_async_callback(analytics.close)
         iteration = RunBrokerIterationUsecase(
@@ -315,6 +329,7 @@ async def build_broker_runtime(
             iteration,
             tick_seconds=tick_seconds,
             retry_limit=retry_limit,
+            recovery_probe_seconds=recovery_probe_seconds,
             account_id=connection.account_id,
         )
         bundle = BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
@@ -357,7 +372,7 @@ def build_streaming_runtime(
         raise ValueError(
             "READ_ONLY cannot start with active intents; preserve history and reconcile in the original trading contour"
         )
-    http = httpx.Client(base_url=settings.core_url, timeout=10.0)
+    http = httpx.Client(base_url=settings.core_url, timeout=settings.core_http_timeout_seconds)
     core = CoreClient(
         http,
         application_environment=settings.application_environment,
@@ -428,6 +443,9 @@ def build_streaming_runtime(
             now=now,
             tick_seconds=settings.iteration_seconds,
             retry_limit=settings.sandbox_retry_limit,
+            recovery_probe_seconds=settings.broker_recovery_probe_seconds,
+            account_snapshot_ttl_seconds=settings.account_snapshot_ttl_seconds,
+            analytics_http_timeout_seconds=settings.analytics_http_timeout_seconds,
             analytics_url=settings.analytics_url,
             core_client=core,
         )
