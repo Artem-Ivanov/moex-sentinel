@@ -1,7 +1,7 @@
 # PROD rollout — admission по IN_WORK — 17.10.2026
 
 ## Цель и scope
-По явному запросу пользователя выпустить локальные изменения допуска по IN_WORK на PROD и выполнить обычную техническую приёмку. Не включать ручные заявки, ARM, стратегии, дополнительные лимиты или Telegram. Любая возможная торговля после релиза должна идти только по существующему `IN_WORK` + TRADE и уже заданным общим финансовым лимитам.
+По явному запросу пользователя убрать реальные TEST-заглушки из production code path, сверить полноту реализации PROD по всему торговому потоку и только после устранения подтверждённых пробелов выпустить изменения на PROD с обычной технической приёмкой. Сохранять настоящий Sandbox/Test contour и тестовые doubles в tests; считать заглушкой только production wiring/ветку, которая подменяет, пропускает или делает неполным обязательное PROD поведение. Любая возможная торговля после релиза должна идти только по существующему `IN_WORK` + TRADE и уже заданным общим финансовым лимитам.
 
 ## Проверка актуальности до выполнения
 - Кодовая веха 16.10 заявлена локально завершённой; общий independent review `C0/I0/M0`, Python 2515 PASS/196 PostgreSQL SKIP, frontend 257 PASS/typecheck/build PASS. См. `develop/reports/position-driven-admission-20261016/review-integration.md` и root logs.
@@ -13,8 +13,10 @@
 1. [done] Сверить release inputs с reviewed source, состав package и безопасные rollout wrappers; проверить локальную доступность build/SSH, не раскрывая credentials.
 2. [pending] Сформировать уникальный tag/archive/source manifest только из явно перечисленного продукта, провести preflight против текущего PROD (release/schema/containers/config/trading state/active intents; read-only), затем независимое pre-execution review. Code-only prep разрешён при caps=null и ровно известной сохранённой UNCERTAIN; перед rollout остановиться при любом runtime drift, новых неопределённых intents, изменении HOLD/IN_WORK/лимитов или отсутствии clean-stop proof.
 3. [pending] После review подготовить immutable Core/Worker/frontend images без изменения private ENV, caps, DB/volumes. Analytics/schema остаются прежними; миграции нет. Обновления compose должны быть точно объяснены и ограничены согласованным приложением/runtime defaults.
-4. [in_progress] Реализовать согласованный scoped operator-authenticated read-only GET для единственного PENDING runtime; hardened allowlist всех intent-state counts; честно ограничить постдеплойный вывод по сохранённому UNCERTAIN свежим pre-stop receipt и неизменным worker volume; lifecycle tests для PENDING→API lookup→single owner-stopped POST, scope/multiple/stale-intent fail-closed и no retry after uncertain response. Затем независимое cross-review, пересборка, fresh preflight и rollout; никаких SQL/SQLite checks на рабочей БД.
-5. [pending] Независимое post-deploy cross-review receipts; обновить tracked runbook/очередь и локальные CURRENT/WORK_LOG с точной границей того, что проверено.
+4. [done] Scoped operator-authenticated read-only GET для единственного PENDING runtime; strict intent-state allowlist; honest `NOT_RECHECKED` boundary; fail-closed admission/null-caps/arm/recovery checks; stable UNCERTAIN reference binding; lifecycle/failure-injection tests. Independent `env_core_reviewer` verdict C0/I0/M0: `develop/reports/position-driven-admission-deploy-20261017/protocol-fix-review.md`.
+5. [in_progress] Новая пользовательская prerequisite-веха: независимая инвентаризация TEST-specific defaults/no-op/fallback и production composition; классифицировать допустимые Sandbox/test code paths vs реальные incomplete PROD paths; согласовать scope/design/DoD перед реализацией, выполнить только подтверждённые правки и тесты, independent cross-review.
+6. [pending] Пересобрать immutable package с новым API и принятыми production fixes, получить свежее разрешённое application-level intent receipt, повторить exact preflight, выполнить deployment и ограниченную техническую приёмку. Не запускать STOP без свежего receipt; PROD DB/SQLite напрямую не читать.
+7. [pending] Независимое post-deploy cross-review receipts; обновить tracked runbook/очередь и локальные CURRENT/WORK_LOG с точной границей того, что проверено.
 
 ## Acceptance / stop conditions
 - Новый RELEASE_TAG / images и точные source/archive hashes подтверждены.
