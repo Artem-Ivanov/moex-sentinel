@@ -33,7 +33,6 @@ def trading_status(instrument_id: str, *, captured_at: datetime = NOW) -> Stream
         instrument_id=instrument_id,
         status="SECURITY_TRADING_STATUS_NORMAL_TRADING",
         limit_order_available=True,
-        api_trade_available=True,
         captured_at=captured_at,
     )
 
@@ -54,7 +53,7 @@ def test_snapshot_is_atomic_and_uses_latest_events() -> None:
     assert snapshot.created_at == NOW
     assert snapshot.instruments["i1"].order_book.best_ask.price == Decimal("100.1")
     assert snapshot.instruments["i1"].last_price.price == Decimal("100.05")
-    assert snapshot.instruments["i1"].is_tradeable(NOW, timedelta(seconds=1))
+    assert not snapshot.instruments["i1"].is_tradeable(NOW, timedelta(seconds=1))
     assert not snapshot.instruments["i2"].is_tradeable(NOW, timedelta(seconds=1))
 
 
@@ -72,7 +71,7 @@ def test_stale_or_inconsistent_order_book_is_not_tradeable() -> None:
     assert not inconsistent.instruments["i1"].is_tradeable(NOW, timedelta(seconds=1))
 
 
-def test_status_remains_tradeable_for_the_stream_session() -> None:
+def test_stream_status_does_not_supply_api_trade_availability() -> None:
     async def scenario():
         cache = HotMarketDataCacheService()
         await cache.update_order_book(order_book("i1"))
@@ -81,7 +80,7 @@ def test_status_remains_tradeable_for_the_stream_session() -> None:
 
     snapshot = asyncio.run(scenario())
 
-    assert snapshot.instruments["i1"].is_tradeable(NOW, timedelta(seconds=1))
+    assert not snapshot.instruments["i1"].is_tradeable(NOW, timedelta(seconds=1))
 
 
 def test_snapshot_mapping_is_immutable() -> None:

@@ -1,0 +1,9 @@
+# Task2 review round1
+
+Reviewer audit_review_20261020: NO-GO C0/I4/M1.
+I1 initialGETне должен требоватьужеизвестныйintentID; сначалабезfilter.
+I2 дваGETвозвращаютCore+cachedWorker, не2independentnewWorkerobservations; source/receipt/HTTPcapturetimesразделить.
+I3нетточныхD3GET/query/cursor/completenesssteps.
+I4Coreacceptedenvelope!=receivedACKWorker; durableACKunknownеслинетисточника.
+M1404неоднозначен(legacyroute/missingautomation/foreignscope), версиюпонемуневыводить.
+Авторuncertain_recovery_packet_authorвозобновлёндляисправления4I/M, затемre-review. Первыйfollowupбылотклонёнthreadlimit4, дождалисьзавершенияreviewer; лимитнеобходился.

@@ -10,7 +10,9 @@ from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
 from trading_automaton.domain.core_contracts import AutomationStatusesResult
 from trading_automaton.domain.errors import CoreOperationError
-from trading_automaton.services.automation_lifecycle import WorkerAutomationLifecycleService
+from trading_automaton.services.automation_lifecycle import (
+    WorkerAutomationLifecycleService,
+)
 
 
 class CoordinatorRepositoryPort(Protocol):
@@ -42,6 +44,20 @@ class CoordinatorRepositoryPort(Protocol):
 
     def hold_active(self, reason: str, automation_id: str | None = None) -> None: ...
 
+    def execution_commission_candidates(
+        self,
+        scopes: list[tuple[str, str, str]],
+        *,
+        limit: int = 100,
+    ) -> list[tuple[str, str, str, str]]: ...
+
+    def save_execution_commission_statuses(
+        self,
+        updates: list[tuple[str, str, str, str, str, Decimal | None]],
+        *,
+        checked_at: datetime,
+    ) -> None: ...
+
 
 class CoordinatorSynchronizationPort(Protocol):
     def claim_commands(self, worker_id: str, limit: int) -> list[AutomationCommand]: ...
@@ -50,7 +66,11 @@ class CoordinatorSynchronizationPort(Protocol):
 
 
 class CoordinatorStatusPort(Protocol):
-    def automation_statuses(self, automation_ids: list[str]) -> AutomationStatusesResult: ...
+    def automation_statuses(
+        self,
+        automation_ids: list[str],
+        commission_order_ids: list[str] | None = None,
+    ) -> AutomationStatusesResult: ...
 
 
 class SynchronizeTradingRuntimeUsecase:
@@ -66,6 +86,7 @@ class SynchronizeTradingRuntimeUsecase:
         worker_id: str,
         now: Callable[[], datetime],
         command_limit: int = 100,
+        commission_cache_enabled: bool = False,
     ) -> None:
         self._repository = repository
         self._synchronization = synchronization
@@ -74,6 +95,8 @@ class SynchronizeTradingRuntimeUsecase:
         self._worker_id = worker_id
         self._now = now
         self._command_limit = command_limit
+        self._commission_cache_enabled = commission_cache_enabled
+        self.last_claimed_count = 0
 
     async def execute(
         self,
@@ -81,6 +104,7 @@ class SynchronizeTradingRuntimeUsecase:
         replace_broker_commands: Callable[[dict[str, list[AutomationCommand]]], Awaitable[None]],
     ) -> Literal["COMPLETED", "OUTBOX_BLOCKED"]:
         """Flush, claim and reconcile commands before publishing the current broker groups."""
+        self.last_claimed_count = 0
         try:
             if not await self._flush_all():
                 await self._publish_transient_holds(replace_broker_commands)
@@ -90,8 +114,9 @@ class SynchronizeTradingRuntimeUsecase:
                 self._worker_id,
                 self._command_limit,
             )
+            self.last_claimed_count = len(claimed)
             for command in claimed:
-                if command.bootstrap is None:
+                if command.bootstrap is None and not command.resume_requested:
                     self._lifecycle.propose(
                         automation_id=str(command.automation_id),
                         target=AutomationState.IN_WORK,
@@ -166,10 +191,26 @@ class SynchronizeTradingRuntimeUsecase:
         """Apply Core states to monitored commands, holding automations missing from Core."""
         if not commands:
             return {}
-        result = await asyncio.to_thread(
-            self._core.automation_statuses,
-            [str(command.automation_id) for command in commands],
-        )
+        commission_candidates: list[tuple[str, str, str, str]] = []
+        commission_order_ids: list[str] = []
+        if self._commission_cache_enabled:
+            scopes = [
+                (str(command.automation_id), str(command.user_broker_id), command.currency.upper())
+                for command in commands
+                if command.state is AutomationState.IN_WORK
+            ]
+            commission_candidates = await asyncio.to_thread(
+                self._repository.execution_commission_candidates,
+                scopes,
+                limit=100,
+            )
+            commission_order_ids = [source_id for _, source_id, _, _ in commission_candidates]
+        arguments = [[str(command.automation_id) for command in commands]]
+        if commission_order_ids:
+            arguments.append(commission_order_ids)
+        result = await asyncio.to_thread(self._core.automation_statuses, *arguments)
+        if commission_candidates:
+            await self._save_commission_statuses(result, commission_candidates)
         statuses = result.automations
         missing = {str(automation_id) for automation_id in result.missing_automation_ids}
         for command in commands:
@@ -186,7 +227,7 @@ class SynchronizeTradingRuntimeUsecase:
             await asyncio.to_thread(
                 self._repository.synchronize_core_state,
                 automation_id,
-                state=raw_state.value if isinstance(raw_state, AutomationState) else str(raw_state),
+                state=(raw_state.value if isinstance(raw_state, AutomationState) else str(raw_state)),
                 revision=int(str(status["revision"])),
                 last_sequence_number=(
                     int(str(status["last_sequence_number"])) if status.get("last_sequence_number") is not None else None
@@ -199,3 +240,48 @@ class SynchronizeTradingRuntimeUsecase:
             state = status["state"]
             result[automation_id] = state.value if isinstance(state, AutomationState) else str(state)
         return result
+
+    async def _save_commission_statuses(
+        self,
+        result: AutomationStatusesResult,
+        candidates: list[tuple[str, str, str, str]],
+    ) -> None:
+        requested = {source_id for _, source_id, _, _ in candidates}
+        entries = result.commission_statuses
+        updates: list[tuple[str, str, str, str, str, Decimal | None]] = []
+        valid = set(entries) == requested
+        if valid:
+            for automation_id, source_id, broker_id, currency in candidates:
+                entry = entries[source_id]
+                status = entry.get("commission_status")
+                amount = entry.get("effective_broker_commission")
+                if (
+                    entry.get("automation_id") != automation_id
+                    or entry.get("user_broker_id") != broker_id
+                    or entry.get("currency") != currency
+                    or status not in {"KNOWN", "MISSING", "UNKNOWN"}
+                    or (status == "KNOWN" and amount is None)
+                    or (
+                        amount is not None
+                        and (
+                            not isinstance(amount, Decimal)
+                            or not amount.is_finite()
+                            or amount < 0
+                            or amount >= Decimal("1e19")
+                            or amount.quantize(Decimal("1e-9")) != amount
+                        )
+                    )
+                ):
+                    valid = False
+                    break
+                updates.append((automation_id, source_id, broker_id, currency, status, amount))
+        if not valid:
+            updates = [
+                (automation_id, source_id, broker_id, currency, "UNKNOWN", None)
+                for automation_id, source_id, broker_id, currency in candidates
+            ]
+        await asyncio.to_thread(
+            self._repository.save_execution_commission_statuses,
+            updates,
+            checked_at=self._now(),
+        )

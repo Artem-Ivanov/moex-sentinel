@@ -24,8 +24,12 @@ def instrument(identifier="instrument", *, age_ms=0, valid=True):
                 "instrument_id": identifier,
                 "status": "NORMAL",
                 "limit_order_available": True,
-                "api_trade_available": True,
                 "captured_at": NOW - timedelta(hours=1),
+            },
+            "api_trading_status": {
+                "api_trade_available": True,
+                "observed_at": NOW,
+                "expires_at": NOW + timedelta(seconds=30),
             },
         },
         "candles": [

@@ -3,6 +3,7 @@
 import hashlib
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -88,6 +89,9 @@ class TradingAdmissionService:
 
     def view(self, broker_id: str) -> AdmissionView:
         return self._repository.get_view(broker_id, now=self._clock())
+
+    def expects_trading(self, broker_id: UUID) -> bool:
+        return self._repository.expects_trading(str(broker_id))
 
     def pending_runtime_candidate(
         self, broker_id: str, worker_id: str, registered_after: datetime
@@ -301,7 +305,26 @@ class TradingAdmissionService:
             suggested_limits=None,
             risk_reasons=(),
         )
-        return await self.validate_daily_preparation(broker_id, observation)
+        prepared = await self.validate_daily_preparation(broker_id, observation)
+        if prepared.status is DailyAdmissionPreparationStatus.BASELINE_ACCEPTED and await run_sync(
+            partial(self._repository.needs_age_policy_recovery, broker_id)
+        ):
+            current = await run_sync(partial(self._repository.get_view, broker_id, now=self._clock()))
+            if current.owner_runtime_instance_id is not None and current.owner_generation is not None:
+                with suppress(AdmissionConflictError, ValueError):
+                    await self.reconcile(
+                        broker_id,
+                        ReconciliationRequest(expected_revision=current.revision, canary_uid=None),
+                        runtime_instance_id=(
+                            current.owner_runtime_instance_id
+                            if isinstance(current.owner_runtime_instance_id, UUID)
+                            else UUID(current.owner_runtime_instance_id)
+                        ),
+                        generation=current.owner_generation,
+                        automatic=True,
+                    )
+                    # Recovery remains gated; the next daily preparation retries with a fresh snapshot.
+        return prepared
 
     async def validate_daily_preparation(
         self, broker_id: str, observation: DailyAdmissionPreparationView
@@ -541,6 +564,9 @@ class TradingAdmissionService:
             else datetime.combine(now.astimezone(ZoneInfo("Europe/Moscow")).date(), time.min, ZoneInfo("Europe/Moscow"))
         )
         request_ids = await run_sync(partial(self._repository.unresolved_request_ids, broker_id))
+        age_policy_ids = (
+            await run_sync(partial(self._repository.age_policy_candidate_ids, broker_id)) if automatic else frozenset()
+        )
         snapshot = await risk.collect(
             connection,
             instrument_uid=request.canary_uid,
@@ -549,9 +575,22 @@ class TradingAdmissionService:
         )
         now = self._clock()
         reasons: list[SubmitDenialReason] = []
+        unknown_states = [state for state in snapshot.order_states if state.unknown_reason is not None]
+        request_not_found_ids = {
+            state.request_id for state in unknown_states if state.unknown_reason == "REQUEST_NOT_FOUND"
+        }
+        age_policy_unknowns_are_accounted = (
+            automatic
+            and bool(age_policy_ids)
+            and set(snapshot.unknown_reasons) <= {"REQUEST_NOT_FOUND"}
+            and len(request_not_found_ids) == len(unknown_states)
+            and request_not_found_ids <= age_policy_ids
+            and all(state.unknown_reason == "REQUEST_NOT_FOUND" for state in unknown_states)
+            and len({state.request_id for state in snapshot.order_states}) == len(snapshot.order_states)
+        )
         if (
             snapshot.account_id != account_id
-            or snapshot.unknown_reasons
+            or (snapshot.unknown_reasons and not age_policy_unknowns_are_accounted)
             or snapshot.capture_started_at > snapshot.captured_at
             or snapshot.captured_at > now
             or snapshot.valid_until <= now
@@ -570,7 +609,15 @@ class TradingAdmissionService:
             reasons.append(SubmitDenialReason.FOREIGN_ACTIVE_ORDER)
         if snapshot.stop_orders:
             reasons.append(SubmitDenialReason.FOREIGN_ACTIVE_ORDER)
-        if any(not state.attributable or state.unknown_reason for state in snapshot.order_states):
+        if any(
+            (not state.attributable or state.unknown_reason)
+            and not (
+                age_policy_unknowns_are_accounted
+                and state.unknown_reason == "REQUEST_NOT_FOUND"
+                and state.request_id in age_policy_ids
+            )
+            for state in snapshot.order_states
+        ):
             reasons.append(SubmitDenialReason.DATA_UNKNOWN)
         unresolved_count = await run_sync(partial(self._repository.unresolved_reservation_count, broker_id))
         scope = "ACCOUNT"
@@ -606,6 +653,25 @@ class TradingAdmissionService:
                     lot_size=position.lot_size,
                 )
             )
+        if automatic and age_policy_ids:
+            age_lots = await run_sync(
+                partial(self._repository.age_policy_candidate_anchor_lots, broker_id)
+            )
+            if age_lots is None:
+                reasons.append(SubmitDenialReason.DATA_UNKNOWN)
+            else:
+                anchor_lots_by_uid = {item.instrument_uid: item.lot_size for item in position_anchors}
+                for uid, lot_size in age_lots:
+                    if uid in anchor_lots_by_uid:
+                        if anchor_lots_by_uid[uid] != lot_size:
+                            reasons.append(SubmitDenialReason.DATA_UNKNOWN)
+                        continue
+                    # A complete account position snapshot omits zero holdings.
+                    # Retain a zero anchor for each unresolved historical order so
+                    # a later authenticated fill can be checked against fresh units.
+                    position_anchors.append(
+                        ReconciliationPositionAnchor(instrument_uid=uid, quantity_units=Decimal(0), lot_size=lot_size)
+                    )
         if (
             snapshot.equity is None
             or not snapshot.equity.is_finite()
@@ -911,7 +977,15 @@ class TradingAdmissionService:
             return SubmitDenied(reason=SubmitDenialReason.STALE_MARKET, outcome_uncertain=False)
         risk_position_anchors = self._position_anchors(snapshot, context)
         risk_anchor_uids = {item.instrument_uid for item in risk_position_anchors}
-        if any(item.instrument_uid not in risk_anchor_uids for item in context.reservations):
+        unresolved_states = {
+            SubmitReservationState.IN_FLIGHT.value,
+            SubmitReservationState.BROKER_ACTIVE.value,
+            SubmitReservationState.UNKNOWN.value,
+        }
+        if any(
+            item.state in unresolved_states and item.instrument_uid not in risk_anchor_uids
+            for item in context.reservations
+        ):
             return SubmitDenied(reason=SubmitDenialReason.DATA_UNKNOWN, outcome_uncertain=False)
         required_mark_uids = {
             request.instrument_uid,
@@ -995,7 +1069,7 @@ class TradingAdmissionService:
         previous_anchors = (
             {} if reconciliation is None else {item.instrument_uid: item for item in reconciliation.position_anchors}
         )
-        for reservation in (() if context is None else context.reservations):
+        for reservation in () if context is None else context.reservations:
             if reservation.state != SubmitReservationState.SETTLED.value or reservation.instrument_uid in anchored_uids:
                 continue
             prior = previous_anchors.get(reservation.instrument_uid)

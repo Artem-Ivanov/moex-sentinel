@@ -25,6 +25,7 @@ def test_anonymous_api_is_private_but_health_is_public(tmp_path: Path, monkeypat
         response = client.get("/api/brokers")
         assert response.status_code == 401
         assert response.headers["Cache-Control"] == "no-store"
+        assert client.get("/api/trading-automations/missing/decision-reasons").status_code == 401
         assert client.get("/api/health").status_code == 200
 
 

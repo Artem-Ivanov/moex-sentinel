@@ -14,6 +14,18 @@ export interface ServiceVersionObservation<Reason extends ServiceVersionReason =
 export type WorkerDiagnosticReason = "NOT_OBSERVED" | "STALE" | "CONTROL_PROGRESS" | "CONTROL_STALLED" | "OUTBOX_BLOCKED" | "ITERATION_FAILED"
 export type OutboxDiagnosticReason = "NOT_OBSERVED" | "STALE" | "READ_FAILED" | "CLEAR" | "PENDING" | "FAILED" | "OLD_PENDING"
 export type WorkerIterationResult = "COMPLETED" | "OUTBOX_BLOCKED" | "ERROR"
+export type BrokerRuntimeStatus = "IDLE" | "RUNNING" | "BLOCKED" | "UNKNOWN"
+export type BrokerDecisionEligibility = "READY" | "NOT_READY" | "UNKNOWN"
+export type BrokerRuntimeReason = "NOT_OBSERVED" | "NO_ACTIVE_COMMAND" | "ITERATION_RUNNING" | "DECISION_FRAME_AVAILABLE" | "NO_DECISION_FRAME" | "BROKER_RETRYING" | "PERMANENT_BROKER_ERROR" | "STALE"
+
+export interface BrokerRuntimeDiagnostics {
+  status: BrokerRuntimeStatus
+  decision_eligibility: BrokerDecisionEligibility
+  reason: BrokerRuntimeReason
+  last_started_at: string | null
+  last_finished_at: string | null
+  last_success_at: string | null
+}
 
 export interface OutboxDiagnosticsObservation {
   observation: "OBSERVED" | "UNKNOWN"
@@ -40,6 +52,8 @@ export interface WorkerDiagnosticsObservation {
   last_result: WorkerIterationResult | null
   error_code: "ITERATION_FAILED" | null
   outbox: OutboxDiagnosticsObservation
+  /** Absent in responses from earlier Core versions. */
+  broker_runtime?: BrokerRuntimeDiagnostics
 }
 
 export interface DiagnosticsStatus {

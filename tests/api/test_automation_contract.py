@@ -1,5 +1,6 @@
 """HTTP contracts for strategy-free trading automation actions."""
 
+from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID
@@ -17,9 +18,11 @@ from moex_sentinel.domain.portfolio import BrokerOperationsView
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.automations import AutomationService
 from moex_sentinel.storage.models import Base
+from moex_sentinel.storage.models.trading_observability import TradeAuditEventModel
 from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.usecases.automations import ViewTradingAutomationDetailsUsecase, ViewTradingAutomationsUsecase
 from sentinel_contracts.broker_execution import BrokerConnection
+from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.trading import AutomationState
 from tests.storage.trading_facts_helpers import NOW, automation_model, instrument_model, user_broker_model
 from trading_automaton.adapters.core_client import CoreClient
@@ -185,6 +188,7 @@ def test_public_automation_contract_is_strategy_free(monkeypatch, tmp_path) -> N
     ):
         assert (payload["strategy_code"], payload["strategy_version"]) == (strategy.code, strategy.version)
     assert enriched_response.json()["automation"]["id"] == "automation-1"
+    assert enriched_response.json()["captured_at"].endswith("Z")
     assert held.json()["state"] == "HOLD"
     assert resumed.json()["state"] == "IN_QUEUE"
     assert closed.json()["state"] == "CLOSED"
@@ -232,6 +236,112 @@ def test_settings_patch_uses_two_revisions_and_is_available_before_trade(monkeyp
     assert cleared.json()["revision"] == 1
     assert cleared.json()["settings_revision"] == 2
     assert cleared.json()["order_quota_percent"] is None
+
+
+def test_decision_reasons_route_returns_only_bounded_scoped_audit_projection(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("APPLICATION_ENVIRONMENT", "TEST")
+    database_url = f"sqlite:///{tmp_path / 'decision-reasons.db'}"
+    captured_at = utc_now_ms()
+    engine = create_engine(database_url)
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine, expire_on_commit=False).begin() as session:
+        session.add(user_broker_model("scope-1", "account-1"))
+        session.flush()
+        session.add(instrument_model("instrument-1", "scope-1"))
+        session.flush()
+        session.add_all(
+            [
+                automation_model("automation-1"),
+                automation_model("automation-2", state="CLOSED", closed=True),
+            ]
+        )
+        session.flush()
+        for index in range(7):
+            session.add(
+                TradeAuditEventModel(
+                    event_id=f"decision-{index}",
+                    process_id="process-1",
+                    parent_process_id=None,
+                    user_broker_id="scope-1",
+                    automation_id="automation-1",
+                    decision_id=None,
+                    broker_order_id=None,
+                    execution_id=None,
+                    instrument_id="instrument-1",
+                    level="INFO",
+                    stage="STRATEGY_DECISION_MADE",
+                    safe_message="safe audit message",
+                    data=(
+                        {"decision": {"secret": "hidden"}, "reason_code": ["hidden"], "account": "hidden"}
+                        if index == 6
+                        else {"decision": "WAIT", "reason_code": "NO_SIGNAL", "account": "hidden"}
+                    ),
+                    occurred_at=captured_at - timedelta(hours=25, minutes=6 - index),
+                    created_at=NOW,
+                    critical=False,
+                )
+            )
+        session.add(
+            TradeAuditEventModel(
+                event_id="other-automation",
+                process_id="process-1",
+                parent_process_id=None,
+                user_broker_id="scope-1",
+                automation_id="automation-2",
+                decision_id=None,
+                broker_order_id=None,
+                execution_id=None,
+                instrument_id="instrument-1",
+                level="INFO",
+                stage="STRATEGY_DECISION_MADE",
+                safe_message="safe audit message",
+                data={"decision": "SELL", "reason_code": "OTHER"},
+                occurred_at=captured_at - timedelta(hours=25, minutes=8),
+                created_at=NOW,
+                critical=False,
+            )
+        )
+    engine.dispose()
+
+    with TestClient(create_app(test_auth_bypass=True, database_url=database_url)) as client:
+        default = client.get("/api/trading-automations/automation-1/decision-reasons")
+        bounded = client.get("/api/trading-automations/automation-1/decision-reasons?limit=20")
+        invalid = client.get("/api/trading-automations/automation-1/decision-reasons?limit=21")
+        missing = client.get("/api/trading-automations/not-found/decision-reasons")
+
+    assert default.status_code == bounded.status_code == 200
+    assert invalid.status_code == 422
+    assert missing.status_code == 404
+    default_payload = default.json()
+    assert set(default_payload) == {"captured_at", "items"}
+    assert [item["event_id"] for item in default_payload["items"]] == [
+        "decision-6",
+        "decision-5",
+        "decision-4",
+        "decision-3",
+        "decision-2",
+    ]
+    assert set(default_payload["items"][0]) == {
+        "event_id",
+        "occurred_at",
+        "decision",
+        "reason_code",
+        "historical",
+    }
+    assert all(item["historical"] for item in default_payload["items"])
+    assert [item["event_id"] for item in bounded.json()["items"]] == [
+        "decision-6",
+        "decision-5",
+        "decision-4",
+        "decision-3",
+        "decision-2",
+        "decision-1",
+        "decision-0",
+    ]
+    assert bounded.json()["items"][0]["decision"] is None
+    assert bounded.json()["items"][0]["reason_code"] is None
+    for leaked in ("account", "hidden", "safe audit message"):
+        assert leaked not in bounded.text
 
 
 @pytest.mark.parametrize(
@@ -335,5 +445,6 @@ def test_api_distinguishes_pending_bootstrap_from_confirmed_position(
     assert listed.status_code == details.status_code == 200
     for payload in (listed.json()["items"][0], details.json()["automation"]):
         assert payload["bootstrap_pending"] is expected
+        assert payload["hold_reason"] == ("BOOTSTRAPPING" if state == "HOLD" and snapshot != "none" else None)
         assert payload["quantity_lots"] == 0
         assert Decimal(payload["average_price"]) == 0

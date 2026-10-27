@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import ConfigDict, Field, StrictInt, model_validator
+from pydantic import ConfigDict, Field, StrictInt, ValidationError, model_validator
 
 from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.views.schemas.market_data import HistoricCandleSchema
-from moex_sentinel.views.schemas.portfolio import MoneySchema, OperationSchema
+from moex_sentinel.views.schemas.portfolio import OperationSchema
 from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.broker_execution import BrokerConnection
 from sentinel_contracts.business_audit import (
@@ -20,10 +20,11 @@ from sentinel_contracts.business_audit import (
     PublishAuditResult,
 )
 from sentinel_contracts.runtime_versions import RuntimeVersion
+from sentinel_contracts.time import utc_now_ms
 from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import OrderQuotaPercent
-from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics, WorkerExecutionDiagnostics
 
 if TYPE_CHECKING:
     from moex_sentinel.domain.automations import TradingAutomationDetails
@@ -63,12 +64,14 @@ class AutomationSchema(StrictSchema):
     unrealized_pnl: Decimal
     net_pnl: Decimal
     actual_commissions: Decimal
+    financial_status: Literal["COMPLETE", "INCOMPLETE", "UNKNOWN"] = "INCOMPLETE"
     broker_name: str
     ticker: str
     instrument_name: str
     bootstrap_pending: bool = False
     order_quota_percent: Decimal | None
     settings_revision: int = 0
+    hold_reason: str | None = None
 
     @classmethod
     def from_domain(cls, value: AutomationRecord) -> AutomationSchema:
@@ -77,6 +80,19 @@ class AutomationSchema(StrictSchema):
 
 class AutomationListSchema(StrictSchema):
     items: list[AutomationSchema]
+
+
+class DecisionReasonItemSchema(StrictSchema):
+    event_id: str
+    occurred_at: datetime
+    decision: str | None
+    reason_code: str | None
+    historical: bool
+
+
+class DecisionReasonsSchema(StrictSchema):
+    captured_at: datetime
+    items: list[DecisionReasonItemSchema]
 
 
 class TradingSessionsStatusSchema(StrictSchema):
@@ -94,6 +110,7 @@ class PositionDetailsErrorSchema(StrictSchema):
 
 
 class TradingAutomationDetailsSchema(StrictSchema):
+    captured_at: datetime
     automation: AutomationSchema
     operations: list[OperationSchema]
     candles: list[HistoricCandleSchema]
@@ -101,26 +118,11 @@ class TradingAutomationDetailsSchema(StrictSchema):
 
     @classmethod
     def from_domain(cls, value: TradingAutomationDetails) -> TradingAutomationDetailsSchema:
+        captured_at = utc_now_ms()
         return cls(
+            captured_at=captured_at,
             automation=AutomationSchema.from_domain(value.automation),
-            operations=[
-                OperationSchema(
-                    broker_id=item.broker_id,
-                    broker_name=item.broker_name,
-                    operation_id=item.operation.operation_id,
-                    account_id=item.operation.account_id,
-                    operation_type=item.operation.operation_type,
-                    state=item.operation.state,
-                    occurred_at=item.operation.occurred_at,
-                    payment=MoneySchema.from_domain(item.operation.payment),
-                    price=MoneySchema.from_domain(item.operation.price),
-                    quantity=item.operation.quantity,
-                    commission=MoneySchema.from_domain(item.operation.commission),
-                    instrument_id=item.operation.instrument_id,
-                    ticker=item.operation.ticker,
-                )
-                for item in value.operations
-            ],
+            operations=[OperationSchema.from_domain(item, captured_at) for item in value.operations],
             candles=[HistoricCandleSchema.model_validate(item, from_attributes=True) for item in value.candles],
             errors=[PositionDetailsErrorSchema.model_validate(item, from_attributes=True) for item in value.errors],
         )
@@ -170,6 +172,50 @@ class HeartbeatRequestSchema(StrictSchema):
     occurred_at: datetime
     runtime_version: RuntimeVersion | None = None
     worker_diagnostics: WorkerDiagnostics | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def contain_invalid_execution_projection(cls, value):
+        if not isinstance(value, dict):
+            return value
+        diagnostics = value.get("worker_diagnostics")
+        if not isinstance(diagnostics, dict) or "execution_diagnostics" not in diagnostics:
+            return value
+        raw_execution = diagnostics["execution_diagnostics"]
+        if raw_execution is None:
+            return value
+        oversized = False
+        if isinstance(raw_execution, dict):
+            rows = raw_execution.get("rows")
+            if isinstance(rows, (list, tuple)):
+                oversized = len(rows) > 100
+                if not oversized:
+                    oversized = any(
+                        isinstance(row, dict)
+                        and isinstance(row.get("intents"), (list, tuple))
+                        and len(row["intents"]) > 5
+                        for row in rows
+                    )
+        if oversized:
+            value = dict(value)
+            diagnostics = dict(diagnostics)
+            diagnostics["execution_diagnostics"] = {
+                "observation": "UNKNOWN",
+                "reason": "INVALID_PROJECTION",
+            }
+            value["worker_diagnostics"] = diagnostics
+            return value
+        try:
+            WorkerExecutionDiagnostics.model_validate(raw_execution)
+        except ValidationError:
+            value = dict(value)
+            diagnostics = dict(diagnostics)
+            diagnostics["execution_diagnostics"] = {
+                "observation": "UNKNOWN",
+                "reason": "INVALID_PROJECTION",
+            }
+            value["worker_diagnostics"] = diagnostics
+        return value
 
     @model_validator(mode="after")
     def require_diagnostic_identity(self):

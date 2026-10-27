@@ -4,6 +4,7 @@ from datetime import datetime
 from types import TracebackType
 from typing import Protocol, Self
 
+from moex_sentinel.domain.automations import DecisionReasonItem
 from moex_sentinel.domain.trading_facts import (
     AutomationEnvelopeDraft,
     BrokerAccountFeeProfileDraft,
@@ -31,6 +32,15 @@ class AutomationFactsPort(Protocol):
     ) -> TradingAutomationDraft: ...
 
     def get(self, user_broker_id: str, automation_id: str) -> TradingAutomationDraft: ...
+
+    def has_current_worker_technical_hold(
+        self,
+        user_broker_id: str,
+        automation_id: str,
+        *,
+        revision: int,
+        hold_reason: str,
+    ) -> bool: ...
 
     def compare_and_set_state(
         self,
@@ -87,6 +97,10 @@ class OrderFactsPort(Protocol):
 
     def list_executions(self, user_broker_id: str, order_id: str) -> tuple[TradeExecutionDraft, ...]: ...
 
+    def execution_diagnostics(
+        self, user_broker_id: str, automation_id: str, *, limit: int, intent_id: str | None = None
+    ) -> dict[str, object]: ...
+
 
 class PositionLedgerPort(Protocol):
     def open_cycle(self, user_broker_id: str, value: PositionCycleDraft) -> PositionCycleDraft: ...
@@ -136,6 +150,13 @@ class TradingAuditPort(Protocol):
         """Return scoped matches by event OR automation/sequence, in no defined order."""
         ...
 
+    def list_recent_decision_reasons(
+        self,
+        user_broker_id: str,
+        automation_id: str,
+        limit: int,
+    ) -> tuple[DecisionReasonItem, ...]: ...
+
 
 class TradingAnalyticsPort(Protocol):
     def upsert_fee_profile(
@@ -154,6 +175,10 @@ class TradingAnalyticsPort(Protocol):
 class TradingFactsUnitOfWorkPort(Protocol):
     def scope_matches_environment(self, user_broker_id: str, environment: str) -> bool: ...
 
+    def execution_diagnostics_scope(
+        self, user_broker_id: str, automation_id: str, *, limit: int, intent_id: str | None = None
+    ) -> dict[str, object] | None: ...
+
     def authorize_fact_runtime(
         self,
         user_broker_id: str,
@@ -168,6 +193,12 @@ class TradingFactsUnitOfWorkPort(Protocol):
     ) -> FactSubmitReservation | None: ...
 
     def confirm_submit_not_sent(self, user_broker_id: str, idempotency_key: str, *, now: datetime) -> bool: ...
+
+    def record_age_policy_candidate(
+        self, user_broker_id: str, idempotency_key: str, *, expired_at: datetime
+    ) -> bool: ...
+
+    def sync_age_policy_settled_execution(self, user_broker_id: str, order_id: str) -> None: ...
 
     @property
     def automations(self) -> AutomationFactsPort: ...

@@ -30,6 +30,7 @@ def test_composition_passes_market_environment_timings_to_gateway() -> None:
         market_operation_timeout_seconds=4,
         market_close_timeout_seconds=3,
         market_quiet_seconds=8,
+        market_trading_status_ttl_seconds=18,
         market_candles_refresh_seconds=12,
     )
     gateway = build_market_snapshot_gateway(object(), retry_limit=5, settings=settings)
@@ -40,6 +41,7 @@ def test_composition_passes_market_environment_timings_to_gateway() -> None:
     assert gateway._recovery.close_timeout_seconds == 3
     assert gateway._recovery.quiet_seconds == 8
     assert gateway._refresh == 12
+    assert gateway._trading_status_ttl == 18
 
 
 def candle(at, close="10"):
@@ -53,6 +55,7 @@ class Source:
         self.history_gate = asyncio.Event()
         self.history_gate.set()
         self.history_calls = []
+        self.trading_status_calls = []
         self.starts = 0
         self.closes = 0
 
@@ -69,6 +72,10 @@ class Source:
         self.history_calls.append(instrument_id)
         await self.history_gate.wait()
         return (candle(NOW - timedelta(minutes=2)),) if instrument_id == "AAA" else ()
+
+    async def get_trading_status(self, instrument_id):
+        self.trading_status_calls.append(instrument_id)
+        return True
 
     async def events(self):
         while True:
@@ -96,7 +103,7 @@ async def ready(source):
     await source.queue.put(
         StreamOrderBook("AAA", (OrderBookLevel(Decimal("10"), 2),), (OrderBookLevel(Decimal("11"), 2),), NOW, True)
     )
-    await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, True, NOW))
+    await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, NOW))
     await settle()
 
 
@@ -122,6 +129,88 @@ def test_lazy_union_and_stable_snapshot_preserve_capture_time():
         assert "token" not in snapshot.model_dump_json()
         await gateway.close()
         assert source.closes == 1
+
+    asyncio.run(run())
+
+
+def test_unary_trading_availability_is_fresh_and_stream_updates_do_not_refresh_it():
+    async def run():
+        clock = [NOW]
+        source = Source()
+        gateway = MarketSnapshotGateway(
+            lambda _: source,
+            now=lambda: clock[0],
+            trading_status_ttl_seconds=10,
+        )
+        request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
+        try:
+            await gateway.snapshot(request)
+            await pump_until(lambda: source.trading_status_calls == ["AAA"])
+            await ready(source)
+            await pump_until(lambda: source.trading_status_calls == ["AAA"])
+            fresh = (await gateway.snapshot(request)).instruments[0]
+            assert fresh.market.api_trading_status is not None
+            assert fresh.market.api_trading_status.observed_at == NOW
+            assert fresh.market.api_trading_status.expires_at == NOW + timedelta(seconds=10)
+            assert fresh.available
+
+            clock[0] = NOW + timedelta(seconds=10)
+            await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, clock[0]))
+            await settle()
+            stale = (await gateway.snapshot(request)).instruments[0]
+
+            assert stale.market.api_trading_status == fresh.market.api_trading_status
+            assert not stale.market.has_fresh_api_trade_availability(clock[0])
+            assert not stale.available
+        finally:
+            await gateway.close()
+
+    asyncio.run(run())
+
+
+def test_timed_out_unary_refresh_is_singleflight_and_gateway_close_is_bounded():
+    class ResistantStatusSource(Source):
+        def __init__(self):
+            super().__init__()
+            self.release = asyncio.Event()
+            self.cancel_received = asyncio.Event()
+
+        async def get_trading_status(self, instrument_id):
+            self.trading_status_calls.append(instrument_id)
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancel_received.set()
+                await self.release.wait()
+            return True
+
+    async def run():
+        source = ResistantStatusSource()
+        clock = [NOW]
+        gateway = MarketSnapshotGateway(
+            lambda _: source,
+            now=lambda: clock[0],
+            trading_status_ttl_seconds=0.02,
+            recovery=MarketRecoveryPolicy(operation_timeout_seconds=0.005, close_timeout_seconds=0.005),
+        )
+        request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
+        try:
+            await gateway.snapshot(request)
+            await asyncio.wait_for(source.cancel_received.wait(), 0.2)
+            await settle()
+            clock[0] += timedelta(seconds=0.05)
+            await asyncio.sleep(0.04)
+            assert source.trading_status_calls == ["AAA"]
+            assert not (await gateway.snapshot(request)).instruments[0].available
+
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(gateway.close(), 0.1)
+            source.release.set()
+            await settle()
+            await gateway.close()
+        finally:
+            source.release.set()
+            await gateway.close()
 
     asyncio.run(run())
 
@@ -187,7 +276,7 @@ def test_mixed_batch_keeps_each_quote_age_and_does_not_renew_envelope_on_read():
                 "BBB", (OrderBookLevel(Decimal("10"), 2),), (OrderBookLevel(Decimal("11"), 2),), current[0], True
             )
         )
-        await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, True, current[0]))
+        await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, current[0]))
         await settle()
         snapshot = await gateway.snapshot(request)
         assert snapshot.captured_at == NOW + timedelta(seconds=10)
@@ -296,7 +385,7 @@ def test_failed_history_instrument_does_not_restart_healthy_peer_stream():
         await source.queue.put(
             StreamOrderBook("BBB", (OrderBookLevel(Decimal("10"), 2),), (OrderBookLevel(Decimal("11"), 2),), NOW, True)
         )
-        await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, True, NOW))
+        await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, NOW))
         await settle()
         snapshot = await gateway.snapshot(request)
         assert not snapshot.instruments[0].available
@@ -319,7 +408,12 @@ def test_failed_backfill_keeps_fresh_quotes_after_successful_bootstrap():
     async def run():
         clock = [NOW]
         source = FailedRefreshSource()
-        gateway = MarketSnapshotGateway(lambda _: source, now=lambda: clock[0], refresh_seconds=0.001)
+        gateway = MarketSnapshotGateway(
+            lambda _: source,
+            now=lambda: clock[0],
+            refresh_seconds=0.001,
+            trading_status_ttl_seconds=600,
+        )
         request = MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",))
         await gateway.snapshot(request)
         await ready(source)
@@ -328,7 +422,10 @@ def test_failed_backfill_keeps_fresh_quotes_after_successful_bootstrap():
         async with asyncio.timeout(1):
             while len(source.history_calls) < 2:  # noqa: ASYNC110 - bounded observation of the public source
                 await asyncio.sleep(0.001)
-        assert (await gateway.snapshot(request)).instruments[0].available
+        after_failed_backfill = (await gateway.snapshot(request)).instruments[0]
+        assert after_failed_backfill.available
+        assert after_failed_backfill.market.order_book is not None
+        assert after_failed_backfill.market.has_fresh_api_trade_availability(clock[0])
         assert source.starts == 1
         await gateway.close()
 
@@ -675,7 +772,6 @@ def test_incomplete_or_untradeable_market_cannot_reset_retry_budget(defect):
                         "AAA",
                         "NORMAL_TRADING",
                         defect != "trade_disabled",
-                        True,
                         NOW + timedelta(seconds=1) if defect == "future_status" else NOW,
                     )
                 )
@@ -723,7 +819,7 @@ def test_history_transient_failure_recovers_after_cooldown():
                     "AAA", (OrderBookLevel(Decimal("10"), 1),), (OrderBookLevel(Decimal("11"), 1),), clock[0], True
                 )
             )
-            await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, True, clock[0]))
+            await source.queue.put(StreamTradingStatus("AAA", "NORMAL_TRADING", True, clock[0]))
             # Advance virtual time; adding an instrument wakes the existing history owner.
             await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB")))
             await settle()
@@ -765,7 +861,7 @@ def test_history_retry_budget_survives_stream_reconnects_with_a_healthy_peer():
                         "BBB", (OrderBookLevel(Decimal("10"), 1),), (OrderBookLevel(Decimal("11"), 1),), clock[0], True
                     )
                 )
-                await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, True, clock[0]))
+                await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, clock[0]))
                 await settle()
                 await source.queue.put(ConnectionError("synthetic"))
                 await settle()
@@ -783,7 +879,7 @@ def test_history_retry_budget_survives_stream_reconnects_with_a_healthy_peer():
                         True,
                     )
                 )
-                await source.queue.put(StreamTradingStatus(instrument_id, "NORMAL_TRADING", True, True, clock[0]))
+                await source.queue.put(StreamTradingStatus(instrument_id, "NORMAL_TRADING", True, clock[0]))
             await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB", "CCC")))
             await settle()
             snapshot = await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA", "BBB")))
@@ -922,7 +1018,7 @@ def test_history_timeout_isolates_instrument_and_preserves_fresh_peer():
         try:
             await gateway.snapshot(request)
             await source.queue.put(StreamOrderBook("BBB", (OrderBookLevel(Decimal("10"), 1),), (), NOW, True))
-            await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, True, NOW))
+            await source.queue.put(StreamTradingStatus("BBB", "NORMAL_TRADING", True, NOW))
             await asyncio.sleep(0.02)
             result = await gateway.snapshot(request)
             assert not result.instruments[0].available
@@ -1046,7 +1142,7 @@ def test_quiet_stream_reconnects_unless_market_explicitly_closed(closed_market):
         try:
             await gateway.snapshot(MarketSnapshotRequest(source_id=SOURCE, instrument_ids=("AAA",)))
             if closed_market:
-                await source.queue.put(StreamTradingStatus("AAA", "NOT_AVAILABLE_FOR_TRADING", False, False, NOW))
+                await source.queue.put(StreamTradingStatus("AAA", "NOT_AVAILABLE_FOR_TRADING", False, NOW))
             await settle()
             await asyncio.sleep(0.025)
             assert (source.starts == 1) if closed_market else (source.starts >= 2)

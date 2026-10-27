@@ -92,6 +92,15 @@ class AutomationService:
 
     def hold(self, automation_id: str, reason: str) -> AutomationRecord:
         current = self.get(automation_id)
+        if current.state is AutomationState.HOLD:
+            if current.hold_reason == reason and not self._repository.is_current_worker_technical_hold(automation_id):
+                return current
+            return self._repository.set_state(
+                automation_id,
+                AutomationState.HOLD,
+                expected_revision=current.revision,
+                hold_reason=reason,
+            )
         if not self._validate_transition(current.state, AutomationState.HOLD):
             return current
         return self._repository.set_state(

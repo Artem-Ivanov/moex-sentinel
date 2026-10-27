@@ -22,24 +22,40 @@ from trading_automaton.adapters.core_client import CoreClient
 from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
 from trading_automaton.config import AutomatonSettings, StrategySettings
 from trading_automaton.domain.core_contracts import AutomationStatusesResult
-from trading_automaton.runtime.analytics_broker import AnalyticsBrokerRuntime, AnalyticsPort
+from trading_automaton.runtime.analytics_broker import (
+    AnalyticsBrokerRuntime,
+    AnalyticsPort,
+)
 from trading_automaton.runtime.streaming_coordinator import (
     CoordinatorCorePort,
     RuntimePort,
     StreamingRuntimeCoordinator,
 )
-from trading_automaton.services.account_cash_reservation import AccountCashReservationService
-from trading_automaton.services.account_commission_profile import AccountCommissionProfileService
+from trading_automaton.services.account_cash_reservation import (
+    AccountCashReservationService,
+)
+from trading_automaton.services.account_commission_profile import (
+    AccountCommissionProfileService,
+)
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
-from trading_automaton.services.analytics_frame import AnalyticsFrameService, AnalyticsMetricsCache
-from trading_automaton.services.automation_lifecycle import WorkerAutomationLifecycleService
+from trading_automaton.services.analytics_frame import (
+    AnalyticsFrameService,
+    AnalyticsMetricsCache,
+)
+from trading_automaton.services.automation_lifecycle import (
+    WorkerAutomationLifecycleService,
+)
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
 from trading_automaton.services.broker_rate_limit import BrokerRateLimitService
-from trading_automaton.services.broker_tick_preparation import BrokerTickPreparationService
+from trading_automaton.services.broker_tick_preparation import (
+    BrokerTickPreparationService,
+)
 from trading_automaton.services.business_audit import BusinessAuditService
 from trading_automaton.services.decision import TradeDecisionService
 from trading_automaton.services.decision_context import DecisionContextService
-from trading_automaton.services.decision_materialization import DecisionMaterializerService
+from trading_automaton.services.decision_materialization import (
+    DecisionMaterializerService,
+)
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.services.lot_ledger import LotLedgerService
 from trading_automaton.services.order_book_validation import OrderBookValidationService
@@ -47,7 +63,9 @@ from trading_automaton.services.order_dispatch import OrderDispatchService
 from trading_automaton.services.order_tracking import OrderTrackingService
 from trading_automaton.services.persistence_failure import PersistenceFailureService
 from trading_automaton.services.portfolio_state_cache import PortfolioStateCacheService
-from trading_automaton.services.position_batch_scheduler import PositionBatchSchedulerService
+from trading_automaton.services.position_batch_scheduler import (
+    PositionBatchSchedulerService,
+)
 from trading_automaton.services.position_bootstrap import PositionBootstrapService
 from trading_automaton.services.position_consistency import PositionConsistencyService
 from trading_automaton.services.position_state_hydration import (
@@ -56,14 +74,22 @@ from trading_automaton.services.position_state_hydration import (
 )
 from trading_automaton.services.recovery import RecoveryService
 from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
-from trading_automaton.services.streaming_cycle_transition import StreamingCycleTransitionService
-from trading_automaton.services.streaming_position_decision import StreamingPositionDecisionService
+from trading_automaton.services.streaming_cycle_transition import (
+    StreamingCycleTransitionService,
+)
+from trading_automaton.services.streaming_position_decision import (
+    StreamingPositionDecisionService,
+)
 from trading_automaton.services.trading_admission import TradingAdmissionService
 from trading_automaton.services.trading_cycle import TradingCycleService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
 )
-from trading_automaton.storage.database import create_worker_engine, initialize_worker_schema
+from trading_automaton.storage.database import (
+    create_worker_engine,
+    initialize_worker_schema,
+)
+from trading_automaton.storage.execution_diagnostics import WorkerExecutionDiagnosticsReader
 from trading_automaton.storage.repository import LocalAutomationRepository
 from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
 from trading_automaton.usecases.recover_worker_run import RecoverWorkerRunUsecase
@@ -87,8 +113,15 @@ class FactCoordinatorCoreAdapter:
     def __init__(self, core: CoreClient) -> None:
         self._core = core
 
-    def automation_statuses(self, automation_ids: list[str]) -> AutomationStatusesResult:
-        result = self._core.automation_statuses([UUID(item) for item in automation_ids])
+    def automation_statuses(
+        self,
+        automation_ids: list[str],
+        commission_order_ids: list[str] | None = None,
+    ) -> AutomationStatusesResult:
+        result = self._core.automation_statuses(
+            [UUID(item) for item in automation_ids],
+            None if commission_order_ids is None else [UUID(item) for item in commission_order_ids],
+        )
         return AutomationStatusesResult(
             automations={
                 str(status.automation_id): {
@@ -101,12 +134,27 @@ class FactCoordinatorCoreAdapter:
                 for status in result.automations
             },
             missing_automation_ids=tuple(str(item) for item in result.missing_automation_ids),
+            commission_statuses={
+                str(status.intent_id): {
+                    "automation_id": str(status.automation_id),
+                    "user_broker_id": str(status.user_broker_id),
+                    "currency": status.currency,
+                    "commission_status": status.commission_status,
+                    "effective_broker_commission": status.effective_broker_commission,
+                }
+                for status in result.commission_statuses
+            },
         )
 
     def broker_connection(self, broker_id: str) -> BrokerConnection:
         return self._core.broker_connection(broker_id)
 
-    def heartbeat(self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None) -> None:
+    def heartbeat(
+        self,
+        worker_id: str,
+        occurred_at: datetime,
+        diagnostics: WorkerDiagnostics | None = None,
+    ) -> None:
         self._core.heartbeat(worker_id, occurred_at, diagnostics)
 
 
@@ -152,6 +200,7 @@ async def build_broker_runtime(
     retry_limit: int = 5,
     recovery_probe_seconds: float = 60.0,
     account_snapshot_ttl_seconds: float = 60.0,
+    broker_request_timeout_seconds: float = 10.0,
     analytics_http_timeout_seconds: float = 1.0,
     analytics_url: str = "http://analytics:8001",
     analytics_client: AnalyticsPort | None = None,
@@ -168,6 +217,7 @@ async def build_broker_runtime(
     for name, value in (
         ("recovery_probe_seconds", recovery_probe_seconds),
         ("account_snapshot_ttl_seconds", account_snapshot_ttl_seconds),
+        ("broker_request_timeout_seconds", broker_request_timeout_seconds),
         ("analytics_http_timeout_seconds", analytics_http_timeout_seconds),
     ):
         if not isfinite(value) or value <= 0:
@@ -203,6 +253,7 @@ async def build_broker_runtime(
             broker_connection=connection if admission is not None else None,
             submit_admission=admission,
             snapshot_ttl_seconds=account_snapshot_ttl_seconds,
+            request_timeout_seconds=broker_request_timeout_seconds,
         )
     )
     if admission is not None and (
@@ -228,6 +279,7 @@ async def build_broker_runtime(
             position_states,
             consistency=PositionConsistencyService(ledger, repository, now=now),
             audit=business_audit,
+            commission_cache_enabled=application_environment == "PROD",
             now=now,
             prepared_metrics=metrics,
         )
@@ -255,6 +307,10 @@ async def build_broker_runtime(
             audit=business_audit,
             cash=cash,
             active_intents=active_intents,
+            environment=application_environment,
+            access_mode=worker_access_mode,
+            admission=admission,
+            broker_request_timeout_seconds=broker_request_timeout_seconds,
         )
         dispatcher = OrderDispatchService(
             repository,
@@ -301,7 +357,9 @@ async def build_broker_runtime(
                 active_intents=active_intents,
                 cash=cash,
                 environment=application_environment,
+                access_mode=worker_access_mode,
                 admission=admission,
+                broker_request_timeout_seconds=broker_request_timeout_seconds,
             ),
             cash=cash,
             now=now,
@@ -363,6 +421,9 @@ def build_streaming_runtime(
         raise ValueError("READ_ONLY requires strategy disabled")
     engine = create_worker_engine(settings.database_url)
     initialize_worker_schema(engine)
+    execution_diagnostics_reader = WorkerExecutionDiagnosticsReader(
+        settings.database_url, environment=settings.application_environment
+    )
     repository = LocalAutomationRepository(
         sessionmaker(engine, expire_on_commit=False),
         environment=settings.application_environment,
@@ -445,6 +506,7 @@ def build_streaming_runtime(
             retry_limit=settings.sandbox_retry_limit,
             recovery_probe_seconds=settings.broker_recovery_probe_seconds,
             account_snapshot_ttl_seconds=settings.account_snapshot_ttl_seconds,
+            broker_request_timeout_seconds=settings.broker_request_timeout_seconds,
             analytics_http_timeout_seconds=settings.analytics_http_timeout_seconds,
             analytics_url=settings.analytics_url,
             core_client=core,
@@ -457,6 +519,7 @@ def build_streaming_runtime(
         WorkerAutomationLifecycleService(repository),
         worker_id=settings.worker_id,
         now=now,
+        commission_cache_enabled=settings.application_environment == "PROD",
     )
     runtime = StreamingRuntimeCoordinator(
         iteration,
@@ -466,5 +529,18 @@ def build_streaming_runtime(
         now=now,
         heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
         outbox_diagnostics=repository.outbox_diagnostics,
+        execution_diagnostics=lambda captured_at: execution_diagnostics_reader.read(
+            settings.internal_worker_broker_id,
+            captured_at,
+        ),
+        command_sync_diagnostics=lambda grouped_ids, claimed_count, publication_reason: (
+            repository.command_sync_diagnostics(
+                (None if settings.internal_worker_broker_id is None else str(settings.internal_worker_broker_id)),
+                claimed_count=claimed_count,
+                grouped_automation_ids=grouped_ids,
+                captured_at=now(),
+                publication_reason=publication_reason,
+            )
+        ),
     )
     return runtime, repository, http

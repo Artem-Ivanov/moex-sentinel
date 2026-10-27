@@ -178,6 +178,10 @@ def test_permanent_broker_error_waits_for_restart_without_repeating_calls(caplog
                 await asyncio.sleep(0)
             assert not task.done()
             assert calls == 1
+            diagnostics = service.broker_runtime_diagnostics()
+            assert diagnostics.status == "BLOCKED"
+            assert diagnostics.reason == "PERMANENT_BROKER_ERROR"
+            assert "Synthetic denial" not in diagnostics.model_dump_json()
             await service.close()
             await task
         finally:

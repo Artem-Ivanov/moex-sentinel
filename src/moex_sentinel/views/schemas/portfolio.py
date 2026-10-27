@@ -7,11 +7,14 @@ from pydantic import ConfigDict
 
 from moex_sentinel.domain.portfolio import (
     BrokerAccountsView,
+    BrokerOperation,
+    BrokerOperationsPageView,
     BrokerOperationsView,
     BrokerPositionsView,
     Money,
 )
 from sentinel_contracts.base import PositionalModel
+from sentinel_contracts.time import is_historical, utc_now_ms
 
 
 class StrictSchema(PositionalModel):
@@ -133,32 +136,66 @@ class OperationSchema(StrictSchema):
     commission: MoneySchema | None
     instrument_id: str | None
     ticker: str | None
+    historical: bool
+
+    @classmethod
+    def from_domain(cls, item: BrokerOperation, captured_at: datetime) -> "OperationSchema":
+        operation = item.operation
+        return cls(
+            broker_id=item.broker_id,
+            broker_name=item.broker_name,
+            operation_id=operation.operation_id,
+            account_id=operation.account_id,
+            operation_type=operation.operation_type,
+            state=operation.state,
+            occurred_at=operation.occurred_at,
+            payment=MoneySchema.from_domain(operation.payment),
+            price=MoneySchema.from_domain(operation.price),
+            quantity=operation.quantity,
+            commission=MoneySchema.from_domain(operation.commission),
+            instrument_id=operation.instrument_id,
+            ticker=operation.ticker,
+            historical=is_historical(operation.occurred_at, captured_at),
+        )
 
 
 class OperationsResponseSchema(StrictSchema):
+    captured_at: datetime
     items: list[OperationSchema]
     errors: list[ReadErrorSchema]
 
     @classmethod
     def from_domain(cls, value: BrokerOperationsView) -> "OperationsResponseSchema":
+        captured_at = utc_now_ms()
         return cls(
-            items=[
-                OperationSchema(
-                    broker_id=item.broker_id,
-                    broker_name=item.broker_name,
-                    operation_id=item.operation.operation_id,
-                    account_id=item.operation.account_id,
-                    operation_type=item.operation.operation_type,
-                    state=item.operation.state,
-                    occurred_at=item.operation.occurred_at,
-                    payment=MoneySchema.from_domain(item.operation.payment),
-                    price=MoneySchema.from_domain(item.operation.price),
-                    quantity=item.operation.quantity,
-                    commission=MoneySchema.from_domain(item.operation.commission),
-                    instrument_id=item.operation.instrument_id,
-                    ticker=item.operation.ticker,
-                )
-                for item in value.items
-            ],
+            captured_at=captured_at,
+            items=[OperationSchema.from_domain(item, captured_at) for item in value.items],
             errors=[ReadErrorSchema.model_validate(item, from_attributes=True) for item in value.errors],
+        )
+
+
+class OperationsPageResponseSchema(StrictSchema):
+    captured_at: datetime
+    items: list[OperationSchema]
+    errors: list[ReadErrorSchema]
+    input_cursor: str | None
+    next_cursor: str | None
+    source_item_count: int
+    selected_item_count: int
+    source_exhausted: bool | None
+    coverage_complete: bool
+
+    @classmethod
+    def from_domain(cls, value: BrokerOperationsPageView) -> "OperationsPageResponseSchema":
+        captured_at = utc_now_ms()
+        return cls(
+            captured_at=captured_at,
+            items=[OperationSchema.from_domain(item, captured_at) for item in value.items],
+            errors=[ReadErrorSchema.model_validate(item, from_attributes=True) for item in value.errors],
+            input_cursor=value.input_cursor,
+            next_cursor=value.next_cursor,
+            source_item_count=value.source_item_count,
+            selected_item_count=value.selected_item_count,
+            source_exhausted=value.source_exhausted,
+            coverage_complete=value.coverage_complete,
         )

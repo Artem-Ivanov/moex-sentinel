@@ -27,6 +27,10 @@ from moex_sentinel.services.brokers import BrokerConfigurationService
 from moex_sentinel.services.connections import BrokerConnectionService
 from moex_sentinel.services.daily_admission_preparation import DailyAdmissionPreparationService
 from moex_sentinel.services.environment import PinnedEnvironment
+from moex_sentinel.services.execution_commissions import (
+    ExecutionCommissionCollectionService,
+    ExecutionCommissionService,
+)
 from moex_sentinel.services.instrument_catalog import InstrumentCatalogService
 from moex_sentinel.services.market_data import BrokerMarketDataService
 from moex_sentinel.services.market_recovery import MarketRecoveryPolicy
@@ -42,6 +46,7 @@ from moex_sentinel.services.trading_summary import TradingSummaryService
 from moex_sentinel.storage.portfolio_snapshot_collection import PortfolioSnapshotCollectionStore
 from moex_sentinel.storage.repositories.automation_commands import AutomationCommandRepository
 from moex_sentinel.storage.repositories.automations import AutomationRepository
+from moex_sentinel.storage.repositories.execution_commissions import ExecutionCommissionRepository
 from moex_sentinel.storage.repositories.portfolio_snapshots import PortfolioSnapshotRepository
 from moex_sentinel.storage.repositories.position_adoption import PositionAdoptionRepository
 from moex_sentinel.storage.repositories.reference_catalog import ReferenceCatalogRepository
@@ -54,6 +59,7 @@ from moex_sentinel.usecases.automations import (
     HoldAutomationUsecase,
     ResumeAutomationUsecase,
     UpdateTradingAutomationSettingsUsecase,
+    ViewTradingAutomationDecisionReasonsUsecase,
     ViewTradingAutomationDetailsUsecase,
     ViewTradingAutomationStatusesUsecase,
     ViewTradingAutomationsUsecase,
@@ -72,6 +78,7 @@ from moex_sentinel.usecases.brokers import (
     ViewBrokerSettingsUsecase,
 )
 from moex_sentinel.usecases.connections import CheckBrokerConnectionUsecase
+from moex_sentinel.usecases.execution_diagnostics import ViewExecutionDiagnosticsUsecase
 from moex_sentinel.usecases.instruments import (
     SetInstrumentSelectionUsecase,
     SynchronizeBrokerInstrumentsUsecase,
@@ -110,6 +117,8 @@ class ApplicationUsecases(PositionalModel):
     create_trading_automation: CreateTradingAutomationUsecase
     update_trading_automation_settings: UpdateTradingAutomationSettingsUsecase
     view_trading_automation: ViewTradingAutomationUsecase
+    view_execution_diagnostics: ViewExecutionDiagnosticsUsecase
+    view_trading_automation_decision_reasons: ViewTradingAutomationDecisionReasonsUsecase
     view_trading_automation_statuses: ViewTradingAutomationStatusesUsecase
     view_trading_automation_details: ViewTradingAutomationDetailsUsecase
     view_trading_automations: ViewTradingAutomationsUsecase
@@ -180,6 +189,16 @@ def build_portfolio_snapshot_collector(
     return CollectPortfolioSnapshotsUsecase(collection, store, clock=clock)
 
 
+def build_execution_commission_collector(factory: sessionmaker[Session], *, clock=utc_now_ms):
+    """Build the independent, one-page PROD broker fee collector."""
+    brokers = UserBrokerRepository(factory)
+    return ExecutionCommissionCollectionService(
+        ExecutionCommissionService(ExecutionCommissionRepository(factory), now=clock),
+        brokers,
+        PortfolioAdapterFactory(TInvestPortfolioAdapter).create,
+    )
+
+
 def build_market_snapshot_gateway(
     factory: sessionmaker[Session], *, retry_limit: int = 5, settings: Settings | None = None
 ) -> MarketSnapshotGateway:
@@ -211,6 +230,7 @@ def build_market_snapshot_gateway(
         configuration_resolver=resolve,
         retry_limit=retry_limit,
         refresh_seconds=settings.market_candles_refresh_seconds,
+        trading_status_ttl_seconds=settings.market_trading_status_ttl_seconds,
         recovery=recovery,
     )
 
@@ -270,7 +290,9 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         TradingFactMapper(),
         environment=settings.application_environment,
     )
-    trading_admission_repository = TradingAdmissionRepository(factory)
+    trading_admission_repository = TradingAdmissionRepository(
+        factory, application_environment=settings.application_environment
+    )
     trading_admission = TradingAdmissionService(
         trading_admission_repository,
         risk=TInvestAdmissionRiskAdapter(),
@@ -287,13 +309,21 @@ def build_application_usecases(factory: sessionmaker[Session], settings: Setting
         retry_delays_seconds=settings.daily_admission_retry_delays_seconds,
     )
     worker_authenticator = WorkerAuthenticator(settings, trading_admission_repository.get_runtime_credential)
+    view_trading_automation = ViewTradingAutomationUsecase(automation_service)
     return ApplicationUsecases(
         view_automaton_broker_scope=ViewAutomatonBrokerScopeUsecase(automaton_broker_service),
         view_automaton_broker_connection=ViewAutomatonBrokerConnectionUsecase(automaton_broker_service),
         record_automaton_heartbeat=RecordAutomatonHeartbeatUsecase(automaton_sync_service),
         create_trading_automation=CreateTradingAutomationUsecase(automation_service),
         update_trading_automation_settings=UpdateTradingAutomationSettingsUsecase(automation_service),
-        view_trading_automation=ViewTradingAutomationUsecase(automation_service),
+        view_trading_automation=view_trading_automation,
+        view_execution_diagnostics=ViewExecutionDiagnosticsUsecase(
+            view_trading_automation, lambda: TradingFactsUnitOfWork(factory)
+        ),
+        view_trading_automation_decision_reasons=ViewTradingAutomationDecisionReasonsUsecase(
+            view_trading_automation,
+            lambda: TradingFactsUnitOfWork(factory),
+        ),
         view_trading_automation_statuses=ViewTradingAutomationStatusesUsecase(automation_service),
         view_trading_automation_details=ViewTradingAutomationDetailsUsecase(
             automation_service, portfolio_service, instrument_catalog_service

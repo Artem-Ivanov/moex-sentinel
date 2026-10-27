@@ -17,13 +17,24 @@ from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfileKey,
     ExecutionFinalization,
     ExecutionFinalizationResult,
+    LocalIntentRecord,
 )
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
+from trading_automaton.services.order_lifecycle import (
+    bounded_broker_call,
+    has_admission_origin,
+    intent_deadline,
+    is_confirmed_nonterminal_status,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class TrackingRepositoryPort(IntentUpdatePort, Protocol):
+    def get_active_intent(self, automation_id: str) -> LocalIntentRecord | None: ...
+
+    def get_intent(self, idempotency_key: str) -> LocalIntentRecord | None: ...
+
     def hold_active(self, reason: str, automation_id: str | None = None) -> None: ...
 
     def finalize_execution(self, finalization: ExecutionFinalization) -> ExecutionFinalizationResult: ...
@@ -43,6 +54,11 @@ class CommissionObservationPort(Protocol):
 
 class TrackingBrokerPort(Protocol):
     async def get_order_state(self, account_id: str, broker_order_id: str) -> BrokerOrderState: ...
+    async def cancel_order(self, account_id: str, broker_order_id: str) -> None: ...
+
+
+class TrackingAdmissionPort(Protocol):
+    async def validate_cancel(self) -> bool: ...
 
 
 class TrackingPortfolioPort(Protocol):
@@ -75,9 +91,13 @@ class OrderTrackingService:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         poll_seconds: float = 0.2,
         poll_limit: int = 50,
+        broker_request_timeout_seconds: float = 10.0,
         audit: OrderStageAuditPort | None = None,
         cash: TrackingCashPort | None = None,
         active_intents: ActiveIntentGateService | None = None,
+        environment: str = "TEST",
+        access_mode: str = "READ_ONLY",
+        admission: TrackingAdmissionPort | None = None,
     ) -> None:
         """Track broker outcomes; the repository atomically persists each execution and its ledger changes."""
         self._repository = repository
@@ -89,9 +109,19 @@ class OrderTrackingService:
         self._sleep = sleep
         self._poll_seconds = poll_seconds
         self._poll_limit = poll_limit
+        if broker_request_timeout_seconds <= 0:
+            raise ValueError("Broker request timeout must be positive")
+        self._broker_request_timeout_seconds = broker_request_timeout_seconds
         self._audit = audit
         self._cash = cash
         self._active_intents = active_intents
+        if environment not in {"TEST", "PROD"}:
+            raise ValueError("Invalid broker environment")
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        self._environment = environment
+        self._access_mode = access_mode
+        self._admission = admission
         self._watchers: set[asyncio.Task[None]] = set()
 
     def track(
@@ -101,6 +131,8 @@ class OrderTrackingService:
         *,
         request: DispatchRequest | None = None,
     ) -> None:
+        if self._active_intents is not None and not self._active_intents.claim_tracking(intent_id):
+            return
         watcher = asyncio.create_task(self._watch(intent_id, dispatch_task, request))
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
@@ -136,6 +168,9 @@ class OrderTrackingService:
                 "ORDER_TRACKING_WATCHER_FAILED",
                 error,
             )
+        finally:
+            if self._active_intents is not None:
+                self._active_intents.release_tracking(intent_id)
 
     async def _contain_watcher_failure(
         self,
@@ -186,6 +221,9 @@ class OrderTrackingService:
         try:
             response = await dispatch_task
         except Exception:
+            return
+        if request is not None and response.idempotency_key != intent_id:
+            await self._mark_uncertain(request, "ORDER_REQUEST_ID_MISMATCH")
             return
         terminal_response = await self._terminal_response(response, request)
         if terminal_response is None:
@@ -342,16 +380,100 @@ class OrderTrackingService:
         request: DispatchRequest | None,
     ) -> BrokerOrderState | None:
         terminal = BROKER_TERMINAL_STATES
-        if response.status in terminal or self._broker is None or request is None:
+        if self._broker is None or request is None:
             return response
-        for _attempt in range(self._poll_limit):
-            await self._sleep(self._poll_seconds)
-            response = await self._broker.get_order_state(
-                request.account_id,
-                response.broker_order_id,
-            )
+        expected_order_id = response.broker_order_id
+        intent = None
+        deadline = None
+        cancel_requested = False
+        if self._environment == "PROD":
+            intent = await asyncio.to_thread(self._repository.get_intent, request.idempotency_key)
+            known_order_id = getattr(intent, "broker_order_id", None)
+            if known_order_id and expected_order_id != known_order_id:
+                await self._mark_uncertain(request, "ORDER_STATUS_ID_MISMATCH")
+                return None
+            deadline = intent_deadline(intent, now=self._now()) if intent is not None else None
+        if response.status in terminal:
+            return response
+        if not is_confirmed_nonterminal_status(response.status):
+            await self._mark_uncertain(request, "ORDER_STATUS_UNKNOWN")
+            return None
+        loop = asyncio.get_running_loop()
+        confirmation_window = self._poll_seconds * self._poll_limit
+        ttl_remaining = max(0.0, (deadline - self._now()).total_seconds()) if deadline is not None else 0.0
+        expires_monotonic = loop.time() + ttl_remaining
+        confirmation_deadline = expires_monotonic + confirmation_window
+        ttl_polls = 0 if self._poll_seconds <= 0 else int(ttl_remaining / self._poll_seconds) + 1
+        max_attempts = self._poll_limit + ttl_polls
+        for _attempt in range(max_attempts):
+            remaining = confirmation_deadline - loop.time()
+            if remaining <= 0:
+                break
+            await self._sleep(min(self._poll_seconds, remaining))
+            remaining = confirmation_deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                until_expiry = expires_monotonic - loop.time()
+                status_timeout = remaining
+                if until_expiry > 0:
+                    status_timeout = min(status_timeout, until_expiry + self._poll_seconds)
+                response = await bounded_broker_call(
+                    self._broker.get_order_state(request.account_id, response.broker_order_id),
+                    min(self._broker_request_timeout_seconds, status_timeout),
+                )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                break
+            except Exception:  # noqa: S112 - bounded same-order polling handles transient status errors.
+                continue
+            if response.broker_order_id != expected_order_id:
+                await self._mark_uncertain(request, "ORDER_STATUS_ID_MISMATCH")
+                return None
             if response.status in terminal:
                 return response
+            if not is_confirmed_nonterminal_status(response.status):
+                await self._mark_uncertain(request, "ORDER_STATUS_UNKNOWN")
+                return None
+            known_order_id = getattr(intent, "broker_order_id", None)
+            if known_order_id and response.broker_order_id != known_order_id:
+                await self._mark_uncertain(request, "ORDER_STATUS_ID_MISMATCH")
+                return None
+            if self._environment == "PROD" and deadline is None:
+                await self._mark_uncertain(request, "ORDER_TTL_PROOF_MISSING")
+                return None
+            if self._environment == "PROD" and not cancel_requested and self._now() >= deadline:
+                if (
+                    self._access_mode != "TRADE"
+                    or self._admission is None
+                    or not has_admission_origin(intent)
+                    or not await self._admission.validate_cancel()
+                ):
+                    await self._mark_uncertain(request, "ORDER_CANCEL_NOT_AUTHORIZED")
+                    return None
+                try:
+                    remaining = confirmation_deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    await bounded_broker_call(
+                        self._broker.cancel_order(request.account_id, response.broker_order_id),
+                        min(self._broker_request_timeout_seconds, remaining / 2),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except TimeoutError:
+                    # Query this same order while any confirmation time remains.
+                    pass
+                except Exception:  # noqa: S110 - lost ACK is resolved by polling this same order.
+                    # Reconcile a lost ACK through same-order status polling below.
+                    pass
+                # A single watcher sends at most one cancel for this intent.
+                cancel_requested = True
+        await self._mark_uncertain(request, "ORDER_STATUS_POLLING_EXHAUSTED")
+        return None
+
+    async def _mark_uncertain(self, request: DispatchRequest, reason_code: str) -> None:
         self._repository.update_intent(
             request.idempotency_key,
             state="UNCERTAIN",
@@ -360,19 +482,20 @@ class OrderTrackingService:
         )
         if self._cash is not None:
             await self._cash.complete(request.idempotency_key, "UNCERTAIN")
-        self._repository.hold_active(
-            "Broker order status polling exhausted",
-            request.automation_id or None,
+        hold_reason = (
+            "Broker order status polling exhausted"
+            if reason_code == "ORDER_STATUS_POLLING_EXHAUSTED"
+            else "Broker order outcome remains uncertain"
         )
+        self._repository.hold_active(hold_reason, request.automation_id or None)
         await self._audit_stage(
             request,
             BusinessAuditStage.AUTOMATION_MOVED_TO_HOLD,
-            "Automation moved to hold after broker status timeout",
+            "Automation moved to hold after broker order outcome became uncertain",
             critical=True,
             broker_order_state="UNCERTAIN",
-            reason_code="ORDER_STATUS_POLLING_EXHAUSTED",
+            reason_code=reason_code,
         )
-        return None
 
     async def _audit_stage(
         self,

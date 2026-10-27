@@ -30,7 +30,11 @@ from moex_sentinel.domain.daily_admission_preparation import (
 )
 from moex_sentinel.services.runtime_versions import WorkerVersionStore
 from moex_sentinel.services.sync_execution import bind_sync_runner, run_sync
-from moex_sentinel.services.trading_readiness_alerts import ReadinessObservation, TradingReadinessAlertService
+from moex_sentinel.services.trading_readiness_alerts import (
+    STARTUP_ADMISSION_BLOCKERS,
+    ReadinessObservation,
+    TradingReadinessAlertService,
+)
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.schema_revision import expected_schema_revision, schema_is_compatible
 from moex_sentinel.usecases.diagnostics import GetDiagnosticsStatusUsecase
@@ -92,7 +96,7 @@ def _preparation_alert_fields(preparation):
     return ("FAILED", reason) if reason != "UNKNOWN" else ("UNKNOWN", reason)
 
 
-def _build_readiness_observer(usecases, worker_versions, broker_id: str | None):
+def _build_readiness_observer(usecases, worker_versions, broker_id: UUID | None):
     async def observe() -> ReadinessObservation:
         _, worker = worker_versions.diagnostics_snapshot()
         now = utc_now_ms()
@@ -105,9 +109,14 @@ def _build_readiness_observer(usecases, worker_versions, broker_id: str | None):
                 recovery_only=False,
                 preparation_status="UNKNOWN",
                 preparation_reason="OWNER_MISSING",
+                expected_work=False,
             )
         try:
-            account = await run_sync(partial(usecases.trading_admission.view, broker_id))
+            expected_work = await run_sync(partial(usecases.trading_admission.expects_trading, broker_id))
+        except Exception:
+            expected_work = None
+        try:
+            account = await run_sync(partial(usecases.trading_admission.view, str(broker_id)))
         except Exception:
             account = None
         try:
@@ -118,10 +127,17 @@ def _build_readiness_observer(usecases, worker_versions, broker_id: str | None):
             account_status = "UNKNOWN"
             effective = None
             recovery_only = False
+            denial_reasons = ()
         else:
             account_status = account.admission_status.value
             effective = account.effective_can_submit
             recovery_only = account.recovery_only
+            raw_denial_reasons = getattr(account, "effective_denial_reasons", ())
+            denial_reasons = tuple(
+                reason
+                for reason in (getattr(item, "value", item) for item in raw_denial_reasons)
+                if isinstance(reason, str) and reason in STARTUP_ADMISSION_BLOCKERS
+            )
         if preparation is None:
             prep_status, prep_reason = "FAILED", "CORE_UNAVAILABLE"
         else:
@@ -141,6 +157,8 @@ def _build_readiness_observer(usecases, worker_versions, broker_id: str | None):
             recovery_only=recovery_only,
             preparation_status=prep_status,
             preparation_reason=prep_reason,
+            expected_work=expected_work,
+            effective_denial_reasons=denial_reasons,
         )
 
     return observe
@@ -264,7 +282,7 @@ def create_app(
                 _build_readiness_observer(
                     application.state.usecases,
                     application.state.worker_versions,
-                    None if settings.internal_worker_broker_id is None else str(settings.internal_worker_broker_id),
+                    settings.internal_worker_broker_id,
                 ),
                 alert_transport,
                 environment=settings.application_environment,
@@ -449,6 +467,13 @@ def create_app(
         return response
 
     @application.get("/internal/runtime")
+    async def internal_runtime_configuration() -> dict[str, str]:
+        return {
+            "environment": settings.application_environment,
+            "access_mode": settings.broker_access_mode,
+            "execution_diagnostics": "v1",
+        }
+
     @application.get("/api/runtime")
     async def runtime_configuration() -> dict[str, str]:
         return {"environment": settings.application_environment, "access_mode": settings.broker_access_mode}

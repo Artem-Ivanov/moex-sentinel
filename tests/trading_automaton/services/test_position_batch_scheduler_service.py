@@ -10,6 +10,7 @@ from sentinel_contracts.streaming_market import (
     MarketBatchSnapshot,
     StreamOrderBook,
     StreamTradingStatus,
+    UnaryApiTradingStatus,
 )
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -65,8 +66,16 @@ def market(
                 instrument_id,
                 "NORMAL" if trading_available else "CLOSED",
                 trading_available,
-                trading_available,
                 status_captured_at or captured_at,
+            )
+            if include_status
+            else None
+        ),
+        api_trading_status=(
+            UnaryApiTradingStatus(
+                api_trade_available=trading_available,
+                observed_at=NOW,
+                expires_at=NOW + timedelta(seconds=30),
             )
             if include_status
             else None

@@ -1,8 +1,9 @@
 """Thin HTTP views for trading automation user actions."""
 
 from functools import partial
+from uuid import UUID
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Query, Request, Response, status
 
 from moex_sentinel.services.sync_execution import run_sync
 from moex_sentinel.views.dependencies import usecases as _usecases
@@ -10,10 +11,12 @@ from moex_sentinel.views.schemas.automations import (
     AutomationListSchema,
     AutomationSchema,
     CreateAutomationSchema,
+    DecisionReasonsSchema,
     TradingAutomationDetailsSchema,
     TradingSessionsStatusSchema,
     UpdateAutomationSettingsSchema,
 )
+from moex_sentinel.views.schemas.execution_diagnostics import ExecutionDiagnosticsSchema
 
 router = APIRouter(tags=["trading-automations"])
 
@@ -64,6 +67,45 @@ async def view_automation_details(automation_id: str, request: Request) -> Tradi
     return TradingAutomationDetailsSchema.from_domain(
         await _usecases(request).view_trading_automation_details.execute(automation_id)
     )
+
+
+@router.get(
+    "/trading-automations/{automation_id}/execution-diagnostics",
+    response_model=ExecutionDiagnosticsSchema,
+)
+async def view_execution_diagnostics(
+    automation_id: str,
+    request: Request,
+    response: Response,
+    limit: int = Query(default=20, ge=1, le=20),
+    intent_id: UUID | None = None,
+) -> ExecutionDiagnosticsSchema:
+    result = await run_sync(
+        partial(
+            _usecases(request).view_execution_diagnostics.execute,
+            automation_id,
+            limit=limit,
+            intent_id=intent_id,
+            worker_store=request.app.state.worker_versions,
+        )
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return ExecutionDiagnosticsSchema.from_domain(result)
+
+
+@router.get(
+    "/trading-automations/{automation_id}/decision-reasons",
+    response_model=DecisionReasonsSchema,
+)
+async def view_automation_decision_reasons(
+    automation_id: str,
+    request: Request,
+    limit: int = Query(default=5, ge=1, le=20),
+) -> DecisionReasonsSchema:
+    result = await run_sync(
+        partial(_usecases(request).view_trading_automation_decision_reasons.execute, automation_id, limit)
+    )
+    return DecisionReasonsSchema.model_validate(result, from_attributes=True)
 
 
 @router.post("/trading-automations/{automation_id}/hold", response_model=AutomationSchema)

@@ -89,3 +89,10 @@ class TInvestMarketStreamSource:
             for item in response.candles
             if item.is_complete
         )
+
+    async def get_trading_status(self, instrument_id: str) -> bool:
+        if self._services is None:
+            raise RuntimeError("Market source is not started.")
+        with market_request_errors():
+            response = await self._services.market_data.get_trading_status(instrument_id=instrument_id)
+        return bool(response.api_trade_available_flag)

@@ -106,7 +106,6 @@ def _event(response: Any) -> MarketStreamEvent | None:
             instrument_id=status.instrument_uid,
             status=enum_name(status.trading_status),
             limit_order_available=bool(status.limit_order_available_flag),
-            api_trade_available=True,
             captured_at=status.time,
         )
     if candle := getattr(response, "candle", None):

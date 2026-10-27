@@ -209,6 +209,42 @@ def test_expired_prod_retry_with_ambiguous_consumed_key_stays_uncertain_without_
     assert [update[1]["state"] for update in repository.updates] == ["SUBMITTING", "UNCERTAIN"]
 
 
+def test_prod_submit_ack_for_different_request_key_remains_uncertain_without_resubmitting():
+    async def scenario():
+        release = asyncio.Event()
+        release.set()
+        unrelated = BrokerOrderState(
+            "other-order",
+            "different-request-key",
+            "ACCEPTED",
+            1,
+            0,
+            Decimal("100"),
+            Decimal(),
+            Decimal("1"),
+            Decimal(),
+            "RUB",
+        )
+        broker = Broker(release, error=CoreOperationError(retryable=True), reconciled=unrelated)
+        repository = Repository()
+        value = request().model_copy(
+            update={
+                "idempotency_key": "00000000-0000-4000-8000-000000000101",
+                "configuration_fingerprint": "a" * 64,
+                "market_valid_until": NOW + timedelta(seconds=10),
+            }
+        )
+        service = OrderDispatchService(repository, broker, now=lambda: NOW, access_mode="TRADE")
+        with pytest.raises(CoreOperationError):
+            await service.dispatch(value, asyncio.get_running_loop().create_future())
+        return broker, repository
+
+    broker, repository = asyncio.run(scenario())
+
+    assert broker.reconciliation_calls == [("account-1", "00000000-0000-4000-8000-000000000101")]
+    assert [item[1]["state"] for item in repository.updates] == ["SUBMITTING", "UNCERTAIN"]
+
+
 def test_expired_prod_lost_grant_ack_holds_and_keeps_buy_reservation(tmp_path):
     class AmbiguousAdmissionBroker(Broker):
         def __init__(self):

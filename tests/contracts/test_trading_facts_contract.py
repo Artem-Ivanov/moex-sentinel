@@ -11,6 +11,7 @@ from sentinel_contracts.time import require_utc_millisecond, utc_now_ms
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationCommand,
+    AutomationCommissionStatus,
     AutomationStateChangedEnvelope,
     AutomationStatus,
     AutomationStatusesResult,
@@ -23,6 +24,33 @@ from sentinel_contracts.trading_facts import (
     FactIngressErrorCode,
     FactKind,
 )
+
+
+def test_nonknown_fee_status_can_carry_last_trusted_absolute_amount() -> None:
+    status = AutomationCommissionStatus(
+        intent_id=UUID("00000000-0000-4000-8000-000000000061"),
+        automation_id=AUTOMATION_ID,
+        user_broker_id=SCOPE_ID,
+        currency="RUB",
+        commission_status="UNKNOWN",
+        effective_broker_commission=Decimal("3.58"),
+    )
+
+    assert status.commission_status == "UNKNOWN"
+    assert status.effective_broker_commission == Decimal("3.58")
+
+
+@pytest.mark.parametrize("state", ["MISSING", "UNKNOWN"])
+def test_nonknown_trusted_fee_amount_keeps_strict_decimal_bounds(state: str) -> None:
+    with pytest.raises(ValidationError):
+        AutomationCommissionStatus(
+            intent_id=UUID("00000000-0000-4000-8000-000000000061"),
+            automation_id=AUTOMATION_ID,
+            user_broker_id=SCOPE_ID,
+            currency="RUB",
+            commission_status=state,
+            effective_broker_commission=Decimal("NaN"),
+        )
 from tests.contracts.trading_facts_helpers import (
     AUTOMATION_ID,
     BROKER_ID,

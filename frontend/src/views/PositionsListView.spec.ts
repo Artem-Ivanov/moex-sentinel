@@ -51,6 +51,28 @@ it("renders automations as an interactive table and opens selected details", asy
   expect(router.currentRoute.value.params.id).toBe("auto-1")
 })
 
+it.each([
+  ["INCOMPLETE", "Сверка комиссий не завершена"],
+  ["UNKNOWN", "Комиссии требуют сверки"],
+  ["COMPLETE", null],
+  [undefined, null],
+])("explains commission status %s and preserves legacy responses", async (financial_status, explanation) => {
+  const fetchMock = vi.fn().mockImplementation((url: string) => Response.json(
+    url === "/api/trading/summary" ? summary : url.startsWith("/api/operations") ? { items: [], errors: [] } : {
+      items: [{ id: "auto-1", broker_id: "b1", broker_name: "Broker", account_id: "a1", instrument_id: "i1", ticker: "TEST", instrument_name: "Test", state: "IN_WORK", suspended_from_state: null, revision: 2, last_sequence_number: 3, resume_requested: false, currency: "RUB", strategy_code: "adaptive_scalping", strategy_version: "1", quantity_lots: 2, average_price: "10", invested_amount: "20", realized_pnl: "1", unrealized_pnl: "2", net_pnl: "2.5", actual_commissions: "0.5", ...(financial_status ? { financial_status } : {}) }],
+    },
+  ))
+  vi.stubGlobal("fetch", fetchMock)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: "/positions", name: "positions", component: PositionsListView }] })
+  await router.push("/positions"); await router.isReady()
+  render(PositionsListView, { global: { plugins: [router] } })
+  const row = await screen.findByRole("row", { name: /TEST Broker a1 IN_WORK 2/ })
+  if (explanation) expect(within(row).getByText(explanation)).toBeTruthy()
+  else expect(within(row).queryByText(/сверк|Комиссии требуют/)).toBeNull()
+  expect(within(row).getByText("2.5 RUB")).toBeTruthy()
+  expect(within(row).getByText("0.5 RUB")).toBeTruthy()
+})
+
 it("refreshes positions and operations without reloading the page", async () => {
   const fetchMock = vi.fn().mockImplementation((url: string) => Response.json(
     url === "/api/trading/summary"

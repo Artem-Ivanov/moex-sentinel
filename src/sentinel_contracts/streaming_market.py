@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from types import MappingProxyType
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 
 from sentinel_contracts.base import PositionalModel
 from sentinel_contracts.broker_execution import OrderBookLevel
@@ -40,8 +40,24 @@ class StreamTradingStatus(PositionalModel):
     instrument_id: str
     status: str
     limit_order_available: bool
-    api_trade_available: bool
     captured_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_api_availability(cls, value: object) -> object:
+        if isinstance(value, dict) and "api_trade_available" in value:
+            value = {key: item for key, item in value.items() if key != "api_trade_available"}
+        return value
+
+
+class UnaryApiTradingStatus(PositionalModel):
+    model_config = ConfigDict(frozen=True)
+    api_trade_available: bool
+    observed_at: datetime
+    expires_at: datetime
+
+    def is_fresh(self, now: datetime) -> bool:
+        return self.observed_at <= now < self.expires_at
 
 
 class StreamCandle(PositionalModel):
@@ -63,6 +79,7 @@ class InstrumentMarketState(PositionalModel):
     order_book: StreamOrderBook | None = None
     last_price: StreamLastPrice | None = None
     trading_status: StreamTradingStatus | None = None
+    api_trading_status: UnaryApiTradingStatus | None = None
     candle: StreamCandle | None = None
 
     def is_tradeable(self, now: datetime, max_age: timedelta) -> bool:
@@ -76,8 +93,12 @@ class InstrumentMarketState(PositionalModel):
             and now - book.captured_at <= max_age
             and status is not None
             and status.limit_order_available
-            and status.api_trade_available
+            and self.has_fresh_api_trade_availability(now)
         )
+
+    def has_fresh_api_trade_availability(self, now: datetime) -> bool:
+        status = self.api_trading_status
+        return status is not None and status.api_trade_available and status.is_fresh(now)
 
 
 class MarketBatchSnapshot(PositionalModel):

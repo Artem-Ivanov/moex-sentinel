@@ -23,6 +23,10 @@ it("uses the protected endpoint with cancellation", async () => {
         observation: "OBSERVED", status: "DEGRADED", reason: "OLD_PENDING", pending_count: 2, failed_count: 1,
         oldest_pending_at: "2026-10-03T08:30:00.000Z", oldest_pending_age_ms: 1800123, max_retry_count: 5,
       },
+      broker_runtime: {
+        status: "BLOCKED", decision_eligibility: "UNKNOWN", reason: "PERMANENT_BROKER_ERROR",
+        last_started_at: "2026-10-03T08:59:00.000Z", last_finished_at: "2026-10-03T08:59:01.000Z", last_success_at: null,
+      },
     },
     awaiting_observations: ["worker", "broker", "analytics", "market", "outbox", "portfolio", "strategy"],
   } satisfies DiagnosticsStatus

@@ -138,6 +138,28 @@ class AccountCommissionProfileModel(Base):
     sell_rate: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
     service_rate: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
     deal_rate: Mapped[Decimal] = mapped_column(Numeric(28, 12), nullable=False)
+
+
+class ExecutionCommissionCacheModel(Base):
+    """Durable Worker projection of the latest trusted absolute entry fee."""
+
+    __tablename__ = "execution_commission_cache"
+    __table_args__ = (
+        CheckConstraint("commission_status IN ('KNOWN', 'MISSING', 'UNKNOWN')", name="ck_commission_cache_status"),
+        CheckConstraint(
+            "effective_broker_commission IS NULL OR effective_broker_commission >= 0",
+            name="ck_commission_cache_nonnegative",
+        ),
+        Index("ix_execution_commission_cache_fairness", "last_checked_at", "source_intent_id"),
+    )
+
+    automation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source_intent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_broker_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    currency: Mapped[str] = mapped_column(String(8), primary_key=True)
+    effective_broker_commission: Mapped[Decimal | None] = mapped_column(Numeric(28, 9))
+    commission_status: Mapped[str] = mapped_column(String(8), nullable=False)
+    last_checked_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     calculated_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     valid_until: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)

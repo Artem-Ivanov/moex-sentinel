@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict
 
@@ -65,12 +65,14 @@ class AutomationRecord(PositionalModel):
     unrealized_pnl: Decimal = Decimal()
     net_pnl: Decimal = Decimal()
     actual_commissions: Decimal = Decimal()
+    financial_status: Literal["COMPLETE", "INCOMPLETE", "UNKNOWN"] = "INCOMPLETE"
     broker_name: str = ""
     ticker: str = ""
     instrument_name: str = ""
     bootstrap_pending: bool = False
     order_quota_percent: Decimal | None = None
     settings_revision: int = 0
+    hold_reason: str | None = None
 
 
 class HeartbeatRecord(PositionalModel):

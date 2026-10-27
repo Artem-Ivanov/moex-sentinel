@@ -3,6 +3,7 @@
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from moex_sentinel.domain.automations import DecisionReasonItem
 from moex_sentinel.domain.trading_facts import (
     AutomationEnvelopeDraft,
     TradeAuditEventDraft,
@@ -18,6 +19,7 @@ from moex_sentinel.storage.models.trading_observability import (
     TradeAuditEventModel,
 )
 from moex_sentinel.storage.repositories.trading_facts_support import append_idempotent, require_scoped_reference
+from sentinel_contracts.business_audit import BusinessAuditStage
 
 
 def _audit_value(model: TradeAuditEventModel) -> TradeAuditEventDraft:
@@ -167,3 +169,38 @@ class TradingAuditRepository:
             .order_by(TradeAuditEventModel.occurred_at, TradeAuditEventModel.event_id)
         )
         return tuple(_audit_value(model) for model in self._session.scalars(statement))
+
+    def list_recent_decision_reasons(
+        self,
+        user_broker_id: str,
+        automation_id: str,
+        limit: int,
+    ) -> tuple[DecisionReasonItem, ...]:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError("limit must be between 1 and 20")
+        statement = (
+            select(TradeAuditEventModel.event_id, TradeAuditEventModel.occurred_at, TradeAuditEventModel.data)
+            .where(
+                TradeAuditEventModel.user_broker_id == user_broker_id,
+                TradeAuditEventModel.automation_id == automation_id,
+                TradeAuditEventModel.stage == BusinessAuditStage.STRATEGY_DECISION_MADE.value,
+            )
+            .order_by(TradeAuditEventModel.occurred_at.desc(), TradeAuditEventModel.event_id.desc())
+            .limit(limit)
+        )
+        return tuple(
+            DecisionReasonItem(
+                event_id=event_id,
+                occurred_at=occurred_at,
+                decision=_safe_decision_value(data, "decision"),
+                reason_code=_safe_decision_value(data, "reason_code"),
+            )
+            for event_id, occurred_at, data in self._session.execute(statement)
+        )
+
+
+def _safe_decision_value(data: object, key: str) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get(key)
+    return value if isinstance(value, str) and len(value) <= 128 else None

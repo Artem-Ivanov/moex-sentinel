@@ -1,0 +1,44 @@
+........................................................................ [ 66%]
+.....................................                                    [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/services/test_trading_admission.py::test_same_runtime_registration_is_idempotent_without_lease_resurrection
+tests/services/test_trading_admission.py::test_same_runtime_registration_is_idempotent_without_lease_resurrection
+tests/services/test_trading_admission.py::test_expired_owner_lease_cannot_be_renewed_and_does_not_create_sticky_stop
+tests/services/test_trading_admission.py::test_expired_owner_lease_cannot_be_renewed_and_does_not_create_sticky_stop
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/sqlalchemy/engine/default.py:952: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+    cursor.execute(statement, parameters)
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:10: DeprecationWarning: GetCandlesRequest.figi is deprecated
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:6: DeprecationWarning: GetOrderBookRequest.figi is deprecated
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:5: DeprecationWarning: GetTradingStatusRequest.figi is deprecated
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:8: DeprecationWarning: GetLastTradesRequest.figi is deprecated
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:20: DeprecationWarning: PostStopOrderRequest.figi is deprecated
+
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+tests/integration/postgresql/test_trading_admission_ingress.py::test_worker_proof_outbox_replays_after_lost_ack_and_runtime_transfer
+  <string>:14: DeprecationWarning: PostOrderRequest.figi is deprecated
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+109 passed, 21 warnings in 24.88s

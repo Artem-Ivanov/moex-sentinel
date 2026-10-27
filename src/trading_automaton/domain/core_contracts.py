@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 
 from sentinel_contracts.base import PositionalModel
 
@@ -36,3 +36,4 @@ class AutomationStatusesResult(PositionalModel):
 
     automations: dict[str, dict[str, Any]]
     missing_automation_ids: tuple[str, ...]
+    commission_statuses: dict[str, dict[str, Any]] = Field(default_factory=dict)

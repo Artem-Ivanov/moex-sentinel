@@ -24,6 +24,7 @@ export interface Automation {
   unrealized_pnl: string
   net_pnl: string
   actual_commissions: string
+  financial_status?: "COMPLETE" | "INCOMPLETE" | "UNKNOWN"
   broker_name: string
   ticker: string
   instrument_name: string

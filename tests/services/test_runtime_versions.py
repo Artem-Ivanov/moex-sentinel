@@ -7,7 +7,13 @@ import pytest
 
 from moex_sentinel.services.runtime_versions import WorkerVersionStore
 from sentinel_contracts.runtime_versions import RuntimeVersion
-from sentinel_contracts.worker_diagnostics import OutboxDiagnostics, WorkerDiagnostics
+from sentinel_contracts.worker_diagnostics import (
+    BrokerRuntimeDiagnostics,
+    OutboxDiagnostics,
+    WorkerAutomationExecutionDiagnostics,
+    WorkerDiagnostics,
+    WorkerExecutionDiagnostics,
+)
 
 NOW = datetime(2026, 10, 3, 12, 0, 0, 123000, tzinfo=UTC)
 
@@ -91,7 +97,7 @@ def test_naive_timestamp_does_not_create_observation():
     assert source.snapshot().reason == "NOT_OBSERVED"
 
 
-def progress(count=1, completed=NOW, finished=NOW, result="COMPLETED", **queue):
+def progress(count=1, completed=NOW, finished=NOW, result="COMPLETED", broker_runtime=None, **queue):
     return WorkerDiagnostics(
         completed_iterations=count,
         last_completed_at=completed,
@@ -99,6 +105,7 @@ def progress(count=1, completed=NOW, finished=NOW, result="COMPLETED", **queue):
         last_result=result,
         error_code="ITERATION_FAILED" if result == "ERROR" else None,
         outbox=OutboxDiagnostics(observation="OBSERVED", reason="OBSERVED", pending_count=0, failed_count=0, **queue),
+        broker_runtime=broker_runtime or BrokerRuntimeDiagnostics(reason="NOT_OBSERVED"),
     )
 
 
@@ -120,7 +127,9 @@ def test_repeated_frozen_completion_does_not_refresh_completion_age():
     assert observed.age_ms == 1000
 
 
-@pytest.mark.parametrize("invalid", ["rollback", "same_count_changed_time", "future_nested", "older_completion"])
+@pytest.mark.parametrize(
+    "invalid", ["rollback", "same_count_changed_time", "future_nested", "future_broker", "older_completion"]
+)
 def test_invalid_progress_does_not_refresh_any_observation(invalid):
     clock = [NOW]
     ticks = [0.0]
@@ -134,6 +143,19 @@ def test_invalid_progress_does_not_refresh_any_observation(invalid):
         "same_count_changed_time": progress(count=2, completed=clock[0], finished=clock[0]),
         "future_nested": progress(
             count=3, completed=clock[0] + timedelta(seconds=1), finished=clock[0] + timedelta(seconds=1)
+        ),
+        "future_broker": progress(
+            count=3,
+            completed=clock[0],
+            finished=clock[0],
+            broker_runtime=BrokerRuntimeDiagnostics(
+                status="RUNNING",
+                decision_eligibility="READY",
+                reason="DECISION_FRAME_AVAILABLE",
+                last_started_at=clock[0],
+                last_finished_at=clock[0] + timedelta(seconds=1),
+                last_success_at=clock[0] + timedelta(seconds=1),
+            ),
         ),
         "older_completion": progress(
             count=3, completed=NOW - timedelta(seconds=1), finished=NOW - timedelta(seconds=1)
@@ -164,6 +186,171 @@ def test_new_instance_clears_old_progress_even_when_new_heartbeat_is_legacy():
     assert observed.completed_iterations is None
 
 
+def test_scoped_execution_snapshot_requires_current_owner_and_exact_row_bindings():
+    source, _ = store()
+    identity = metadata()
+    broker_id = uuid4()
+    automation_id = uuid4()
+    row = WorkerAutomationExecutionDiagnostics(
+        automation_id=automation_id,
+        account_id="account-1",
+        external_instrument_id="instrument-1",
+        fact_instrument_id=uuid4(),
+        lot_size=10,
+        pending_fact_count=1,
+        failed_fact_count=0,
+    )
+    diagnostics = progress().model_copy(
+        update={
+            "execution_diagnostics": WorkerExecutionDiagnostics(
+                observation="OBSERVED",
+                reason="OBSERVED",
+                broker_id=broker_id,
+                captured_at=NOW,
+                rows=(row,),
+            )
+        }
+    )
+    source.observe(
+        identity,
+        NOW,
+        diagnostics,
+        source_runtime_instance_id=identity.instance_id,
+        source_generation=3,
+        source_broker_id=broker_id,
+    )
+
+    accepted = source.execution_snapshot(
+        broker_id=broker_id,
+        automation_id=automation_id,
+        account_id="account-1",
+        instrument_id="instrument-1",
+        fact_instrument_id=row.fact_instrument_id,
+        lot_size=row.lot_size,
+        owner_runtime_instance_id=identity.instance_id,
+        owner_generation=3,
+    )
+    takeover = source.execution_snapshot(
+        broker_id=broker_id,
+        automation_id=automation_id,
+        account_id="account-1",
+        instrument_id="instrument-1",
+        fact_instrument_id=row.fact_instrument_id,
+        lot_size=row.lot_size,
+        owner_runtime_instance_id=identity.instance_id,
+        owner_generation=4,
+    )
+    cross_account = source.execution_snapshot(
+        broker_id=broker_id,
+        automation_id=automation_id,
+        account_id="other-account",
+        instrument_id="instrument-1",
+        fact_instrument_id=row.fact_instrument_id,
+        lot_size=row.lot_size,
+        owner_runtime_instance_id=identity.instance_id,
+        owner_generation=3,
+    )
+    wrong_catalog_id = source.execution_snapshot(
+        broker_id=broker_id,
+        automation_id=automation_id,
+        account_id="account-1",
+        instrument_id="instrument-1",
+        fact_instrument_id=uuid4(),
+        lot_size=row.lot_size,
+        owner_runtime_instance_id=identity.instance_id,
+        owner_generation=3,
+    )
+    wrong_lot_size = source.execution_snapshot(
+        broker_id=broker_id,
+        automation_id=automation_id,
+        account_id="account-1",
+        instrument_id="instrument-1",
+        fact_instrument_id=row.fact_instrument_id,
+        lot_size=11,
+        owner_runtime_instance_id=identity.instance_id,
+        owner_generation=3,
+    )
+
+    assert accepted.observation == "OBSERVED"
+    assert accepted.row == row
+    assert takeover.observation == "UNKNOWN"
+    assert takeover.reason == "OWNER_CHANGED"
+    assert takeover.row is None
+    assert cross_account.observation == "UNKNOWN"
+    assert cross_account.row is None
+    assert wrong_catalog_id.observation == wrong_lot_size.observation == "UNKNOWN"
+    assert wrong_catalog_id.reason == wrong_lot_size.reason == "INVALID_PROJECTION"
+    assert wrong_catalog_id.row is wrong_lot_size.row is None
+
+
+def test_execution_projection_source_ttl_and_future_skew_are_checked():
+    clock = [NOW]
+    ticks = [0.0]
+    source = WorkerVersionStore("TEST", "READ_ONLY", clock=lambda: clock[0], monotonic_clock=lambda: ticks[0])
+    identity = metadata()
+    broker_id = uuid4()
+    automation_id = uuid4()
+    row = WorkerAutomationExecutionDiagnostics(
+        automation_id=automation_id,
+        account_id="account-1",
+        external_instrument_id="instrument-1",
+        fact_instrument_id=uuid4(),
+        lot_size=1,
+        pending_fact_count=0,
+        failed_fact_count=0,
+    )
+
+    def projection(captured_at):
+        return progress().model_copy(
+            update={
+                "execution_diagnostics": WorkerExecutionDiagnostics(
+                    observation="OBSERVED",
+                    reason="OBSERVED",
+                    broker_id=broker_id,
+                    captured_at=captured_at,
+                    rows=(row,),
+                )
+            }
+        )
+
+    source.observe(
+        identity,
+        NOW,
+        projection(NOW),
+        source_runtime_instance_id=identity.instance_id,
+        source_generation=1,
+        source_broker_id=broker_id,
+    )
+    lookup = {
+        "broker_id": broker_id,
+        "automation_id": automation_id,
+        "account_id": "account-1",
+        "instrument_id": "instrument-1",
+        "fact_instrument_id": row.fact_instrument_id,
+        "lot_size": row.lot_size,
+        "owner_runtime_instance_id": identity.instance_id,
+        "owner_generation": 1,
+    }
+    assert source.execution_snapshot(**lookup).observation == "OBSERVED"
+    clock[0] += timedelta(seconds=30)
+    assert source.execution_snapshot(**lookup).reason == "STALE"
+
+    fresh_source, _ = store()
+    fresh = metadata()
+    future_diagnostics = projection(NOW + timedelta(milliseconds=5001))
+    fresh_source.observe(
+        fresh,
+        NOW,
+        future_diagnostics,
+        source_runtime_instance_id=fresh.instance_id,
+        source_generation=1,
+        source_broker_id=broker_id,
+    )
+    assert (
+        fresh_source.execution_snapshot(**{**lookup, "owner_runtime_instance_id": fresh.instance_id}).reason == "STALE"
+    )
+
+
 @pytest.mark.parametrize(("result", "reason"), [("ERROR", "ITERATION_FAILED"), ("OUTBOX_BLOCKED", "OUTBOX_BLOCKED")])
 def test_failed_finished_iteration_is_immediately_degraded(result, reason):
     source, _ = store()
@@ -171,6 +358,53 @@ def test_failed_finished_iteration_is_immediately_degraded(result, reason):
     observed = source.diagnostics_snapshot()[1]
     assert observed.status == "DEGRADED"
     assert observed.reason == reason
+
+
+def test_permanent_broker_block_degrades_observation_while_control_progress_remains_visible():
+    source, _ = store()
+    source.observe(
+        metadata(),
+        NOW,
+        progress(
+            broker_runtime=BrokerRuntimeDiagnostics(
+                status="BLOCKED", reason="PERMANENT_BROKER_ERROR", last_started_at=NOW, last_finished_at=NOW
+            )
+        ),
+    )
+
+    observed = source.diagnostics_snapshot()[1]
+
+    assert observed.status == "DEGRADED"
+    assert observed.reason == "CONTROL_PROGRESS"
+    assert observed.completed_iterations == 1
+    assert observed.broker_runtime.status == "BLOCKED"
+    assert observed.broker_runtime.reason == "PERMANENT_BROKER_ERROR"
+
+
+def test_stale_legacy_worker_diagnostics_never_claim_broker_readiness():
+    source, ticks = store()
+    source.observe(
+        metadata(),
+        NOW,
+        progress(
+            broker_runtime=BrokerRuntimeDiagnostics(
+                status="RUNNING",
+                decision_eligibility="READY",
+                reason="DECISION_FRAME_AVAILABLE",
+                last_started_at=NOW,
+                last_finished_at=NOW,
+                last_success_at=NOW,
+            )
+        ),
+    )
+    ticks[0] = 30.0
+
+    observed = source.diagnostics_snapshot()[1]
+
+    assert observed.reason == "STALE"
+    assert observed.broker_runtime.status == "UNKNOWN"
+    assert observed.broker_runtime.decision_eligibility == "UNKNOWN"
+    assert observed.broker_runtime.reason == "STALE"
 
 
 @pytest.mark.parametrize(

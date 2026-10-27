@@ -14,7 +14,9 @@ from moex_sentinel.adapters.tinvest.portfolio import (
     TInvestAdapterError,
     TInvestPortfolioAdapter,
 )
+from moex_sentinel.domain.execution_commissions import BrokerFeeScanClaim
 from moex_sentinel.domain.portfolio import Money
+from moex_sentinel.services.execution_commissions import ExecutionCommissionService
 
 
 def value(units: int, nano: int = 0, currency: str = "RUB") -> SimpleNamespace:
@@ -69,6 +71,7 @@ class FakeOperationsService:
                     quantity=1,
                     commission=None,
                     instrument_uid="instrument-1",
+                    parent_operation_id="exchange-order-1",
                 )
             ],
         )
@@ -132,6 +135,7 @@ def test_adapter_maps_operations(portfolio_adapter: tuple[TInvestPortfolioAdapte
 
     assert page.items[0].payment == Money(Decimal("-50.5"), "RUB")
     assert page.items[0].instrument_id == "instrument-1"
+    assert page.items[0].parent_operation_id == "exchange-order-1"
     assert page.next_cursor == "next"
     assert operations.request.account_id == "account-1"
     assert operations.request.cursor == "cursor"
@@ -196,3 +200,113 @@ def test_adapter_maps_transport_errors_safely(status, code: str, retryable: bool
     assert error.value.retryable is retryable
     assert "transport detail" not in str(error.value)
     assert "synthetic-token" not in str(error.value)
+
+
+def test_actual_fee_enum_survives_adapter_and_commission_service() -> None:
+    class Operations:
+        async def get_operations_by_cursor(self, _request):
+            return SimpleNamespace(
+                has_next=False,
+                next_cursor=None,
+                items=[
+                    SimpleNamespace(
+                        id="fee-op",
+                        broker_account_id="account-1",
+                        type="OPERATION_TYPE_BROKER_FEE",
+                        state="OPERATION_STATE_EXECUTED",
+                        date=datetime(2026, 10, 27, tzinfo=UTC),
+                        payment=value(-1, -720_000_000),
+                        price=None,
+                        quantity=0,
+                        commission=None,
+                        instrument_uid="instrument-1",
+                        parent_operation_id="exchange-order-1",
+                    )
+                ],
+            )
+
+    class Repository:
+        saved = None
+
+        def apply_page(self, _claim, observations, _cursor, _now):
+            self.saved = observations
+            return True
+
+        def fail_page(self, _claim, _error):
+            raise AssertionError("Valid fee source must not be rejected")
+
+    adapter = adapter_with(SimpleNamespace(operations=Operations()))
+    repository = Repository()
+    service = ExecutionCommissionService(repository, now=lambda: datetime(2026, 10, 28, tzinfo=UTC))
+    claim = BrokerFeeScanClaim(
+        user_broker_id="broker-1",
+        account_id="account-1",
+        scan_pass_id="scan-abc",  # noqa: S106 - synthetic test identity, not a credential
+        claim_id="claim-abc",
+        lower_bound=datetime(2026, 10, 27, tzinfo=UTC),
+        upper_bound=datetime(2026, 10, 28, tzinfo=UTC),
+        cursor=None,
+    )
+    page = asyncio.run(
+        adapter.get_operations(
+            "account-1",
+            None,
+            100,
+            from_at=claim.lower_bound,
+            to_at=claim.upper_bound,
+        )
+    )
+
+    assert service.accept_page(claim, page) is True
+    assert repository.saved is not None
+    assert repository.saved[0].amount == Decimal("1.72")
+
+
+def test_missing_source_account_on_fee_is_not_replaced_by_requested_account() -> None:
+    class Operations:
+        async def get_operations_by_cursor(self, _request):
+            item = SimpleNamespace(
+                id="fee-op",
+                broker_account_id=None,
+                type="OPERATION_TYPE_BROKER_FEE",
+                state="OPERATION_STATE_EXECUTED",
+                date=datetime(2026, 10, 27, tzinfo=UTC),
+                payment=value(-1, -720_000_000),
+                price=None,
+                quantity=0,
+                commission=None,
+                instrument_uid="instrument-1",
+                parent_operation_id="exchange-order-1",
+            )
+            return SimpleNamespace(has_next=False, next_cursor=None, items=[item])
+
+    adapter = adapter_with(SimpleNamespace(operations=Operations()))
+
+    page = asyncio.run(adapter.get_operations("account-1", None, 100))
+
+    assert page.items[0].account_id == ""
+
+    class Repository:
+        error = None
+
+        def fail_page(self, _claim, error):
+            self.error = error
+            return True
+
+        def apply_page(self, *_args):
+            raise AssertionError("Missing source account must fail closed")
+
+    repository = Repository()
+    service = ExecutionCommissionService(repository)
+    claim = BrokerFeeScanClaim(
+        user_broker_id="broker-1",
+        account_id="account-1",
+        scan_pass_id="scan-account",  # noqa: S106 - synthetic test identity, not a credential
+        claim_id="claim-account",
+        lower_bound=datetime(2026, 10, 27, tzinfo=UTC),
+        upper_bound=datetime(2026, 10, 28, tzinfo=UTC),
+        cursor=None,
+    )
+
+    assert service.accept_page(claim, page) is False
+    assert repository.error == "SOURCE_ACCOUNT_MISMATCH"

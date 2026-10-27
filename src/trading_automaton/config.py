@@ -64,6 +64,7 @@ class StrategySettings(BaseSettings):
     order_retry_limit: int = Field(
         3,
         validation_alias="STRATEGY_ORDER_RETRY_LIMIT",
+        description="Deprecated compatibility setting; it does not authorize broker order resends.",
         ge=0,
     )
     core_retry_limit: int = Field(
@@ -99,6 +100,7 @@ class AutomatonSettings(BaseSettings):
     )
     broker_recovery_probe_seconds: float = Field(60.0, validation_alias="AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS", gt=0)
     account_snapshot_ttl_seconds: float = Field(60.0, validation_alias="AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS", gt=0)
+    broker_request_timeout_seconds: float = Field(10.0, validation_alias="BROKER_REQUEST_TIMEOUT_SECONDS", gt=0)
     fact_outbox_batch_size: int = Field(100, validation_alias="FACT_OUTBOX_BATCH_SIZE")
     fact_outbox_deadline_ms: int = Field(1000, validation_alias="FACT_OUTBOX_DEADLINE_MS")
     log_level: str = Field("INFO", validation_alias="LOG_LEVEL")
@@ -153,6 +155,7 @@ class AutomatonSettings(BaseSettings):
             "analytics_http_timeout_seconds",
             "broker_recovery_probe_seconds",
             "account_snapshot_ttl_seconds",
+            "broker_request_timeout_seconds",
         ):
             if not isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive.")

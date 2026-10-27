@@ -1,6 +1,7 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -8,6 +9,8 @@ from sqlalchemy.orm import sessionmaker
 
 from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, OrderSide
 from tests.trading_automaton.command_factory import command, decision_item
+from trading_automaton.adapters.tinvest_broker_session import _order_state
+from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.order_dispatch import DispatchRequest
 from trading_automaton.services.order_tracking import OrderTrackingService
@@ -30,6 +33,13 @@ class Repository:
         self.finalizations: list[ExecutionFinalization] = []
         self.finalization_error: Exception | None = None
         self.finalization_applied = True
+        self.active_intent = None
+
+    def get_active_intent(self, automation_id):
+        return self.active_intent
+
+    def get_intent(self, idempotency_key):
+        return self.active_intent
 
     def update_intent(self, intent_id, **values):
         self.updates.append((intent_id, values))
@@ -95,6 +105,187 @@ def test_tracks_broker_response_outside_dispatch_start() -> None:
     assert repository.updates[0][1]["broker_order_id"] == "order-1"
 
 
+def test_tracking_watcher_claim_is_released_after_dispatch_failure():
+    async def scenario():
+        gate = ActiveIntentGateService()
+        tracking = OrderTrackingService(Repository(), now=lambda: NOW, active_intents=gate)
+
+        async def failed_dispatch():
+            raise RuntimeError("synthetic dispatch failure")
+
+        tracking.track("intent-1", asyncio.create_task(failed_dispatch()))
+        claimed_during_run = gate.is_tracked("intent-1")
+        await tracking.wait_all()
+        return gate, claimed_during_run
+
+    gate, claimed_during_run = asyncio.run(scenario())
+
+    assert claimed_during_run is True
+    assert gate.is_tracked("intent-1") is False
+
+
+def test_duplicate_tracking_submission_has_one_terminal_lifecycle_owner():
+    async def scenario():
+        repository = Repository()
+        gate = ActiveIntentGateService()
+        tracking = OrderTrackingService(repository, now=lambda: NOW, active_intents=gate)
+        response = BrokerOrderState(
+            "order-1",
+            "intent-1",
+            "FILLED",
+            1,
+            1,
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("1"),
+            Decimal("0.2"),
+            "RUB",
+            executed_price=Decimal("100"),
+        )
+        request = DispatchRequest(
+            "intent-1",
+            "account",
+            "instrument",
+            OrderSide.BUY,
+            1,
+            Decimal("100"),
+            automation_id="automation",
+            broker_id="broker",
+            lot_size=1,
+        )
+        first = asyncio.create_task(asyncio.sleep(0, result=response))
+        duplicate = asyncio.create_task(asyncio.sleep(0, result=response))
+        tracking.track("intent-1", first, request=request)
+        tracking.track("intent-1", duplicate, request=request)
+        await tracking.wait_all()
+        return repository, gate
+
+    repository, gate = asyncio.run(scenario())
+
+    assert len(repository.finalizations) == 1
+    assert gate.is_tracked("intent-1") is False
+
+
+def test_terminal_response_with_wrong_request_id_is_held_without_finalization():
+    async def scenario():
+        repository = Repository()
+        tracking = OrderTrackingService(repository, now=lambda: NOW)
+        response = BrokerOrderState(
+            "order-1",
+            "other-intent",
+            "FILLED",
+            1,
+            1,
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("1"),
+            Decimal("0.2"),
+            "RUB",
+            executed_price=Decimal("100"),
+        )
+        request = DispatchRequest(
+            "intent-1",
+            "account",
+            "instrument",
+            OrderSide.BUY,
+            1,
+            Decimal("100"),
+            automation_id="automation",
+            broker_id="broker",
+            lot_size=1,
+        )
+        tracking.track("intent-1", asyncio.create_task(asyncio.sleep(0, result=response)), request=request)
+        await tracking.wait_all()
+        return repository
+
+    repository = asyncio.run(scenario())
+
+    assert repository.finalizations == []
+    assert repository.updates[-1][1]["state"] == "UNCERTAIN"
+    assert repository.holds
+
+
+def test_late_terminal_ack_uses_its_exact_intent_without_holding_new_active_order():
+    async def scenario():
+        old_id = "old-intent"
+        new_id = "new-intent"
+        old_intent = SimpleNamespace(
+            broker_order_id="old-broker-order",
+            state="FAILED",
+            terminal_at=None,
+            strategy_snapshot={
+                "_age_policy": {
+                    "version": 1,
+                    "expired_at": (NOW - timedelta(hours=1)).isoformat(timespec="milliseconds"),
+                }
+            },
+        )
+        new_intent = SimpleNamespace(broker_order_id="new-broker-order")
+
+        class ConcurrentRepository(Repository):
+            def get_active_intent(self, automation_id):
+                return new_intent
+
+            def get_intent(self, intent_id):
+                assert intent_id == old_id
+                return old_intent
+
+        repository = ConcurrentRepository()
+        gate = ActiveIntentGateService()
+        gate.activate("automation", new_id)
+        assert gate.claim_tracking(new_id)
+        broker = Broker(None)
+        tracking = OrderTrackingService(
+            repository,
+            now=lambda: NOW,
+            broker=broker,
+            active_intents=gate,
+            environment="PROD",
+        )
+        response = BrokerOrderState(
+            "old-broker-order",
+            old_id,
+            "FILLED",
+            1,
+            1,
+            Decimal("1000"),
+            Decimal("1000"),
+            Decimal("1"),
+            Decimal("0.2"),
+            "RUB",
+            executed_price=Decimal("100"),
+            executed_at=NOW,
+        )
+        released = asyncio.Event()
+
+        async def delayed_dispatch():
+            await released.wait()
+            return response
+
+        request = DispatchRequest(
+            old_id,
+            "account",
+            "instrument",
+            OrderSide.BUY,
+            1,
+            Decimal("100"),
+            automation_id="automation",
+            broker_id="broker",
+            lot_size=10,
+        )
+        tracking.track(old_id, asyncio.create_task(delayed_dispatch()), request=request)
+        released.set()
+        await tracking.wait_all()
+        return repository, gate
+
+    repository, gate = asyncio.run(scenario())
+
+    assert [item.intent_id for item in repository.finalizations] == ["old-intent"]
+    assert repository.holds == []
+    assert gate.has_active_intent("automation") is True
+    assert gate.is_tracked("new-intent") is True
+
+
 class CommissionProfiles:
     def __init__(self) -> None:
         self.observations = []
@@ -107,10 +298,18 @@ class Broker:
     def __init__(self, response) -> None:
         self.response = response
         self.calls = 0
+        self.states = []
+        self.cancel_calls = []
+        self.cancel_error = None
 
     async def get_order_state(self, account_id, broker_order_id):
         self.calls += 1
-        return self.response
+        return self.states.pop(0) if self.states else self.response
+
+    async def cancel_order(self, account_id, broker_order_id):
+        self.cancel_calls.append((account_id, broker_order_id))
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
 
 class Portfolio:
@@ -362,6 +561,77 @@ def test_failed_atomic_finalization_keeps_cash_gate_and_portfolio_unchanged() ->
     assert portfolio.value is None
     assert cash.completions == []
     assert gate.has_active_intent("automation") is True
+
+
+def test_expired_intent_cancels_only_after_fresh_status_and_finalizes_confirmation():
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository()
+        repository.active_intent = SimpleNamespace(
+            dispatch_started_at=NOW - timedelta(seconds=10),
+            strategy_snapshot={
+                "order_ttl_seconds": 10,
+                "admission_origin": {
+                    "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                    "generation": 1,
+                    "revision": 1,
+                    "configuration_fingerprint": "a" * 64,
+                },
+            },
+        )
+        response = BrokerOrderState(
+            "order-1",
+            "intent-1",
+            "ACCEPTED",
+            1,
+            0,
+            Decimal("1000"),
+            Decimal(),
+            Decimal("1"),
+            Decimal(),
+            "RUB",
+        )
+        cancelled = response.model_copy(update={"status": "CANCELLED"})
+        broker = Broker(response)
+        broker.states = [response, cancelled]
+        broker.cancel_error = TimeoutError("cancel acknowledgement lost")
+
+        async def no_sleep(_seconds):
+            return None
+
+        tracking = OrderTrackingService(
+            repository,
+            now=lambda: NOW,
+            broker=broker,
+            access_mode="TRADE",
+            environment="PROD",
+            admission=Admission(),
+            sleep=no_sleep,
+            poll_limit=3,
+        )
+        request = DispatchRequest(
+            "intent-1",
+            "account",
+            "instrument",
+            OrderSide.BUY,
+            1,
+            Decimal("100"),
+            automation_id="automation",
+            broker_id="broker",
+            lot_size=10,
+        )
+        tracking.track("intent-1", asyncio.create_task(asyncio.sleep(0, result=response)), request=request)
+        await tracking.wait_all()
+        return repository, broker
+
+    repository, broker = asyncio.run(scenario())
+
+    assert broker.calls == 2
+    assert broker.cancel_calls == [("account", "order-1")]
+    assert repository.finalizations[0].state == "CANCELLED"
 
 
 def test_sell_execution_snapshot_includes_realized_pnl_from_current_lifo_allocation() -> None:
@@ -742,6 +1012,203 @@ def test_poll_limit_keeps_intent_uncertain_and_holds_automation() -> None:
     assert all(values["state"] != "ACCEPTED" for _intent, values in repository.updates)
     assert repository.holds == [("Broker order status polling exhausted", "automation")]
     assert cash.completions == [("intent-1", "UNCERTAIN")]
+
+
+def test_unknown_sdk_status_never_triggers_order_cancel() -> None:
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository()
+        repository.active_intent = SimpleNamespace(
+            broker_order_id="order-1",
+            dispatch_started_at=NOW - timedelta(seconds=20),
+            strategy_snapshot={
+                "order_ttl_seconds": 10,
+                "admission_origin": {
+                    "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                    "generation": 1,
+                    "revision": 1,
+                    "configuration_fingerprint": "a" * 64,
+                },
+            },
+        )
+        money = SimpleNamespace(units=100, nano=0, currency="rub")
+        unknown = _order_state(
+            SimpleNamespace(
+                order_id="order-1",
+                order_request_id="intent-1",
+                execution_report_status="EXECUTION_REPORT_STATUS_UNSPECIFIED",
+                lots_requested=1,
+                lots_executed=0,
+                initial_order_price=money,
+                total_order_amount=SimpleNamespace(units=0, nano=0, currency="rub"),
+                initial_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+                executed_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+                executed_order_price=SimpleNamespace(units=0, nano=0, currency="rub"),
+            )
+        )
+        broker = Broker(unknown)
+        tracking = OrderTrackingService(
+            repository,
+            now=lambda: NOW,
+            broker=broker,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+        )
+        request = DispatchRequest(
+            "intent-1", "account", "instrument", OrderSide.BUY, 1, Decimal("100"), automation_id="automation"
+        )
+        tracking.track("intent-1", asyncio.create_task(asyncio.sleep(0, result=unknown)), request=request)
+        await tracking.wait_all()
+        return repository, broker
+
+    repository, broker = asyncio.run(scenario())
+
+    assert broker.cancel_calls == []
+    assert repository.updates[-1][1]["state"] == "UNCERTAIN"
+
+
+def test_never_completing_status_rpc_releases_watcher_claim_and_wait_all() -> None:
+    class HangingBroker:
+        def __init__(self):
+            self.status_calls = 0
+            self.cancel_calls = []
+
+        async def get_order_state(self, account_id, broker_order_id):
+            self.status_calls += 1
+            await asyncio.Event().wait()
+
+        async def cancel_order(self, account_id, broker_order_id):
+            self.cancel_calls.append((account_id, broker_order_id))
+
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository()
+        repository.active_intent = SimpleNamespace(
+            broker_order_id="order-1",
+            dispatch_started_at=NOW - timedelta(seconds=20),
+            strategy_snapshot={"order_ttl_seconds": 10},
+        )
+        broker = HangingBroker()
+        gate = ActiveIntentGateService()
+        tracking = OrderTrackingService(
+            repository,
+            now=lambda: NOW,
+            broker=broker,
+            active_intents=gate,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+            poll_seconds=0.02,
+            poll_limit=2,
+            broker_request_timeout_seconds=0.005,
+        )
+        request = DispatchRequest(
+            "intent-1", "account", "instrument", OrderSide.BUY, 1, Decimal("100"), automation_id="automation"
+        )
+        tracking.track(
+            "intent-1",
+            asyncio.create_task(
+                asyncio.sleep(
+                    0,
+                    result=BrokerOrderState(
+                        "order-1", "intent-1", "ACCEPTED", 1, 0, Decimal("100"), Decimal(), Decimal(), Decimal(), "RUB"
+                    ),
+                )
+            ),
+            request=request,
+        )
+        await asyncio.wait_for(tracking.wait_all(), timeout=0.1)
+        return repository, broker, gate
+
+    repository, broker, gate = asyncio.run(scenario())
+
+    assert broker.status_calls == 1
+    assert broker.cancel_calls == []
+    assert repository.updates[-1][1]["state"] == "UNCERTAIN"
+    assert gate.is_tracked("intent-1") is False
+
+
+def test_fresh_order_gets_separate_confirmation_window_after_durable_ttl() -> None:
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+    class CancelAwareBroker:
+        def __init__(self, accepted, cancelled, cash):
+            self.accepted = accepted
+            self.cancelled = cancelled
+            self.cash = cash
+            self.cancel_calls = []
+            self.reserved_during_cancel = None
+
+        async def get_order_state(self, account_id, broker_order_id):
+            return self.cancelled if self.cancel_calls else self.accepted
+
+        async def cancel_order(self, account_id, broker_order_id):
+            self.cancel_calls.append((account_id, broker_order_id))
+            self.reserved_during_cancel = await self.cash.reserved(account_id, "RUB")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        repository = Repository()
+        repository.active_intent = SimpleNamespace(
+            broker_order_id="order-1",
+            dispatch_started_at=NOW,
+            strategy_snapshot={
+                "order_ttl_seconds": 1,
+                "admission_origin": {
+                    "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                    "generation": 1,
+                    "revision": 1,
+                    "configuration_fingerprint": "a" * 64,
+                },
+            },
+        )
+
+        def now():
+            return NOW + timedelta(seconds=loop.time() - started)
+
+        accepted = BrokerOrderState(
+            "order-1", "intent-1", "ACCEPTED", 1, 0, Decimal("100"), Decimal(), Decimal(), Decimal(), "RUB"
+        )
+        cancelled = accepted.model_copy(update={"status": "CANCELLED"})
+        cash = AccountCashReservationService()
+        await cash.replace_snapshot("account", "RUB", Decimal("300"))
+        assert await cash.try_reserve("account", "RUB", "intent-1", Decimal("201"))
+        broker = CancelAwareBroker(accepted, cancelled, cash)
+        tracking = OrderTrackingService(
+            repository,
+            now=now,
+            broker=broker,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+            cash=cash,
+            poll_seconds=0.05,
+            poll_limit=20,
+        )
+        request = DispatchRequest(
+            "intent-1", "account", "instrument", OrderSide.BUY, 1, Decimal("100"), automation_id="automation"
+        )
+        tracking.track("intent-1", asyncio.create_task(asyncio.sleep(0, result=accepted)), request=request)
+        await tracking.wait_all()
+        return repository, broker, await cash.reserved("account", "RUB")
+
+    repository, broker, reserved_after = asyncio.run(scenario())
+
+    assert broker.cancel_calls == [("account", "order-1")]
+    assert repository.finalizations[-1].state == "CANCELLED"
+    assert repository.holds == []
+    assert broker.reserved_during_cancel == Decimal("201")
+    assert reserved_after == Decimal(0)
 
 
 def test_filled_without_executed_lots_becomes_uncertain_without_ledger_update() -> None:

@@ -1,0 +1,327 @@
+"""User intents for baseline trading automation lifecycle."""
+
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from functools import partial
+from typing import Protocol
+
+from moex_sentinel.domain.automations import (
+    DecisionReasonsSnapshot,
+    PositionDetailsError,
+    TradingAutomationDetails,
+    TradingAutomationStatuses,
+)
+from moex_sentinel.domain.brokers import BrokerRecordNotFoundError
+from moex_sentinel.domain.market_data import CandleInterval, HistoricCandle
+from moex_sentinel.domain.persistence_errors import DuplicateRecordError, RecordNotFoundError, RevisionConflictError
+from moex_sentinel.domain.portfolio import BrokerOperation, BrokerOperationsView
+from moex_sentinel.domain.repository_records import AutomationRecord
+from moex_sentinel.services.automations import AutomationStateConflictError
+from moex_sentinel.services.environment import EnvironmentMismatchError
+from moex_sentinel.services.sync_execution import run_sync
+from moex_sentinel.services.trading_fact_ports import TradingFactsUnitOfWorkPort
+from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.time import utc_now_ms
+
+
+class AutomationServicePort(Protocol):
+    def create(self, *, broker_id: str, account_id: str, instrument_id: str) -> AutomationRecord: ...
+    def get(self, automation_id: str) -> AutomationRecord: ...
+    def get_many(self, automation_ids: list[str]) -> list[AutomationRecord]: ...
+    def list_active(self) -> list[AutomationRecord]: ...
+    def hold(self, automation_id: str, reason: str) -> AutomationRecord: ...
+    def resume(self, automation_id: str) -> AutomationRecord: ...
+    def close(self, automation_id: str) -> AutomationRecord: ...
+    def update_settings(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord: ...
+
+
+class PositionOperationsServicePort(Protocol):
+    """Position operations addressed by broker-scoped internal catalog IDs."""
+
+    async def view_position_operations(
+        self,
+        broker_id: str,
+        account_id: str,
+        instrument_id: str,
+        limit: int,
+    ) -> BrokerOperationsView: ...
+
+
+class PositionMarketDataServicePort(Protocol):
+    """Position chart data addressed by broker-scoped internal catalog IDs."""
+
+    async def candles(
+        self,
+        broker_id: str,
+        instrument_id: str,
+        start: datetime,
+        end: datetime,
+        interval: CandleInterval,
+    ) -> tuple[HistoricCandle, ...]:
+        """Resolve the internal instrument ID before querying broker candles."""
+        ...
+
+
+class CreateTradingAutomationUsecase:
+    """Create an automation and expose known lifecycle failures as stable application errors."""
+
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    async def execute(self, broker_id: str, account_id: str, instrument_id: str) -> AutomationRecord:
+        """Return the created automation; translate known lifecycle failures to UseCaseError."""
+        try:
+            return await run_sync(
+                partial(
+                    self._service.create,
+                    broker_id=broker_id,
+                    account_id=account_id,
+                    instrument_id=instrument_id,
+                )
+            )
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except BrokerRecordNotFoundError as error:
+            raise UseCaseError("BROKER_NOT_FOUND", "Подключение брокера не найдено.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class UpdateTradingAutomationSettingsUsecase:
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(
+        self,
+        automation_id: str,
+        *,
+        expected_revision: int,
+        expected_settings_revision: int,
+        order_quota_percent: Decimal | None,
+    ) -> AutomationRecord:
+        try:
+            return self._service.update_settings(
+                automation_id,
+                expected_revision=expected_revision,
+                expected_settings_revision=expected_settings_revision,
+                order_quota_percent=order_quota_percent,
+            )
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class ViewTradingAutomationUsecase:
+    """Read one automation without intercepting unexpected service failures."""
+
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self, automation_id: str) -> AutomationRecord:
+        """Return one automation; translate known lookup and lifecycle failures to UseCaseError."""
+        try:
+            return self._service.get(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class ViewTradingAutomationDecisionReasonsUsecase:
+    def __init__(
+        self,
+        automation_lookup: ViewTradingAutomationUsecase,
+        uow_factory: Callable[[], TradingFactsUnitOfWorkPort],
+    ) -> None:
+        self._automation_lookup = automation_lookup
+        self._uow_factory = uow_factory
+
+    def execute(self, automation_id: str, limit: int = 5) -> DecisionReasonsSnapshot:
+        automation = self._automation_lookup.execute(automation_id)
+        captured_at = utc_now_ms()
+        with self._uow_factory() as uow:
+            items = uow.audit.list_recent_decision_reasons(automation.broker_id, automation_id, limit)
+        return DecisionReasonsSnapshot(captured_at=captured_at, items=items)
+
+
+class ViewTradingAutomationStatusesUsecase:
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self, automation_ids: list[str]) -> TradingAutomationStatuses:
+        records = self._service.get_many(automation_ids)
+        found = {record.id for record in records}
+        return TradingAutomationStatuses(
+            tuple(records),
+            tuple(automation_id for automation_id in automation_ids if automation_id not in found),
+        )
+
+
+class ViewTradingAutomationsUsecase:
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self) -> list[AutomationRecord]:
+        return self._service.list_active()
+
+
+class ViewTradingAutomationDetailsUsecase:
+    """Read an automation with independent, explicitly reported operations and candle failures."""
+
+    def __init__(
+        self,
+        automations: AutomationServicePort,
+        operations: PositionOperationsServicePort,
+        market_data: PositionMarketDataServicePort,
+        *,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._automations = automations
+        self._operations = operations
+        self._market_data = market_data
+        self._now = now
+
+    async def execute(self, automation_id: str) -> TradingAutomationDetails:
+        """Return details with independent source errors; fail if the automation cannot be read."""
+        try:
+            automation = await run_sync(partial(self._automations.get, automation_id))
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+        end = self._now()
+        start = end - timedelta(hours=2)
+        operations: tuple[BrokerOperation, ...] = ()
+        candles: tuple[HistoricCandle, ...] = ()
+        errors: list[PositionDetailsError] = []
+        try:
+            operation_view = await self._operations.view_position_operations(
+                automation.broker_id,
+                automation.account_id,
+                automation.instrument_id,
+                50,
+            )
+            operations = operation_view.items
+            errors.extend(PositionDetailsError("operations", item.code, item.message) for item in operation_view.errors)
+        except Exception:
+            errors.append(
+                PositionDetailsError(
+                    "operations",
+                    "BROKER_OPERATIONS_UNAVAILABLE",
+                    "Не удалось получить брокерские операции.",  # noqa: RUF001
+                )
+            )
+        try:
+            candles = await self._market_data.candles(
+                automation.broker_id,
+                automation.instrument_id,
+                start,
+                end,
+                CandleInterval.MIN_1,
+            )
+        except Exception:
+            errors.append(
+                PositionDetailsError(
+                    "candles",
+                    "MARKET_CANDLES_UNAVAILABLE",
+                    "Не удалось получить минутные свечи.",  # noqa: RUF001
+                )
+            )
+        return TradingAutomationDetails(automation, operations, candles, tuple(errors))
+
+
+class HoldAutomationUsecase:
+    """Request HOLD and preserve typed lifecycle conflict errors."""
+
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the automation after HOLD; translate known lifecycle failures to UseCaseError."""
+        try:
+            return self._service.hold(automation_id, "User requested hold")
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class ResumeAutomationUsecase:
+    """Request RESUME and preserve typed lifecycle conflict errors."""
+
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the resumed automation; translate known lifecycle failures to UseCaseError."""
+        try:
+            return self._service.resume(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class CloseAutomationUsecase:
+    """Request closure and preserve typed lifecycle conflict errors."""
+
+    def __init__(self, service: AutomationServicePort) -> None:
+        self._service = service
+
+    def execute(self, automation_id: str) -> AutomationRecord:
+        """Return the automation after requesting closure; translate known lifecycle failures."""
+        try:
+            return self._service.close(automation_id)
+        except EnvironmentMismatchError as error:
+            raise UseCaseError("BROKER_ENVIRONMENT_MISMATCH", "Брокер относится к другому контуру.") from error
+        except RecordNotFoundError as error:
+            raise UseCaseError("AUTOMATION_NOT_FOUND", "Торговый автомат не найден.") from error
+        except DuplicateRecordError as error:
+            raise UseCaseError("AUTOMATION_ALREADY_ACTIVE", "Для инструмента уже есть автомат.") from error
+        except RevisionConflictError as error:
+            raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
+        except AutomationStateConflictError as error:
+            raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error

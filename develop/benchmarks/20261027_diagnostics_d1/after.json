@@ -1,0 +1,342 @@
+{
+  "synthetic_only": true,
+  "repeats": 7,
+  "profiles": [
+    {
+      "automations": 2,
+      "total_intents": 100,
+      "intents_per_automation_mean": 50.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.086,
+        "automations": 0.101,
+        "intents": 0.806,
+        "fact_counts": 0.147
+      },
+      "full_read_median_ms": 5.22,
+      "full_read_observation": "OBSERVED",
+      "full_read_reason": "OBSERVED",
+      "full_read_rows": 2,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 2,
+      "total_intents": 1000,
+      "intents_per_automation_mean": 500.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.051,
+        "automations": 0.066,
+        "intents": 3.772,
+        "fact_counts": 0.174
+      },
+      "full_read_median_ms": 6.301,
+      "full_read_observation": "OBSERVED",
+      "full_read_reason": "OBSERVED",
+      "full_read_rows": 2,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 2,
+      "total_intents": 10000,
+      "intents_per_automation_mean": 5000.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.06,
+        "automations": 0.079,
+        "intents": 36.387,
+        "fact_counts": 0.133
+      },
+      "full_read_median_ms": 32.956,
+      "full_read_observation": "OBSERVED",
+      "full_read_reason": "OBSERVED",
+      "full_read_rows": 2,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 2,
+      "total_intents": 50000,
+      "intents_per_automation_mean": 25000.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.059,
+        "automations": 0.081,
+        "intents": 224.628,
+        "fact_counts": 0.13
+      },
+      "full_read_median_ms": 105.521,
+      "full_read_observation": "UNKNOWN",
+      "full_read_reason": "BUDGET_EXCEEDED",
+      "full_read_rows": 0,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 100,
+      "total_intents": 100,
+      "intents_per_automation_mean": 1.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.067,
+        "automations": 0.387,
+        "intents": 2.133,
+        "fact_counts": 0.616
+      },
+      "full_read_median_ms": 10.857,
+      "full_read_observation": "OBSERVED",
+      "full_read_reason": "OBSERVED",
+      "full_read_rows": 100,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 100,
+      "total_intents": 1000,
+      "intents_per_automation_mean": 10.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.066,
+        "automations": 0.306,
+        "intents": 12.22,
+        "fact_counts": 0.606
+      },
+      "full_read_median_ms": 36.95,
+      "full_read_observation": "OBSERVED",
+      "full_read_reason": "OBSERVED",
+      "full_read_rows": 100,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 100,
+      "total_intents": 10000,
+      "intents_per_automation_mean": 100.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.065,
+        "automations": 0.321,
+        "intents": 51.208,
+        "fact_counts": 0.562
+      },
+      "full_read_median_ms": 98.538,
+      "full_read_observation": "UNKNOWN",
+      "full_read_reason": "BUDGET_EXCEEDED",
+      "full_read_rows": 0,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    },
+    {
+      "automations": 100,
+      "total_intents": 50000,
+      "intents_per_automation_mean": 500.0,
+      "query_median_ms": {
+        "unscoped_cache": 0.066,
+        "automations": 0.32,
+        "intents": 297.524,
+        "fact_counts": 0.811
+      },
+      "full_read_median_ms": 101.691,
+      "full_read_observation": "UNKNOWN",
+      "full_read_reason": "BUDGET_EXCEEDED",
+      "full_read_rows": 0,
+      "plans": {
+        "unscoped_cache": [
+          "SCAN cached_automations"
+        ],
+        "automations": [
+          "SCAN cached_automations USING INDEX sqlite_autoindex_cached_automations_1"
+        ],
+        "intents": [
+          "CO-ROUTINE ranked",
+          "CO-ROUTINE (subquery-5)",
+          "MATERIALIZE active_candidates",
+          "SEARCH intent USING INDEX ix_broker_intents_automation_id (automation_id=?)",
+          "SCAN active_candidates",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "SCAN (subquery-5)",
+          "SCAN ranked",
+          "SEARCH intent USING INDEX sqlite_autoindex_broker_intents_1 (idempotency_key=?)",
+          "SEARCH decision USING INDEX sqlite_autoindex_trade_decisions_1 (id=?) LEFT-JOIN",
+          "CORRELATED SCALAR SUBQUERY 3",
+          "SEARCH candidate USING INDEX ix_trade_decisions_intent_id (intent_id=?)",
+          "USE TEMP B-TREE FOR ORDER BY",
+          "USE TEMP B-TREE FOR ORDER BY"
+        ],
+        "fact_counts": [
+          "SEARCH fact_outbox USING INDEX ix_fact_outbox_automation_id (automation_id=?)"
+        ]
+      }
+    }
+  ]
+}

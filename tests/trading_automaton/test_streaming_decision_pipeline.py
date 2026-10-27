@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sentinel_contracts.analytics import (
@@ -9,7 +9,12 @@ from sentinel_contracts.analytics import (
     MarketIndicators,
 )
 from sentinel_contracts.broker_execution import BrokerPosition, OrderBookLevel
-from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook, StreamTradingStatus
+from sentinel_contracts.streaming_market import (
+    InstrumentMarketState,
+    StreamOrderBook,
+    StreamTradingStatus,
+    UnaryApiTradingStatus,
+)
 from sentinel_contracts.trading import DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
@@ -64,7 +69,8 @@ class Analytics:
                     market=InstrumentMarketState(
                         "instrument",
                         order_book=book,
-                        trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, True, NOW),
+                        trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, NOW),
+                        api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
                     ),
                     candles=(),
                     available=True,

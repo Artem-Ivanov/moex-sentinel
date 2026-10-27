@@ -14,7 +14,7 @@ from moex_sentinel.domain.trading_facts import (
 )
 from moex_sentinel.storage.repositories.trading_audit import TradingAuditRepository
 from tests.domain.trading_facts_helpers import all_fact_drafts
-from tests.storage.trading_facts_helpers import automation_model, seed_buy_and_sell_executions
+from tests.storage.trading_facts_helpers import NOW, automation_model, seed_buy_and_sell_executions
 
 FactDraftT = TypeVar("FactDraftT", AutomationEnvelopeDraft, TradeAuditEventDraft)
 
@@ -93,3 +93,85 @@ def test_audit_rejects_same_scope_cross_automation_lineage(database: tuple[Engin
         repository.append_audit("scope-1", audit)
 
     assert caught.value.code is TradingFactErrorCode.INVALID_STATE
+
+
+def test_recent_decision_reasons_are_scoped_bounded_and_safe(database: tuple[Engine, Session]) -> None:
+    _, session = database
+    session.add(automation_model("automation-2", state="CLOSED", closed=True))
+    session.flush()
+    repository = TradingAuditRepository(session)
+    audit = fact_value(TradeAuditEventDraft)
+    for event_id, stage, automation_id, occurred_at, data in (
+        (
+            "old",
+            "STRATEGY_DECISION_MADE",
+            "automation-1",
+            NOW,
+            {"decision": "OLD", "reason_code": "OLD_REASON"},
+        ),
+        (
+            "new",
+            "STRATEGY_DECISION_MADE",
+            "automation-1",
+            NOW.replace(minute=1),
+            {"decision": "WAIT", "reason_code": "NO_SIGNAL", "secret": "hidden"},
+        ),
+        (
+            "other-stage",
+            "BROKER_ORDER_SUBMITTED",
+            "automation-1",
+            NOW.replace(minute=2),
+            {"decision": "BUY", "reason_code": "ORDER"},
+        ),
+        (
+            "other-automation",
+            "STRATEGY_DECISION_MADE",
+            "automation-2",
+            NOW.replace(minute=3),
+            {"decision": "SELL", "reason_code": "OTHER"},
+        ),
+        (
+            "malformed",
+            "STRATEGY_DECISION_MADE",
+            "automation-1",
+            NOW.replace(minute=4),
+            {"decision": {"nested": "secret"}, "reason_code": ["secret"]},
+        ),
+        (
+            "long",
+            "STRATEGY_DECISION_MADE",
+            "automation-1",
+            NOW.replace(minute=5),
+            {"decision": "x" * 129, "reason_code": "R"},
+        ),
+    ):
+        repository.append_audit(
+            "scope-1",
+            audit.model_copy(
+                update={
+                    "event_id": event_id,
+                    "stage": stage,
+                    "automation_id": automation_id,
+                    "occurred_at": occurred_at,
+                    "data": data,
+                    "decision_id": None,
+                    "broker_order_id": None,
+                    "execution_id": None,
+                }
+            ),
+        )
+
+    results = repository.list_recent_decision_reasons("scope-1", "automation-1", 4)
+
+    assert [item.event_id for item in results] == ["long", "malformed", "new", "old"]
+    assert (results[0].decision, results[0].reason_code) == (None, "R")
+    assert (results[1].decision, results[1].reason_code) == (None, None)
+    assert (results[2].decision, results[2].reason_code) == ("WAIT", "NO_SIGNAL")
+    assert not hasattr(results[2], "data")
+
+
+def test_recent_decision_reasons_rejects_limit_above_repository_bound(database: tuple[Engine, Session]) -> None:
+    _, session = database
+
+    with pytest.raises(ValueError, match="limit"):
+        TradingAuditRepository(session).list_recent_decision_reasons("scope-1", "automation-1", 21)

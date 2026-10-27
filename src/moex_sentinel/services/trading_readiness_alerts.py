@@ -39,6 +39,8 @@ AlertSignal = Literal[
     "OUTBOX_UNKNOWN",
     "PREPARATION_FAILED",
     "READINESS_LOST",
+    "BROKER_STARTUP_BLOCKED",
+    "STARTUP_ADMISSION_BLOCKED",
 ]
 Severity = Literal["CRITICAL", "WARNING"]
 AlertState = Literal["ACTIVE", "RECOVERED"]
@@ -50,6 +52,16 @@ HEARTBEAT_CONFIRMATION_SECONDS = 30
 CONTROL_CONFIRMATION_SECONDS = 30
 OUTBOX_CONFIRMATION_SECONDS = 60
 RETRY_DELAYS_SECONDS = (30, 60, 300)
+STARTUP_ADMISSION_BLOCKERS = frozenset(
+    {
+        "LIMITS_NOT_CONFIGURED",
+        "BASELINE_REQUIRED",
+        "NOT_OWNER",
+        "LEASE_EXPIRED",
+        "CONFIGURATION_CHANGED",
+        "RECONCILIATION_REQUIRED",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +73,8 @@ class ReadinessObservation:
     recovery_only: bool
     preparation_status: PreparationStatus
     preparation_reason: PreparationReason
+    expected_work: bool | None = None
+    effective_denial_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +159,7 @@ class TradingReadinessAlertService:
         self._worker_seen = False
         self._outbox_seen = False
         self._effective_submit_seen = False
+        self._broker_ready_seen = False
         self._candidate_since: dict[AlertSignal, float] = {}
         self._active: dict[AlertSignal, AlertTransition] = {}
         self._control_progress_baseline: dict[AlertSignal, tuple[int | None, str | None]] = {}
@@ -173,6 +188,8 @@ class TradingReadinessAlertService:
             return ()
         if observation.account_effective_can_submit is True:
             self._effective_submit_seen = True
+        if observation.worker.broker_runtime.decision_eligibility == "READY":
+            self._broker_ready_seen = True
         events = self._transitions(observation, now)
         for event in events:
             self._enqueue(event)
@@ -251,6 +268,32 @@ class TradingReadinessAlertService:
             result["PREPARATION_FAILED"] = (safe_reason, "CRITICAL", 0)
 
         worker = value.worker
+        broker = worker.broker_runtime
+        if (
+            value.expected_work is True
+            and not self._effective_submit_seen
+            and value.account_effective_can_submit is False
+        ):
+            blocker = next(
+                (reason for reason in value.effective_denial_reasons if reason in STARTUP_ADMISSION_BLOCKERS), None
+            )
+            if blocker is not None:
+                result["STARTUP_ADMISSION_BLOCKED"] = (
+                    blocker,
+                    "CRITICAL",
+                    max(self._startup_grace_seconds, self._control_confirmation_seconds),
+                )
+        if (
+            value.expected_work
+            and not self._broker_ready_seen
+            and broker.status == "BLOCKED"
+            and broker.reason == "PERMANENT_BROKER_ERROR"
+        ):
+            result["BROKER_STARTUP_BLOCKED"] = (
+                "PERMANENT_BROKER_ERROR",
+                "CRITICAL",
+                max(self._startup_grace_seconds, self._control_confirmation_seconds),
+            )
         if worker.observation == "OBSERVED":
             self._worker_seen = True
         if worker.observation == "UNKNOWN" or worker.reason in {"NOT_OBSERVED", "STALE"}:
@@ -278,6 +321,27 @@ class TradingReadinessAlertService:
             return value.account_status not in {"STOP_REQUIRED", "UNKNOWN"}
         if signal == "READINESS_LOST":
             return value.account_effective_can_submit is True
+        if signal == "BROKER_STARTUP_BLOCKED":
+            if value.expected_work is False:
+                return True
+            previous = self._active.get(signal)
+            success_at = value.worker.broker_runtime.last_success_at
+            return (
+                value.expected_work is True
+                and value.worker.broker_runtime.status == "RUNNING"
+                and previous is not None
+                and success_at is not None
+                and success_at > previous.occurred_at
+            )
+        if signal == "STARTUP_ADMISSION_BLOCKED":
+            if value.expected_work is False or value.account_effective_can_submit is True:
+                return True
+            return (
+                value.expected_work is True
+                and value.account_status != "UNKNOWN"
+                and value.account_effective_can_submit is False
+                and not any(reason in STARTUP_ADMISSION_BLOCKERS for reason in value.effective_denial_reasons)
+            )
         if signal == "PREPARATION_FAILED":
             return value.preparation_status == "READY" or (
                 value.preparation_reason == "ARM_REQUIRED" and value.account_status == "DISARMED"

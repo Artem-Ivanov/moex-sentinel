@@ -12,7 +12,12 @@ from sentinel_contracts.analytics import (
     MarketIndicators,
 )
 from sentinel_contracts.broker_execution import OrderBookLevel
-from sentinel_contracts.streaming_market import InstrumentMarketState, StreamOrderBook, StreamTradingStatus
+from sentinel_contracts.streaming_market import (
+    InstrumentMarketState,
+    StreamOrderBook,
+    StreamTradingStatus,
+    UnaryApiTradingStatus,
+)
 from sentinel_contracts.trading import DecisionKind
 from tests.trading_automaton.analytics_runtime_helpers import build_analytics_runtime
 from tests.trading_automaton.command_factory import command
@@ -39,7 +44,8 @@ def frame(*, at=NOW, book_at=NOW, snapshot_id="snapshot", fresh="FRESH", ids=("i
                     order_book=StreamOrderBook(
                         instrument, (OrderBookLevel(Decimal(99), 5),), (OrderBookLevel(Decimal(100), 5),), book_at, True
                     ),
-                    trading_status=StreamTradingStatus(instrument, "NORMAL_TRADING", True, True, NOW),
+                    trading_status=StreamTradingStatus(instrument, "NORMAL_TRADING", True, NOW),
+                    api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
                 ),
                 candles=(),
                 available=True,
@@ -139,6 +145,7 @@ def test_wall_clock_ttl_boundary(age_ms, expected):
         frame(fresh="UNAVAILABLE"),
         AnalyticsUnavailableError("Analytics unavailable"),
         ValueError("synthetic invalid response"),
+        None,
     ],
 )
 def test_unavailable_analytics_preserves_preparation_and_recovers(value):
@@ -151,10 +158,26 @@ def test_unavailable_analytics_preserves_preparation_and_recovers(value):
         assert len(preparation.calls) == 1
         assert preparation.calls[0][1].instruments == {}
         assert preparation.calls[0][2] is None
+        assert service.broker_runtime_diagnostics().decision_eligibility == "NOT_READY"
+        assert service.broker_runtime_diagnostics().reason == "NO_DECISION_FRAME"
         source.value = frame(snapshot_id="recovered")
         await service.run_once()
         assert len(tick.calls) == 1
         assert len(preparation.calls) == 2
+        assert service.broker_runtime_diagnostics().decision_eligibility == "READY"
+
+    asyncio.run(scenario())
+
+
+def test_no_commands_remains_idle_without_claiming_decision_eligibility():
+    async def scenario():
+        service, _, _ = runtime(Source(frame()))
+        await service.run_once()
+        value = service.broker_runtime_diagnostics()
+        assert value.status == "IDLE"
+        assert value.reason == "NO_ACTIVE_COMMAND"
+        assert value.decision_eligibility == "UNKNOWN"
+        assert value.last_success_at is None
 
     asyncio.run(scenario())
 

@@ -1,0 +1,206 @@
+"""Session-bound accepted-envelope and audit repository."""
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session
+
+from moex_sentinel.domain.automations import DecisionReasonItem
+from moex_sentinel.domain.trading_facts import (
+    AutomationEnvelopeDraft,
+    TradeAuditEventDraft,
+    TradeAuditLevel,
+    TradingFactErrorCode,
+    TradingFactPersistenceError,
+)
+from moex_sentinel.storage.models.automation_facts import TradingAutomationModel
+from moex_sentinel.storage.models.order_facts import BrokerOrderModel, TradeDecisionModel, TradeExecutionModel
+from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
+from moex_sentinel.storage.models.trading_observability import (
+    AutomationEventModel,
+    TradeAuditEventModel,
+)
+from moex_sentinel.storage.repositories.trading_facts_support import append_idempotent, require_scoped_reference
+from sentinel_contracts.business_audit import BusinessAuditStage
+
+
+def _audit_value(model: TradeAuditEventModel) -> TradeAuditEventDraft:
+    return TradeAuditEventDraft(
+        event_id=model.event_id,
+        process_id=model.process_id,
+        parent_process_id=model.parent_process_id,
+        user_broker_id=model.user_broker_id,
+        automation_id=model.automation_id,
+        decision_id=model.decision_id,
+        broker_order_id=model.broker_order_id,
+        execution_id=model.execution_id,
+        instrument_id=model.instrument_id,
+        level=TradeAuditLevel(model.level),
+        stage=model.stage,
+        safe_message=model.safe_message,
+        data=dict(model.data),
+        occurred_at=model.occurred_at,
+        created_at=model.created_at,
+        critical=model.critical,
+    )
+
+
+def _envelope_value(model: AutomationEventModel) -> AutomationEnvelopeDraft:
+    return AutomationEnvelopeDraft(
+        event_id=model.event_id,
+        automation_id=model.automation_id,
+        user_broker_id=model.user_broker_id,
+        sequence_number=model.sequence_number,
+        expected_revision=model.expected_revision,
+        fact_kind=model.fact_kind,
+        safe_message=model.safe_message,
+        payload=dict(model.payload),
+        occurred_at=model.occurred_at,
+        received_at=model.received_at,
+    )
+
+
+def _require_scope(user_broker_id: str, value_scope: str, entity_type: str) -> None:
+    if user_broker_id != value_scope:
+        raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type=entity_type)
+
+
+class TradingAuditRepository:
+    """Persist accepted fact envelopes and diagnostic events."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def append_audit(self, user_broker_id: str, value: TradeAuditEventDraft) -> TradeAuditEventDraft:
+        _require_scope(user_broker_id, value.user_broker_id, "trade_audit_event")
+        automation_instrument = self._session.scalar(
+            select(TradingAutomationModel.instrument_id).where(
+                TradingAutomationModel.user_broker_id == user_broker_id,
+                TradingAutomationModel.id == value.automation_id,
+            )
+        )
+        if automation_instrument is None:
+            raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type="trade_audit_event")
+        references = []
+        for reference_model, reference_id in (
+            (TradeDecisionModel, value.decision_id),
+            (BrokerOrderModel, value.broker_order_id),
+            (TradeExecutionModel, value.execution_id),
+        ):
+            if reference_id is None:
+                continue
+            reference = self._session.execute(
+                select(reference_model.automation_id, reference_model.instrument_id).where(
+                    reference_model.user_broker_id == user_broker_id,
+                    reference_model.id == reference_id,
+                )
+            ).one_or_none()
+            if reference is None:
+                raise TradingFactPersistenceError(TradingFactErrorCode.CROSS_SCOPE, entity_type="trade_audit_event")
+            references.append(reference)
+        require_scoped_reference(
+            self._session,
+            scope_column=BrokerInstrumentModel.user_broker_id,
+            id_column=BrokerInstrumentModel.id,
+            user_broker_id=user_broker_id,
+            reference_id=value.instrument_id,
+            entity_type="trade_audit_event",
+        )
+        if automation_instrument != value.instrument_id or any(
+            reference.automation_id != value.automation_id or reference.instrument_id != value.instrument_id
+            for reference in references
+        ):
+            raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="trade_audit_event")
+        model = TradeAuditEventModel(**value.model_dump(mode="python"))
+        return append_idempotent(
+            self._session,
+            candidate=model,
+            identity=TradeAuditEventModel.event_id == value.event_id,
+            to_value=_audit_value,
+            conflict_code=TradingFactErrorCode.FACT_ID_CONFLICT,
+            entity_type="trade_audit_event",
+        )
+
+    def append_envelope(self, user_broker_id: str, value: AutomationEnvelopeDraft) -> AutomationEnvelopeDraft:
+        _require_scope(user_broker_id, value.user_broker_id, "automation_event")
+        require_scoped_reference(
+            self._session,
+            scope_column=TradingAutomationModel.user_broker_id,
+            id_column=TradingAutomationModel.id,
+            user_broker_id=user_broker_id,
+            reference_id=value.automation_id,
+            entity_type="automation_event",
+        )
+        model = AutomationEventModel(**value.model_dump(mode="python"))
+        return append_idempotent(
+            self._session,
+            candidate=model,
+            identity=AutomationEventModel.event_id == value.event_id,
+            to_value=_envelope_value,
+            conflict_code=TradingFactErrorCode.FACT_ID_CONFLICT,
+            entity_type="automation_event",
+        )
+
+    def find_envelope_matches(
+        self,
+        user_broker_id: str,
+        event_id: str,
+        automation_id: str,
+        sequence_number: int,
+    ) -> tuple[AutomationEnvelopeDraft, ...]:
+        """Read both identity matches in one query; they may be different rows."""
+        statement = select(AutomationEventModel).where(
+            AutomationEventModel.user_broker_id == user_broker_id,
+            or_(
+                AutomationEventModel.event_id == event_id,
+                and_(
+                    AutomationEventModel.automation_id == automation_id,
+                    AutomationEventModel.sequence_number == sequence_number,
+                ),
+            ),
+        )
+        return tuple(_envelope_value(model) for model in self._session.scalars(statement))
+
+    def list_audit(self, user_broker_id: str, automation_id: str) -> tuple[TradeAuditEventDraft, ...]:
+        statement = (
+            select(TradeAuditEventModel)
+            .where(
+                TradeAuditEventModel.user_broker_id == user_broker_id,
+                TradeAuditEventModel.automation_id == automation_id,
+            )
+            .order_by(TradeAuditEventModel.occurred_at, TradeAuditEventModel.event_id)
+        )
+        return tuple(_audit_value(model) for model in self._session.scalars(statement))
+
+    def list_recent_decision_reasons(
+        self,
+        user_broker_id: str,
+        automation_id: str,
+        limit: int,
+    ) -> tuple[DecisionReasonItem, ...]:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError("limit must be between 1 and 20")
+        statement = (
+            select(TradeAuditEventModel.event_id, TradeAuditEventModel.occurred_at, TradeAuditEventModel.data)
+            .where(
+                TradeAuditEventModel.user_broker_id == user_broker_id,
+                TradeAuditEventModel.automation_id == automation_id,
+                TradeAuditEventModel.stage == BusinessAuditStage.STRATEGY_DECISION_MADE.value,
+            )
+            .order_by(TradeAuditEventModel.occurred_at.desc(), TradeAuditEventModel.event_id.desc())
+            .limit(limit)
+        )
+        return tuple(
+            DecisionReasonItem(
+                event_id=event_id,
+                occurred_at=occurred_at,
+                decision=_safe_decision_value(data, "decision"),
+                reason_code=_safe_decision_value(data, "reason_code"),
+            )
+            for event_id, occurred_at, data in self._session.execute(statement)
+        )
+
+
+def _safe_decision_value(data: object, key: str) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    value = data.get(key)
+    return value if isinstance(value, str) and len(value) <= 128 else None

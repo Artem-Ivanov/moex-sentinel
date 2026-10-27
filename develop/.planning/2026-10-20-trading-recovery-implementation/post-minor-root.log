@@ -1,0 +1,36 @@
+...............................                                          [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:10: DeprecationWarning: GetCandlesRequest.figi is deprecated
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:6: DeprecationWarning: GetOrderBookRequest.figi is deprecated
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:5: DeprecationWarning: GetTradingStatusRequest.figi is deprecated
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:8: DeprecationWarning: GetLastTradesRequest.figi is deprecated
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:20: DeprecationWarning: PostStopOrderRequest.figi is deprecated
+
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+tests/api/test_runtime_versions.py::test_worker_heartbeat_preserves_ack_and_exposes_actual_runtime_version
+  <string>:14: DeprecationWarning: PostOrderRequest.figi is deprecated
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+31 passed, 17 warnings in 5.74s

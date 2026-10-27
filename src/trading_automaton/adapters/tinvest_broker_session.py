@@ -5,7 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
-from math import floor
+from math import floor, isfinite
 from time import monotonic as system_monotonic
 from typing import Any, Literal
 from uuid import UUID
@@ -51,6 +51,11 @@ def _default_client_factory(token: str, *, target: str) -> AsyncClient:
     return AsyncClient(token, target=target)
 
 
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 class BrokerSdkSession:
     def __init__(
         self,
@@ -64,6 +69,7 @@ class BrokerSdkSession:
         submit_admission: Any | None = None,
         client_factory: Callable[..., Any] = _default_client_factory,
         snapshot_ttl_seconds: float = 60.0,
+        request_timeout_seconds: float = 10.0,
         monotonic: Callable[[], float] = system_monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -99,10 +105,17 @@ class BrokerSdkSession:
         self._submit_admission = submit_admission
         if snapshot_ttl_seconds <= 0:
             raise ValueError("Account snapshot TTL must be positive.")
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isfinite(request_timeout_seconds)
+            or request_timeout_seconds <= 0
+        ):
+            raise ValueError("Broker request timeout must be finite and positive.")
         self._token = token
         self._target = target
         self._client_factory = client_factory
         self._snapshot_ttl_seconds = snapshot_ttl_seconds
+        self._request_timeout_seconds = request_timeout_seconds
         self._monotonic = monotonic
         self._now = now
         self._client: Any | None = None
@@ -110,6 +123,7 @@ class BrokerSdkSession:
         self._snapshot_lock = asyncio.Lock()
         self._positions_cache: dict[str, tuple[float, tuple[BrokerPosition, ...]]] = {}
         self._money_cache: dict[str, tuple[float, dict[str, Decimal]]] = {}
+        self._rpc_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def services(self) -> Any:
@@ -126,12 +140,24 @@ class BrokerSdkSession:
     async def close(self) -> None:
         if self._client is None:
             return
-        await self._client.__aexit__(None, None, None)
+        pending = {task for task in self._rpc_tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=min(self._request_timeout_seconds, 0.1))
+        client = self._client
+        exit_task = asyncio.create_task(client.__aexit__(None, None, None))
+        done, _pending = await asyncio.wait({exit_task}, timeout=self._request_timeout_seconds)
+        if exit_task not in done:
+            exit_task.cancel()
+            exit_task.add_done_callback(_consume_task_result)
+            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker session close timed out.", retryable=True)
         self._client = None
         self._services = None
         async with self._snapshot_lock:
             self._positions_cache.clear()
             self._money_cache.clear()
+        exit_task.result()
 
     async def quote(self, request: CommissionRefreshRequest, side: str) -> CommissionQuote:
         self._validate_account(request.key.account_id)
@@ -230,6 +256,8 @@ class BrokerSdkSession:
         if self._access_mode != "TRADE":
             raise ValueError("READ_ONLY forbids broker mutation")
         self._validate_account(request.account_id)
+        gate = None
+        permit_remaining_ms = None
         if self._environment == "PROD":
             self._validate_connection_binding(request)
             gate = await self._submit_admission.authorize_submit(request)
@@ -274,23 +302,41 @@ class BrokerSdkSession:
                     permit_remaining_ms=remaining_ms,
                 )
             permit_remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
-        post = self.services.orders.post_order(
-            instrument_id=request.instrument_id,
-            quantity=request.quantity_lots,
-            price=_quotation(request.limit_price),
-            direction=(
-                OrderDirection.ORDER_DIRECTION_BUY
-                if request.side.value == "BUY"
-                else OrderDirection.ORDER_DIRECTION_SELL
-            ),
-            account_id=request.account_id,
-            order_type=OrderType.ORDER_TYPE_LIMIT,
-            order_id=request.idempotency_key,
-            price_type=PriceType.PRICE_TYPE_CURRENCY,
-        )
-        response = await self._broker_request(post)
-        state = _order_state(response)
-        if self._environment == "PROD":
+
+        async def enter_sdk_post() -> Any:
+            if self._environment == "PROD":
+                if gate is None or gate.permit is None or gate.expires_monotonic is None:
+                    raise CoreOperationError(retryable=False)
+                market_expired = self._market_expired(request)
+                permit_expired = self._monotonic() >= gate.expires_monotonic
+                if market_expired or permit_expired:
+                    reason = "MARKET_EXPIRED_BEFORE_POST" if market_expired else "PERMIT_EXPIRED_BEFORE_POST"
+                    proof = self._submit_admission.abort_proof(request, gate.permit, reason)
+                    remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
+                    return self._cancel_before_post(
+                        request,
+                        proof,
+                        submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                        permit_remaining_ms=remaining_ms,
+                    )
+            return await self.services.orders.post_order(
+                instrument_id=request.instrument_id,
+                quantity=request.quantity_lots,
+                price=_quotation(request.limit_price),
+                direction=(
+                    OrderDirection.ORDER_DIRECTION_BUY
+                    if request.side.value == "BUY"
+                    else OrderDirection.ORDER_DIRECTION_SELL
+                ),
+                account_id=request.account_id,
+                order_type=OrderType.ORDER_TYPE_LIMIT,
+                order_id=request.idempotency_key,
+                price_type=PriceType.PRICE_TYPE_CURRENCY,
+            )
+
+        response = await self._broker_request(enter_sdk_post())
+        state = response if isinstance(response, BrokerOrderState) else _order_state(response)
+        if self._environment == "PROD" and state.pre_rpc_abort_proof is None:
             state = state.model_copy(
                 update={
                     "submit_authorization_elapsed_ms": gate.authorization_elapsed_ms,
@@ -413,6 +459,17 @@ class BrokerSdkSession:
         await self._invalidate_if_terminal(account_id, state)
         return state
 
+    async def cancel_order(self, account_id: str, broker_order_id: str) -> None:
+        self._validate_account(account_id)
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        await self._broker_request(
+            self.services.orders.cancel_order(
+                account_id=account_id,
+                order_id=broker_order_id,
+            )
+        )
+
     async def find_by_idempotency_key(
         self,
         account_id: str,
@@ -480,8 +537,26 @@ class BrokerSdkSession:
         ) = None,
     ) -> Any:
         """Translate SDK failures once; the runtime owns retry delays and recovery probes."""
+        active = {task for task in self._rpc_tasks if not task.done()}
+        if len(active) >= 2:
+            close = getattr(request, "close", None)
+            if close is not None:
+                close()
+            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker requests are still pending.", retryable=True)
+        task = asyncio.ensure_future(request)
+        self._rpc_tasks.add(task)
+        task.add_done_callback(self._rpc_tasks.discard)
         try:
-            return await request
+            done, _pending = await asyncio.wait({task}, timeout=self._request_timeout_seconds)
+            if task not in done:
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker request timed out.", retryable=True)
+            return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+            raise
         except AioRequestError as error:
             mapped = self._snapshot_error(error, snapshot_read=snapshot_operation is not None)
             LOGGER.warning(

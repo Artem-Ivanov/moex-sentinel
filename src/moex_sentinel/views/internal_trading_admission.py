@@ -2,8 +2,9 @@
 
 from functools import partial
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from moex_sentinel.api.worker_auth import WorkerAuthenticationError
@@ -21,6 +22,19 @@ from sentinel_contracts.trading_admission import (
 )
 
 router = APIRouter(tags=["internal-trading-admission"])
+
+
+def _submit_attempt_origin(
+    original_runtime_instance_id: UUID | None = None,
+    original_generation: Annotated[str | None, Query(pattern=r"^[0-9]+$")] = None,
+) -> SubmitAttemptRequest:
+    try:
+        return SubmitAttemptRequest(
+            original_runtime_instance_id=original_runtime_instance_id,
+            original_generation=None if original_generation is None else int(original_generation),
+        )
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail="Invalid submit attempt origin") from error
 
 
 @router.get("/internal/automaton/brokers/{broker_id}/admission", response_model=AdmissionView)
@@ -76,7 +90,7 @@ async def submit_attempt(
     broker_id: str,
     idempotency_key: str,
     request: Request,
-    origin: Annotated[SubmitAttemptRequest, Depends()],
+    origin: Annotated[SubmitAttemptRequest, Depends(_submit_attempt_origin)],
 ) -> SubmitAttemptView | JSONResponse:
     principal = request.state.worker_principal
     if str(principal.broker_id) != broker_id:

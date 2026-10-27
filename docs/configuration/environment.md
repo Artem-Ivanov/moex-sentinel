@@ -58,6 +58,7 @@ Vite dev server. Проверка покрытия в `tests/test_environment_co
 | `MARKET_OPERATION_TIMEOUT_SECONDS` (Core) | float / seconds | `10`; конечное значение больше 0 | Timeout market operation | Нет | Core | `10` |
 | `MARKET_CLOSE_TIMEOUT_SECONDS` (Core) | float / seconds | `5`; конечное значение больше 0 | Timeout закрытия рыночного соединения | Нет | Core | `5` |
 | `MARKET_QUIET_SECONDS` (Core) | float / seconds | `30`; конечное значение больше 0 | Окно тишины перед восстановлением | Нет | Core | `30` |
+| `MARKET_TRADING_STATUS_TTL_SECONDS` (Core) | float / seconds | `30`; конечное значение больше 0 | Срок unary API-доступности торговли; обновление выполняется примерно через половину TTL, просроченный или неизвестный статус закрывает допуск | Нет | Core | `30` |
 | `MARKET_CANDLES_REFRESH_SECONDS` (Core) | float / seconds | `60`; конечное значение больше 0 | Период обновления завершённых свечей | Нет | Core | `60` |
 | `ANALYTICS_VERSION_HTTP_TIMEOUT_SECONDS` (Core) | float / seconds | `1`; конечное значение больше 0 | HTTP timeout чтения версии Analytics | Нет | Core | `1` |
 
@@ -75,6 +76,7 @@ Vite dev server. Проверка покрытия в `tests/test_environment_co
 | `AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS` (Worker) | float / seconds | `1`; конечное значение больше 0 | Timeout вызовов Analytics | Нет | Worker | `1` |
 | `AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS` (Worker) | float / seconds | `60`; конечное значение больше 0 | Интервал broker recovery probe | Нет | Worker | `60` |
 | `AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS` (Worker) | float / seconds | `60`; конечное значение больше 0 | TTL кэша broker account snapshot | Нет | Worker | `60` |
+| `BROKER_REQUEST_TIMEOUT_SECONDS` (Worker) | float / seconds | `10`; конечное значение больше 0 | Максимальное время одного RPC к broker SDK; превышение переводит исход в recovery/HOLD без повторной отправки заявки | Нет | Worker | `10` |
 | `FACT_OUTBOX_BATCH_SIZE` (Worker) | integer / events | `100`; больше 0 | Максимальный batch typed outbox | Нет | Worker | `100` |
 | `FACT_OUTBOX_DEADLINE_MS` (Worker) | integer / milliseconds | `1000`; больше 0 | Deadline доставки outbox | Нет | Worker | `1000` |
 | `STRATEGY_ENABLED` (Worker) | boolean | `false` | Общий переключатель алгоритма | Нет | Worker | `false` |
@@ -86,7 +88,7 @@ Vite dev server. Проверка покрытия в `tests/test_environment_co
 | `STRATEGY_PARTIAL_SELL_PERCENT` (Worker) | decimal / percent | `25`; диапазон `(0,100]` | Доля частичной продажи | Нет | Worker | `25` |
 | `STRATEGY_MAX_PARTIAL_SELL_STEPS` (Worker) | integer / steps | `3`; не меньше 0 | Число частичных продаж | Нет | Worker | `3` |
 | `STRATEGY_ORDER_TTL_SECONDS` (Worker) | integer / seconds | `10`; больше 0 | TTL заявки стратегии | Нет | Worker | `10` |
-| `STRATEGY_ORDER_RETRY_LIMIT` (Worker) | integer / retries | `3`; не меньше 0 | Повторы действия стратегии | Нет | Worker | `3` |
+| `STRATEGY_ORDER_RETRY_LIMIT` (Worker) | integer / retries | `3`; не меньше 0 | Устаревшая настройка, сохранённая для совместимости; не разрешает повторную отправку заявки | Нет | Worker | `3` |
 | `STRATEGY_CORE_RETRY_LIMIT` (Worker) | integer / retries | `5`; не меньше 0 | Повторы запросов Core | Нет | Worker | `5` |
 
 ## Analytics

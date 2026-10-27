@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 import frontendPackage from "../../package.json"
-import { fetchDiagnosticsStatus, type AwaitingObservation, type DiagnosticsStatus, type OutboxDiagnosticReason, type ServiceVersionObservation, type WorkerDiagnosticReason, type WorkerIterationResult } from "../api/diagnostics"
+import { fetchDiagnosticsStatus, type AwaitingObservation, type BrokerRuntimeDiagnostics, type DiagnosticsStatus, type OutboxDiagnosticReason, type ServiceVersionObservation, type WorkerDiagnosticReason, type WorkerIterationResult } from "../api/diagnostics"
 
 const snapshot = ref<DiagnosticsStatus>()
 const loading = ref(false)
@@ -13,6 +13,19 @@ const observationLabels: Record<AwaitingObservation, string> = {
   outbox: "Outbox", portfolio: "Портфель", strategy: "Стратегия",
 }
 const frontendVersion = frontendPackage.version
+const unknownBrokerRuntime: BrokerRuntimeDiagnostics = {
+  status: "UNKNOWN", decision_eligibility: "UNKNOWN", reason: "NOT_OBSERVED",
+  last_started_at: null, last_finished_at: null, last_success_at: null,
+}
+const brokerRuntime = computed(() => snapshot.value?.worker?.broker_runtime ?? unknownBrokerRuntime)
+const brokerStates = { IDLE: "Нет активных команд", RUNNING: "Runtime активен", BLOCKED: "Брокер заблокирован", UNKNOWN: "UNKNOWN" }
+const decisionEligibility = { READY: "Кадр доступен для решения", NOT_READY: "Кадр для решения недоступен", UNKNOWN: "UNKNOWN" }
+const brokerReasons = {
+  NOT_OBSERVED: "Наблюдение брокера ещё не получено", NO_ACTIVE_COMMAND: "Нет активных команд",
+  ITERATION_RUNNING: "Итерация выполняется", DECISION_FRAME_AVAILABLE: "Есть кадр для решения",
+  NO_DECISION_FRAME: "Нет пригодного кадра для решения", BROKER_RETRYING: "Запланирована повторная попытка",
+  PERMANENT_BROKER_ERROR: "Постоянная ошибка брокерской операции", STALE: "Наблюдение брокера устарело",
+}
 const workerReasons: Record<WorkerDiagnosticReason, string> = {
   NOT_OBSERVED: "Наблюдение Worker ещё не получено", STALE: "Наблюдение Worker устарело",
   CONTROL_PROGRESS: "Worker завершил цикл управления", CONTROL_STALLED: "Цикл управления не завершился",
@@ -99,6 +112,25 @@ onUnmounted(() => { active = false; controller?.abort() })
           <p>Последняя итерация завершилась (UTC): <time v-if="snapshot.worker.observation === 'OBSERVED' && snapshot.worker.last_finished_at" :datetime="snapshot.worker.last_finished_at">{{ snapshot.worker.last_finished_at }}</time><span v-else>—</span></p>
           <p class="hint">Завершение цикла означает обработку команд Worker и не подтверждает готовность торговли, bootstrap или брокера.</p>
         </article>
+        <article class="grid-row" aria-label="Состояние брокерского runtime">
+          <h3>Брокерский runtime</h3>
+          <p>Состояние: {{ brokerStates[brokerRuntime.status] }}</p>
+          <p>Причина: {{ brokerReasons[brokerRuntime.reason] }}</p>
+          <p>Готовность кадра для решения: {{ decisionEligibility[brokerRuntime.decision_eligibility] }}</p>
+          <p>Возраст наблюдения брокера: {{ age(snapshot.worker.observation === "OBSERVED" ? snapshot.worker.age_ms : null) }}</p>
+          <p>Последний запуск итерации (UTC): <time v-if="brokerRuntime.last_started_at" :datetime="brokerRuntime.last_started_at">{{ brokerRuntime.last_started_at }}</time><span v-else>—</span></p>
+          <p>Последнее завершение итерации (UTC): <time v-if="brokerRuntime.last_finished_at" :datetime="brokerRuntime.last_finished_at">{{ brokerRuntime.last_finished_at }}</time><span v-else>—</span></p>
+          <p>Последний успешный проход (UTC): <time v-if="brokerRuntime.last_success_at" :datetime="brokerRuntime.last_success_at">{{ brokerRuntime.last_success_at }}</time><span v-else>—</span></p>
+          <p class="hint">Control heartbeat и завершение команды не подтверждают наличие пригодного кадра для решения.</p>
+        </article>
+      </template>
+      <article v-else class="grid-row" aria-label="Состояние брокерского runtime">
+        <h3>Брокерский runtime</h3>
+        <p>Состояние: UNKNOWN</p>
+        <p>Причина: Наблюдение Worker отсутствует</p>
+        <p>Готовность кадра для решения: UNKNOWN</p>
+      </article>
+      <template v-if="snapshot.worker">
         <article class="grid-row" aria-label="Доставка событий">
           <h3>Доставка событий</h3>
           <p>Состояние доставки: {{ snapshot.worker.outbox.status }}</p>

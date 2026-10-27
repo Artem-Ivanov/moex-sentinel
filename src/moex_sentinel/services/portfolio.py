@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from datetime import datetime
 from decimal import Decimal
 from functools import partial
 from typing import Any, Protocol
@@ -12,6 +13,7 @@ from moex_sentinel.domain.portfolio import (
     BrokerAccountSnapshot,
     BrokerAccountsView,
     BrokerOperation,
+    BrokerOperationsPageView,
     BrokerOperationsView,
     BrokerPosition,
     BrokerPositionsView,
@@ -26,6 +28,7 @@ from moex_sentinel.services.portfolio_ports import PortfolioPort
 from moex_sentinel.services.ports import UserBrokerReadPort
 from moex_sentinel.services.sync_execution import run_sync
 from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.time import floor_utc_millisecond
 
 AdapterFactory = Callable[[UserBroker], PortfolioPort]
 
@@ -115,6 +118,122 @@ class PortfolioAggregationService:
         return BrokerOperationsView(
             tuple(sorted(items, key=lambda item: item.operation.occurred_at, reverse=True)[:limit]),
             tuple(error for _, errors in results for error in errors),
+        )
+
+    async def view_operations_scoped(
+        self,
+        broker_id: str,
+        account_id: str,
+        *,
+        limit: int,
+        cursor: str | None,
+        from_at: datetime,
+        to_at: datetime,
+    ) -> BrokerOperationsPageView:
+        broker = await run_sync(partial(self._brokers.get, broker_id))
+        if broker.is_test is not self._active_test():
+            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        if not broker.enabled:
+            return self._operations_page_error(broker, account_id, "BROKER_DISABLED", cursor=cursor)
+        if broker.account_id and broker.account_id != account_id:
+            return self._operations_page_error(broker, account_id, "BROKER_ACCOUNT_SCOPE_MISMATCH", cursor=cursor)
+
+        try:
+            adapter = self._adapter_factory(broker)
+            accounts = await adapter.list_accounts()
+            if not any(account.account_id == account_id for account in accounts):
+                return self._operations_page_error(broker, account_id, "BROKER_ACCOUNT_NOT_FOUND", cursor=cursor)
+            page = await adapter.get_operations(account_id, cursor, limit, from_at=from_at, to_at=to_at)
+        except BrokerOperationError:
+            return self._operations_page_error(broker, account_id, "BROKER_OPERATIONS_UNAVAILABLE", cursor=cursor)
+        except ValueError:
+            return self._operations_page_error(broker, account_id, "BROKER_CONFIGURATION", cursor=cursor)
+
+        if len(page.items) > limit:
+            return self._operations_page_error(
+                broker, account_id, "BROKER_OPERATIONS_INVALID_PAGE", cursor=cursor, source_item_count=len(page.items)
+            )
+        if page.next_cursor is not None and (
+            not page.next_cursor or len(page.next_cursor) > 1024 or page.next_cursor == cursor
+        ):
+            return self._operations_page_error(
+                broker, account_id, "BROKER_OPERATIONS_INVALID_CURSOR", cursor=cursor, source_item_count=len(page.items)
+            )
+
+        unique: dict[str, ExternalOperation] = {}
+        for operation in page.items:
+            if operation.account_id != account_id:
+                return self._operations_page_error(
+                    broker,
+                    account_id,
+                    "BROKER_OPERATIONS_SCOPE_MISMATCH",
+                    cursor=cursor,
+                    source_item_count=len(page.items),
+                )
+            previous = unique.get(operation.operation_id)
+            if previous is not None and previous != operation:
+                return self._operations_page_error(
+                    broker,
+                    account_id,
+                    "BROKER_OPERATIONS_CONFLICTING_DUPLICATE",
+                    cursor=cursor,
+                    source_item_count=len(page.items),
+                )
+            unique[operation.operation_id] = operation
+
+        try:
+            selected = tuple(
+                operation
+                for operation in unique.values()
+                if operation.operation_type not in NON_TRADING_OPERATION_TYPES
+                and from_at < floor_utc_millisecond(operation.occurred_at) <= to_at
+            )
+        except ValueError:
+            return self._operations_page_error(
+                broker,
+                account_id,
+                "BROKER_OPERATIONS_INVALID_TIMESTAMP",
+                cursor=cursor,
+                source_item_count=len(page.items),
+            )
+
+        items = [BrokerOperation(broker.id, broker.display_name, operation) for operation in selected]
+        items.sort(key=lambda item: item.operation.operation_id)
+        items.sort(key=lambda item: floor_utc_millisecond(item.operation.occurred_at), reverse=True)
+        source_exhausted = page.next_cursor is None
+        return BrokerOperationsPageView(
+            items=tuple(items),
+            errors=(),
+            input_cursor=cursor,
+            next_cursor=page.next_cursor,
+            source_item_count=len(page.items),
+            selected_item_count=len(items),
+            source_exhausted=source_exhausted,
+            coverage_complete=cursor is None and source_exhausted,
+        )
+
+    @staticmethod
+    def _operations_page_error(
+        broker: UserBroker,
+        account_id: str,
+        code: str,
+        *,
+        cursor: str | None = None,
+        source_item_count: int = 0,
+    ) -> BrokerOperationsPageView:
+        return BrokerOperationsPageView(
+            items=(),
+            errors=(
+                BrokerReadError(
+                    broker.id, broker.display_name, account_id, code, "Не удалось прочитать историю операций."
+                ),
+            ),
+            input_cursor=cursor,
+            next_cursor=None,
+            source_item_count=source_item_count,
+            selected_item_count=0,
+            source_exhausted=None,
+            coverage_complete=False,
         )
 
     async def view_position_operations(

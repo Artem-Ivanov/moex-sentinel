@@ -1,0 +1,72 @@
+{
+  "task": "R1 Worker technical recovery resume and canceled outbox rebase",
+  "captured_at_utc": "2026-10-26",
+  "workspace_baseline": "Large dirty workspace; hashes below identify current Worker-owned files and saved pre-resume snapshots. Git HEAD is not represented as the pre-edit state.",
+  "implementation_files": [
+    {
+      "path": "src/sentinel_contracts/automation_lifecycle.py",
+      "sha256": "2778629a2c5014d3707a4b175a47d5b0732b4cb372cea36f27e16f56e26b7700",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/automation_lifecycle.py.baseline",
+      "baseline_sha256": "0d2bfe008e14770e1b9b299729f3313a18ca49085b9db37d32c70270482a9794"
+    },
+    {
+      "path": "src/trading_automaton/storage/repository.py",
+      "sha256": "a5df472494c15faaace9ad98f0072493dbf39b9575121c787d63ab9e28bc8189",
+      "baseline": null,
+      "baseline_note": "No exact R1-final source snapshot existed when the resume extension began; current file already contained dirty R1/I1-I3 work. Do not use Git HEAD as baseline."
+    },
+    {
+      "path": "src/trading_automaton/services/fact_synchronization.py",
+      "sha256": "0058d87ba3c9c7bc262cfbd36031db76f8e895c33cbc46df25a1d9c9371cc187",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/fact_synchronization.py.baseline",
+      "baseline_sha256": "75847b3d258f8285f0e41551f04a15dcfec8525ea5350fa8c75ec129b11feaf2"
+    },
+    {
+      "path": "src/trading_automaton/usecases/synchronize_runtime.py",
+      "sha256": "0fdcad6ff6d6d1bf82d0fe5a197e932f409d62ced4a541a1dace766662160537",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/synchronize_runtime.py.baseline",
+      "baseline_sha256": "f8a41fe2eb7dd9e006901d3808af95c43722c562208fabbc6da067ba66964438"
+    }
+  ],
+  "test_files": [
+    {
+      "path": "tests/sentinel_contracts/test_automation_lifecycle.py",
+      "sha256": "70954e052b72ebbd0dc50bc19631c2c378ef4c548f3f2d7493d6581300f1c6ae",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/test_contract_automation_lifecycle.py.baseline",
+      "baseline_sha256": "1b0ecab7b5f9c6a2ed2211008f46205c56378138f64bef3b88a5bbf94572291b"
+    },
+    {
+      "path": "tests/trading_automaton/storage/test_local_repository.py",
+      "sha256": "b6a2967245d06c0109c6f2c717304080a82336d3f88e410032ef4c82e4ffb560",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/test_local_repository.py.baseline",
+      "baseline_sha256": "f4c505442286558de36478c840a3e302e3473c317788d447a1f5a48af80db471"
+    },
+    {
+      "path": "tests/trading_automaton/services/test_fact_synchronization.py",
+      "sha256": "839bdbd44b8a112e4a623a48cc4e8a38732a9fdd478b514868bec410879b631d",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/test_fact_synchronization.py.baseline",
+      "baseline_sha256": "6b94ac3b07b1e5f7e8493df72969903755d09518d112a4f191b921e035be3e5f"
+    },
+    {
+      "path": "tests/trading_automaton/services/test_streaming_runtime_coordinator_service.py",
+      "sha256": "0b47eb20438c40bf95a6c3065bfa67c3f49494aee1ac875d54809d48dc5000ad",
+      "baseline": "develop/.planning/2026-10-26-order-history-24h/worker-resume-baseline/test_streaming_runtime_coordinator_service.py.baseline",
+      "baseline_sha256": "c0207dd15187a1dbb11ac6b0a818bff32092063a039de06b323b975ead5f7c85"
+    }
+  ],
+  "validation": {
+    "red_evidence": "New API regression first failed because recovery reconciliation lacked user_broker_id/allow_financial_rebase; corrected after verifying the intended guard.",
+    "focused_storage_and_fact_sync": "82 passed",
+    "worker_resume_and_contract_focus": "179 passed, 16 existing SDK deprecation warnings",
+    "full_suite": "BROKER_ACCESS_MODE=READ_ONLY pytest -q: 2762 passed, 201 skipped, 6 failed; failures are outside the Worker-owned file set: test_scoped_execution_diagnostics_is_authenticated_bounded_and_no_store, test_prepare_daily_revalidates_after_canary_preview, test_quiet_stream_reconnects_unless_market_explicitly_closed[False], two test_accept_refreshes_loaded_aggregate_and_returns_complete_database_values cases, and test_execution_diagnostics_joins_each_fact_to_exact_accepted_envelope_read_only.",
+    "ruff": "passed",
+    "git_diff_check": "passed",
+    "financial_database": "isolated SQLite test databases only",
+    "review_fixes": [
+      "BEGIN IMMEDIATE before first read in consume and outbox rebase; barrier tests serialize audit append",
+      "Ascending old-sequence per-row SQL resequence after control deletion; reverse UUID multi-fact graph preserved",
+      "Exact revision-conflict-only finance rebase, including cancellation-before-claim, repeated user HOLD, and unknown-boundary fail-closed"
+    ]
+  },
+  "cross_review": "Architect independent re-review pending; Core dual-database integration belongs to recovery24_core."
+}

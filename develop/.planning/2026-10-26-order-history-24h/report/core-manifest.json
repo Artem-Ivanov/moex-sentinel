@@ -1,0 +1,51 @@
+{
+  "created_at_utc": "2026-10-26T15:34:10Z",
+  "owner": "recovery24_core",
+  "status": "frozen pending independent architect re-review",
+  "scope": "Core 24-hour order recovery, technical-HOLD reconciliation, late-fill settlement projection, and bounded diagnostics projection",
+  "files": [
+    {
+      "path": "src/moex_sentinel/services/trading_admission.py",
+      "sha256": "e50afb6ad5b5f871bcc6ba0e629024ea5398d58bf749f2c9cc51be53a0285df8"
+    },
+    {
+      "path": "src/moex_sentinel/services/trading_fact_ingress.py",
+      "sha256": "b8fa1217a76269f6e5046a5ccc83c113cc9a2516cb194b49cdc5220f6a8221a9"
+    },
+    {
+      "path": "src/moex_sentinel/storage/repositories/trading_admission.py",
+      "sha256": "db0e75e048cd3ae73cfae2c55f04a487499a9d865277a47b6a9530ad1c0fb927"
+    },
+    {
+      "path": "src/moex_sentinel/storage/repositories/trading_facts_uow.py",
+      "sha256": "607cb5d3c4b65c94245ab9425298165043b6f0aa709b01c7cff3de7e3f176a40"
+    },
+    {
+      "path": "tests/services/test_trading_admission.py",
+      "sha256": "f1745615ea9575bf7041f9d23be94313409900a7cdf84a64adee34f7393ed0cc"
+    },
+    {
+      "path": "tests/services/test_trading_fact_ingress.py",
+      "sha256": "45138da82e79d5655c1d7945caaf973759bd0b362b0850d8f05f17f2ff84af0d"
+    },
+    {
+      "path": "tests/storage/test_execution_diagnostics.py",
+      "sha256": "a8bbef23fdd7d1fbba2b12330bde9b9599337c9dc981db5b0341352387958553"
+    },
+    {
+      "path": "tests/integration/postgresql/test_trading_admission_ingress.py",
+      "sha256": "e20ff43366bc17feca75e2eaf8442ae1658c882fdb59e1a51d56901cc9e116a6"
+    }
+  ],
+  "verification": {
+    "command": "BROKER_ACCESS_MODE=READ_ONLY POSTGRES_TEST_DATABASE_URL=<isolated-disposable-test-db> PG_PROFILE_DATABASE_URL=<isolated-disposable-test-db> ./.venv/bin/pytest -q tests/services/test_trading_admission.py tests/services/test_trading_fact_ingress.py tests/storage/test_execution_diagnostics.py tests/integration/postgresql/test_trading_admission_ingress.py",
+    "result": "109 passed, 21 warnings in 24.88s",
+    "log": "develop/.planning/2026-10-26-order-history-24h/report/core-final-tests.log",
+    "lint_command": "./.venv/bin/ruff check src/moex_sentinel/services/trading_admission.py src/moex_sentinel/services/trading_fact_ingress.py src/moex_sentinel/storage/repositories/trading_admission.py src/moex_sentinel/storage/repositories/trading_facts_uow.py tests/services/test_trading_admission.py tests/services/test_trading_fact_ingress.py tests/storage/test_execution_diagnostics.py tests/integration/postgresql/test_trading_admission_ingress.py",
+    "lint_result": "All checks passed"
+  },
+  "review": {
+    "independent_architect": "re-review pending",
+    "migrations": "none"
+  }
+}

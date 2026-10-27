@@ -7,7 +7,10 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Protocol
 
-from moex_sentinel.composition import build_portfolio_snapshot_collector
+from moex_sentinel.composition import (
+    build_execution_commission_collector,
+    build_portfolio_snapshot_collector,
+)
 from moex_sentinel.config import Settings
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from sentinel_contracts.audit import audit_event, business_process, configure_logging
@@ -17,6 +20,21 @@ LOGGER = logging.getLogger(__name__)
 
 class CollectorPort(Protocol):
     async def execute(self) -> object: ...
+
+
+class WorkerCollectors:
+    """Run independent snapshot and fee jobs so either failure leaves the other alive."""
+
+    def __init__(self, snapshots: CollectorPort, fees: CollectorPort) -> None:
+        self._snapshots = snapshots
+        self._fees = fees
+
+    async def execute(self) -> None:
+        for name, collector in (("Portfolio snapshot", self._snapshots), ("Execution fee", self._fees)):
+            try:
+                await collector.execute()
+            except Exception:
+                LOGGER.exception("%s collection failed", name)
 
 
 WaitPort = Callable[[asyncio.Event, int], Awaitable[None]]
@@ -56,7 +74,11 @@ async def run() -> None:
         max_overflow=settings.database_max_overflow,
         pool_timeout_seconds=settings.database_pool_timeout_seconds,
     )
-    collector = build_portfolio_snapshot_collector(create_session_factory(engine), engine, settings)
+    factory = create_session_factory(engine)
+    collector = WorkerCollectors(
+        build_portfolio_snapshot_collector(factory, engine, settings),
+        build_execution_commission_collector(factory),
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):

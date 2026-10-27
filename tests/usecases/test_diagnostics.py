@@ -7,7 +7,7 @@ import pytest
 from moex_sentinel.usecases.diagnostics import GetDiagnosticsStatusUsecase
 from moex_sentinel.usecases.health import CheckReadinessUsecase
 from sentinel_contracts.runtime_versions import VersionObservation
-from sentinel_contracts.worker_diagnostics import OutboxObservation, WorkerObservation
+from sentinel_contracts.worker_diagnostics import BrokerRuntimeDiagnostics, OutboxObservation, WorkerObservation
 
 
 @pytest.mark.parametrize(
@@ -99,3 +99,24 @@ def test_failed_queue_degrades_global_snapshot_even_with_completed_control():
     assert result.status == "DEGRADED"
     assert "worker" not in result.awaiting_observations
     assert "outbox" not in result.awaiting_observations
+
+
+def test_broker_block_degrades_diagnostics_without_changing_core_readiness_or_control_reason():
+    worker = WorkerObservation(
+        observation="OBSERVED",
+        status="DEGRADED",
+        reason="CONTROL_PROGRESS",
+        broker_runtime=BrokerRuntimeDiagnostics(status="BLOCKED", reason="PERMANENT_BROKER_ERROR"),
+    )
+    result = GetDiagnosticsStatusUsecase(
+        CheckReadinessUsecase(lambda: True, lambda: True),
+        "PROD",
+        "TRADE",
+        worker_observations=lambda: (VersionObservation(reason="OBSERVED"), worker),
+    ).execute()
+
+    assert result.status == "DEGRADED"
+    assert result.core.status == "OK"
+    assert result.core.database == "ok"
+    assert result.worker.reason == "CONTROL_PROGRESS"
+    assert result.worker.broker_runtime.reason == "PERMANENT_BROKER_ERROR"

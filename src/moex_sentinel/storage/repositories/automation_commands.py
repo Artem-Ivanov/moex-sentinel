@@ -2,15 +2,21 @@
 
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.storage.models.automation_facts import TradingAutomationModel
+from moex_sentinel.storage.models.execution_commissions import (
+    BrokerFeeScanStateModel,
+    BrokerOrderFeeObservationModel,
+)
+from moex_sentinel.storage.models.order_facts import BrokerOrderModel
 from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
 from moex_sentinel.storage.models.user_brokers import UserBrokerModel
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationCommand,
+    AutomationCommissionStatus,
     AutomationStatus,
     AutomationStatusesResult,
     BrokerPositionBootstrap,
@@ -54,8 +60,17 @@ class AutomationCommandRepository:
             ).all()
         return [self._command(automation, user_broker, instrument) for automation, user_broker, instrument in rows]
 
-    def statuses(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult:
+    def statuses(
+        self,
+        automation_ids: list[UUID],
+        *,
+        broker_id: UUID | None = None,
+        commission_order_ids: list[UUID] | None = None,
+    ) -> AutomationStatusesResult:
         requested = tuple(dict.fromkeys(automation_ids))
+        fee_requested = tuple(dict.fromkeys(commission_order_ids or ()))
+        if len(fee_requested) > 100:
+            raise ValueError("At most 100 commission order IDs may be requested.")
         if not requested:
             return AutomationStatusesResult(automations=())
         by_text = {str(value): value for value in requested}
@@ -69,6 +84,79 @@ class AutomationCommandRepository:
                     True if broker_id is None else UserBrokerModel.id == str(broker_id),
                 )
             ).all()
+            fees = []
+            for order_id in fee_requested:
+                order = session.scalar(
+                    select(BrokerOrderModel)
+                    .join(UserBrokerModel, UserBrokerModel.id == BrokerOrderModel.user_broker_id)
+                    .join(
+                        TradingAutomationModel,
+                        (TradingAutomationModel.id == BrokerOrderModel.automation_id)
+                        & (TradingAutomationModel.user_broker_id == BrokerOrderModel.user_broker_id),
+                    )
+                    .where(
+                        BrokerOrderModel.idempotency_key == str(order_id),
+                        TradingAutomationModel.id.in_(tuple(by_text)),
+                        True if self._environment is None else UserBrokerModel.environment == self._environment,
+                        True if broker_id is None else UserBrokerModel.id == str(broker_id),
+                    )
+                )
+                if order is None:
+                    continue
+                scan = session.get(BrokerFeeScanStateModel, order.user_broker_id)
+                rows_for_pass = []
+                if scan is not None and scan.completed_scan_pass_id:
+                    rows_for_pass = session.scalars(
+                        select(BrokerOrderFeeObservationModel).where(
+                            BrokerOrderFeeObservationModel.user_broker_id == order.user_broker_id,
+                            BrokerOrderFeeObservationModel.parent_operation_id == order.external_order_id,
+                            BrokerOrderFeeObservationModel.operation_type == "BROKER_FEE",
+                            BrokerOrderFeeObservationModel.currency
+                            == session.scalar(
+                                select(BrokerInstrumentModel.currency).where(
+                                    BrokerInstrumentModel.user_broker_id == order.user_broker_id,
+                                    BrokerInstrumentModel.id == order.instrument_id,
+                                )
+                            ),
+                            BrokerOrderFeeObservationModel.scan_pass_id == scan.completed_scan_pass_id,
+                        )
+                    ).all()
+                instrument = session.get(BrokerInstrumentModel, order.instrument_id)
+                if instrument is None:
+                    continue
+                previous_amount = session.scalar(
+                    select(func.max(BrokerOrderFeeObservationModel.amount)).where(
+                        BrokerOrderFeeObservationModel.user_broker_id == order.user_broker_id,
+                        BrokerOrderFeeObservationModel.parent_operation_id == order.external_order_id,
+                        BrokerOrderFeeObservationModel.operation_type == "BROKER_FEE",
+                        BrokerOrderFeeObservationModel.currency == instrument.currency,
+                        BrokerOrderFeeObservationModel.status == "KNOWN",
+                        True
+                        if scan is None or not scan.completed_scan_pass_id
+                        else BrokerOrderFeeObservationModel.scan_pass_id != scan.completed_scan_pass_id,
+                    )
+                )
+                if len(rows_for_pass) == 1 and rows_for_pass[0].status == "KNOWN":
+                    latest_amount = rows_for_pass[0].amount
+                    if latest_amount >= order.executed_commission and (
+                        previous_amount is None or latest_amount >= previous_amount
+                    ):
+                        status, amount = "KNOWN", latest_amount
+                    else:
+                        status, amount = "UNKNOWN", previous_amount
+                else:
+                    status = "MISSING" if not rows_for_pass else "UNKNOWN"
+                    amount = previous_amount
+                fees.append(
+                    AutomationCommissionStatus(
+                        intent_id=order_id,
+                        automation_id=UUID(order.automation_id),
+                        user_broker_id=UUID(order.user_broker_id),
+                        currency=instrument.currency,
+                        commission_status=status,
+                        effective_broker_commission=amount,
+                    )
+                )
         by_id = {row.id: row for row in rows}
         return AutomationStatusesResult(
             automations=tuple(
@@ -86,6 +174,7 @@ class AutomationCommandRepository:
                 if str(automation_id) in by_id
             ),
             missing_automation_ids=tuple(value for value in requested if str(value) not in by_id),
+            commission_statuses=tuple(fees),
         )
 
     @staticmethod

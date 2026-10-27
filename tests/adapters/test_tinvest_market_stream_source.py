@@ -30,6 +30,7 @@ class Client:
         self.manager = Manager()
         self.market_data = self
         self.requests = []
+        self.status_requests = []
 
     async def __aenter__(self):
         self.opens += 1
@@ -49,6 +50,10 @@ class Client:
                 SimpleNamespace(open=price, high=price, low=price, close=price, volume=1, time=NOW, is_complete=True)
             ]
         )
+
+    async def get_trading_status(self, **kwargs):
+        self.status_requests.append(kwargs)
+        return SimpleNamespace(api_trade_available_flag=True)
 
 
 def test_market_source_reuses_session_and_releases_stream_and_client():
@@ -71,6 +76,25 @@ def test_market_source_reuses_session_and_releases_stream_and_client():
         assert client.closes == 1
 
     asyncio.run(run())
+
+
+def test_market_source_reads_api_trade_availability_from_unary_status():
+    async def run():
+        client = Client()
+        source = TInvestMarketStreamSource(
+            "synthetic", TINVEST_SANDBOX_TARGET, client_factory=lambda *args, **kwargs: client
+        )
+        await source.start()
+
+        available = await source.get_trading_status("AAA")
+
+        await source.close()
+        return available, client.status_requests
+
+    available, requests = asyncio.run(run())
+
+    assert available is True
+    assert requests == [{"instrument_id": "AAA"}]
 
 
 def failing_source(operation, error):

@@ -1,9 +1,98 @@
+import asyncio
+from types import SimpleNamespace
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 
 from moex_sentinel import composition as composition_module
 from moex_sentinel.api import app as app_module
 from moex_sentinel.config import Settings
 from moex_sentinel.storage.database import create_database_engine as actual_create_database_engine
+from sentinel_contracts.runtime_versions import VersionObservation
+from sentinel_contracts.worker_diagnostics import WorkerObservation
+
+
+def test_readiness_observer_reads_expected_work_from_scoped_trading_service(monkeypatch) -> None:
+    broker_id = uuid4()
+    scopes = []
+
+    class TradingAdmission:
+        def expects_trading(self, value):
+            scopes.append(value)
+            return True
+
+        def view(self, _value):
+            return None
+
+    class WorkerVersions:
+        def diagnostics_snapshot(self):
+            return VersionObservation(reason="NOT_OBSERVED"), WorkerObservation(reason="NOT_OBSERVED")
+
+    async def direct_run(operation):
+        return operation()
+
+    async def no_preparation(_broker_id):
+        return None
+
+    monkeypatch.setattr(app_module, "run_sync", direct_run)
+    observer = app_module._build_readiness_observer(
+        SimpleNamespace(
+            trading_admission=TradingAdmission(),
+            daily_admission_preparation=SimpleNamespace(snapshot=no_preparation),
+        ),
+        WorkerVersions(),
+        broker_id,
+    )
+
+    result = asyncio.run(observer())
+
+    assert result.expected_work is True
+    assert scopes == [broker_id]
+
+
+def test_readiness_observer_exposes_only_allowlisted_admission_denials(monkeypatch) -> None:
+    broker_id = uuid4()
+
+    class TradingAdmission:
+        def expects_trading(self, _value):
+            return True
+
+        def view(self, _value):
+            return SimpleNamespace(
+                admission_status=SimpleNamespace(value="ARMED"),
+                effective_can_submit=False,
+                effective_denial_reasons=(
+                    SimpleNamespace(value="LIMITS_NOT_CONFIGURED"),
+                    SimpleNamespace(value="STALE_MARKET"),
+                    SimpleNamespace(value="synthetic-secret-reason"),
+                ),
+                recovery_only=False,
+            )
+
+    class WorkerVersions:
+        def diagnostics_snapshot(self):
+            return VersionObservation(reason="NOT_OBSERVED"), WorkerObservation(reason="NOT_OBSERVED")
+
+    async def direct_run(operation):
+        return operation()
+
+    async def no_preparation(_broker_id):
+        return None
+
+    monkeypatch.setattr(app_module, "run_sync", direct_run)
+    observer = app_module._build_readiness_observer(
+        SimpleNamespace(
+            trading_admission=TradingAdmission(),
+            daily_admission_preparation=SimpleNamespace(snapshot=no_preparation),
+        ),
+        WorkerVersions(),
+        broker_id,
+    )
+
+    result = asyncio.run(observer())
+
+    assert result.account_effective_can_submit is False
+    assert result.effective_denial_reasons == ("LIMITS_NOT_CONFIGURED",)
 
 
 def test_http_backend_passes_configured_database_pool_to_engine(monkeypatch, tmp_path) -> None:

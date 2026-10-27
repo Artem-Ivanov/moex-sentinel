@@ -20,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class AnalyticsSnapshotPort(Protocol):
-    async def snapshot(self, request: AnalyticsSnapshotRequest) -> AnalyticsSnapshot: ...
+    async def snapshot(self, request: AnalyticsSnapshotRequest) -> AnalyticsSnapshot | None: ...
 
 
 class AnalyticsMetricsCache:
@@ -51,6 +51,9 @@ class AnalyticsFrameService:
         """Return a validated frame or None, logging only availability state transitions."""
         try:
             result = await self._analytics.snapshot(request)
+            if result is None:
+                self._mark_unavailable()
+                return None
             self._validate_response(result, request)
             if self._analytics_unavailable_since is not None:
                 LOGGER.info(
@@ -67,13 +70,16 @@ class AnalyticsFrameService:
                 self._analytics_unavailable_since = None
             return result
         except (AnalyticsUnavailableError, ValueError):
-            if self._analytics_unavailable_since is None:
-                self._analytics_unavailable_since = self._now()
-                LOGGER.warning(
-                    "Analytics unavailable; execution recovery continues",
-                    extra={"reason_code": "ANALYTICS_UNAVAILABLE"},
-                )
+            self._mark_unavailable()
             return None
+
+    def _mark_unavailable(self) -> None:
+        if self._analytics_unavailable_since is None:
+            self._analytics_unavailable_since = self._now()
+            LOGGER.warning(
+                "Analytics unavailable; execution recovery continues",
+                extra={"reason_code": "ANALYTICS_UNAVAILABLE"},
+            )
 
     @staticmethod
     def _validate_response(result: AnalyticsSnapshot, request: AnalyticsSnapshotRequest) -> None:
@@ -119,9 +125,14 @@ class AnalyticsFrameService:
         )
         if frame is not None and instruments:
             ttl = timedelta(milliseconds=min(frame.ttl_ms, 2000))
-            deadline = min(
-                frame.captured_at + ttl,
-                *(item.market.order_book.captured_at + ttl for item in instruments.values() if item.market.order_book),
-            )
+            deadlines = [frame.captured_at + ttl]
+            for item in instruments.values():
+                book = item.market.order_book
+                if book is not None:
+                    deadlines.append(book.captured_at + ttl)
+                api_status = item.market.api_trading_status
+                if api_status is not None:
+                    deadlines.append(api_status.expires_at)
+            deadline = min(deadlines)
             snapshot = snapshot.model_copy(update={"expires_at": deadline})
         return snapshot

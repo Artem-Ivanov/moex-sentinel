@@ -13,6 +13,7 @@ from sentinel_contracts.streaming_market import (
     MarketBatchSnapshot,
     StreamOrderBook,
     StreamTradingStatus,
+    UnaryApiTradingStatus,
 )
 from sentinel_contracts.trading import AutomationState, DecisionKind
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -109,7 +110,8 @@ def test_invalid_book_isolated_from_valid_position_batch(invalid: str, caplog, m
         bad = InstrumentMarketState(
             "instrument",
             order_book=valid_book.model_copy(update=changes[invalid]),
-            trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, True, NOW),
+            trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, NOW),
+            api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
         )
         good = bad.model_copy(update={"instrument_id": "good", "order_book": valid_book})
         commands = (command(), baseline_command(automation="good", instrument="good"))
@@ -296,9 +298,9 @@ def test_assembles_decision_intent_and_dispatch_from_one_snapshot() -> None:
                         "instrument",
                         "NORMAL_TRADING",
                         True,
-                        True,
                         NOW - timedelta(hours=1),
                     ),
+                    api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
                 )
             },
         )
@@ -982,9 +984,9 @@ def test_stale_hydration_after_persistence_does_not_create_second_intent() -> No
                         "instrument",
                         "NORMAL_TRADING",
                         True,
-                        True,
                         NOW,
                     ),
+                    api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
                 )
             },
         )

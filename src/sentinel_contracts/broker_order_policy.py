@@ -16,11 +16,21 @@ _TRANSITIONS = {
 }
 
 
-def validate_order_transition(current: S, target: S, *, finalized: bool) -> None:
+def validate_order_transition(
+    current: S,
+    target: S,
+    *,
+    finalized: bool,
+    policy_expired: bool = False,
+) -> None:
     current, target = S(current), S(target)
     if current == target:
         return
     allowed = _TRANSITIONS.get(current, set())
+    if policy_expired:
+        if target != S.FAILED or finalized or current in LEGACY_TERMINAL_STATES:
+            raise ValueError(f"Invalid broker order transition: {current.value} -> {target.value}.")
+        allowed = allowed | {S.FAILED}
     if current in LEGACY_TERMINAL_STATES:
         allowed = _OPEN | BROKER_TERMINAL_STATES
         if current != S.FAILED:

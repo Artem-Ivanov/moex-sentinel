@@ -1,0 +1,111 @@
+ M .env.example
+ M compose.yml
+ M deploy/remote/.env.example
+ M deploy/remote/.env.production.example
+ M develop/.planning/2026-10-17-inwork-prod-deploy/findings.md
+ M develop/.planning/2026-10-17-inwork-prod-deploy/progress.md
+ M develop/.planning/2026-10-17-inwork-prod-deploy/task_plan.md
+ M docs/configuration/environment.md
+ M docs/deployment/prod-trading-start.md
+ M docs/phase-1-implementation-plan.md
+ M docs/trading-strategy.md
+ M frontend/src/api/diagnostics.spec.ts
+ M frontend/src/api/diagnostics.ts
+ M frontend/src/views/DiagnosticsView.spec.ts
+ M frontend/src/views/DiagnosticsView.vue
+ M src/moex_sentinel/adapters/tinvest/market_stream_source.py
+ M src/moex_sentinel/adapters/tinvest/streaming.py
+ M src/moex_sentinel/api/app.py
+ M src/moex_sentinel/composition.py
+ M src/moex_sentinel/config.py
+ M src/moex_sentinel/domain/automations.py
+ M src/moex_sentinel/domain/repository_records.py
+ M src/moex_sentinel/services/market_snapshot_gateway.py
+ M src/moex_sentinel/services/runtime_versions.py
+ M src/moex_sentinel/services/trading_admission.py
+ M src/moex_sentinel/services/trading_fact_ports.py
+ M src/moex_sentinel/services/trading_readiness_alerts.py
+ M src/moex_sentinel/storage/repositories/automations.py
+ M src/moex_sentinel/storage/repositories/trading_admission.py
+ M src/moex_sentinel/storage/repositories/trading_audit.py
+ M src/moex_sentinel/usecases/automations.py
+ M src/moex_sentinel/views/automations.py
+ M src/moex_sentinel/views/internal_trading_admission.py
+ M src/moex_sentinel/views/schemas/automations.py
+ M src/sentinel_contracts/analytics.py
+ M src/sentinel_contracts/streaming_market.py
+ M src/sentinel_contracts/worker_diagnostics.py
+ M src/trading_automaton/adapters/core_client.py
+ M src/trading_automaton/adapters/tinvest_broker_session.py
+ M src/trading_automaton/composition.py
+ M src/trading_automaton/config.py
+ M src/trading_automaton/runtime/analytics_broker.py
+ M src/trading_automaton/runtime/streaming_coordinator.py
+ M src/trading_automaton/services/active_intent_gate.py
+ M src/trading_automaton/services/analytics_frame.py
+ M src/trading_automaton/services/broker_tick_preparation.py
+ M src/trading_automaton/services/order_dispatch.py
+ M src/trading_automaton/services/order_tracking.py
+ M src/trading_automaton/services/position_batch_scheduler.py
+ M src/trading_automaton/services/trading_admission.py
+ M src/trading_automaton/services/uncertain_intent_reconciliation.py
+ M src/trading_automaton/storage/repository.py
+ M src/trading_automaton/usecases/broker_iteration.py
+ M src/trading_automaton/usecases/synchronize_runtime.py
+ M tests/adapters/test_tinvest_market_stream_source.py
+ M tests/api/test_auth.py
+ M tests/api/test_automation_contract.py
+ M tests/api/test_runtime_environment_wiring.py
+ M tests/api/test_runtime_versions.py
+ M tests/api/test_trading_admission_limits.py
+ M tests/contracts/test_worker_diagnostics.py
+ M tests/integration/postgresql/test_trading_admission_concurrency.py
+ M tests/integration/postgresql/test_trading_admission_flow.py
+ M tests/integration/test_dynamic_strategy_contract.py
+ M tests/integration/test_open_position_bootstrap.py
+ M tests/integration/test_sandbox_outage_recovery.py
+ M tests/market_analytics/market_source_helpers.py
+ M tests/services/test_market_snapshot_gateway.py
+ M tests/services/test_runtime_versions.py
+ M tests/services/test_trading_admission.py
+ M tests/services/test_trading_readiness_alerts.py
+ M tests/storage/test_automation_read_model.py
+ M tests/storage/test_trading_observability_repository.py
+ M tests/test_config.py
+ M tests/trading_automaton/adapters/test_core_client.py
+ M tests/trading_automaton/adapters/test_tinvest_broker_session.py
+ M tests/trading_automaton/adapters/test_tinvest_streaming_adapter.py
+ M tests/trading_automaton/services/test_broker_tick_preparation_service.py
+ M tests/trading_automaton/services/test_hot_market_data_service.py
+ M tests/trading_automaton/services/test_order_dispatch_service.py
+ M tests/trading_automaton/services/test_order_tracking_service.py
+ M tests/trading_automaton/services/test_position_batch_scheduler_service.py
+ M tests/trading_automaton/services/test_streaming_batch_tick_service.py
+ M tests/trading_automaton/services/test_streaming_runtime_coordinator_service.py
+ M tests/trading_automaton/services/test_trading_admission.py
+ M tests/trading_automaton/services/test_uncertain_intent_reconciliation_service.py
+ M tests/trading_automaton/storage/test_local_repository.py
+ M tests/trading_automaton/test_analytics_recovery.py
+ M tests/trading_automaton/test_analytics_runtime.py
+ M tests/trading_automaton/test_config.py
+ M tests/trading_automaton/test_streaming_decision_pipeline.py
+ M tests/usecases/test_diagnostics.py
+?? develop/.planning/2026-10-17-inwork-prod-deploy/core-path-audit-brief.md
+?? develop/.planning/2026-10-17-inwork-prod-deploy/worker-path-audit-brief.md
+?? develop/.planning/2026-10-18-prod-trading-resume/
+?? develop/.planning/2026-10-19-broker-not-found/
+?? develop/.planning/2026-10-19-frontend-basics/
+?? develop/.planning/2026-10-19-interview-summary/
+?? develop/.planning/2026-10-19-trading-status/
+?? develop/.planning/2026-10-20-application-audit/
+?? develop/.planning/2026-10-20-trading-recovery-implementation/
+?? docs/audits/prod-completeness-20261017.md
+?? docs/superpowers/plans/2026-10-18-prod-completeness.md
+?? docs/superpowers/specs/2026-10-17-prod-completeness-design.md
+?? src/trading_automaton/services/order_lifecycle.py
+?? tests/api/test_submit_attempt_http.py
+?? tests/contracts/test_streaming_market.py
+?? tests/integration/postgresql/test_prod_decision_pipeline.py
+?? tests/trading_automaton/services/test_active_intent_gate.py
+?? tests/trading_automaton/services/test_analytics_frame.py
+?? tests/trading_automaton/services/test_order_lifecycle.py

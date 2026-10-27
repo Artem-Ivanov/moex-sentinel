@@ -44,6 +44,21 @@ def test_regressions_and_invented_failed_writers_are_forbidden(current, target):
         validate_order_transition(S(current), S(target), finalized=False)
 
 
+@pytest.mark.parametrize("current", ["CREATED", "SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNCERTAIN"])
+def test_age_policy_allows_nonterminal_to_failed_only_with_expiry_authorization(current):
+    with pytest.raises(ValueError, match="transition"):
+        validate_order_transition(S(current), S.FAILED, finalized=False)
+
+    try:
+        validate_order_transition(S(current), S.FAILED, finalized=False, policy_expired=True)
+    except TypeError:
+        pytest.fail("order policy must support explicit age-expiry authorization")
+
+
+def test_age_policy_failed_can_still_be_reconciled_to_late_fill_until_terminal_timestamp():
+    validate_order_transition(S.FAILED, S.FILLED, finalized=False)
+
+
 @pytest.mark.parametrize("current", ["FILLED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED"])
 def test_finalized_order_only_allows_same_state(current):
     for target in S:

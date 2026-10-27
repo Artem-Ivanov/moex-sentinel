@@ -103,6 +103,7 @@ class OrderDispatchService:
             return self._cancel_expired(request, started)
         try:
             response = await self._broker.dispatch_limit_order(request)
+            self._require_response_request_id(response, request.idempotency_key)
             responded_at = self._now()
             self._repository.update_intent(
                 request.idempotency_key,
@@ -161,7 +162,7 @@ class OrderDispatchService:
                     self._broker.inspect_recent_operations(request.account_id, request.instrument_id, 20),
                     return_exceptions=True,
                 )
-            if isinstance(reconciled, BrokerOrderState):
+            if isinstance(reconciled, BrokerOrderState) and reconciled.idempotency_key == request.idempotency_key:
                 responded_at = self._now()
                 self._repository.update_intent(
                     request.idempotency_key,
@@ -240,6 +241,11 @@ class OrderDispatchService:
 
     def _market_expired(self, request: DispatchRequest) -> bool:
         return request.market_valid_until is not None and self._now() > request.market_valid_until
+
+    @staticmethod
+    def _require_response_request_id(response: BrokerOrderState, expected: str) -> None:
+        if response.idempotency_key != expected:
+            raise ValueError("Broker response request ID does not match the submitted intent.")
 
     def _cancel_expired(self, request: DispatchRequest, started: asyncio.Future[datetime]) -> BrokerOrderState:
         occurred_at = self._now()

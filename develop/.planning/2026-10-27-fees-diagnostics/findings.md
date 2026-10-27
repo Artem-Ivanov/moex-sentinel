@@ -1,0 +1,7 @@
+# Findings27Oct
+Initialcode: Coreappend_execution immutable; brokeroperations already include nested commission+separateFEE. D1reader100ms deadline; needprofile nottimeoutincrease. Existingdeployed26Oct sourceidentity inCURRENT, fresh27Octruntime unknown.
+
+Freshmonitor001 currentproof asabove, notyesterdayruntime. F1scopehazard: terminal responsefee0 immutableexecute; operation DTO loseslinks. Needexactproviderassociationandapplyfeeswithoutdoublecount; planpendingarchitect. F2rootACKgranted.
+
+## F2 independent GO / corrected benchmark evidence
+Authordiagnostics_f2_20261027 SQLnarrowrank beforewideprojection/latestdecision limited6.19PASS. Independentdiagnostics_review_20261027 GO C0/I0/M0 afterMinorREADME100auto10kstatuscorrectedtoUNKNOWN, median98.538doesnotmeanOBSERVED; full10k2autos32.956OBSERVED vs102.190UNKNOWNbefore. 50kstillUNKNOWNfailclosed, no100msincrease. RoothypothesisACKoutboxhistorywasincorrect/revoked: acknowledgephysDELETE, CHECKonlyPENDING/FAILED, lowoutboxseedrepresentsobserved0–6; _FACT_COUNTS0.12–0.81ms. NoextraSQLfilter/schemaadded. F1probeindepI1enumstatusproperty/I2feeaccount/statevalidationfixpendingbeforelive.

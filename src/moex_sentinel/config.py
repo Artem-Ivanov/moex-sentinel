@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     market_operation_timeout_seconds: float = Field(default=10.0, gt=0)
     market_close_timeout_seconds: float = Field(default=5.0, gt=0)
     market_quiet_seconds: float = Field(default=30.0, gt=0)
+    market_trading_status_ttl_seconds: float = Field(default=30.0, gt=0)
     market_candles_refresh_seconds: float = Field(default=60.0, gt=0)
     analytics_version_http_timeout_seconds: float = Field(default=1.0, gt=0)
     sandbox_retry_limit: int = Field(default=5, ge=0)
@@ -133,6 +134,7 @@ class Settings(BaseSettings):
             self.market_operation_timeout_seconds,
             self.market_close_timeout_seconds,
             self.market_quiet_seconds,
+            self.market_trading_status_ttl_seconds,
             self.market_candles_refresh_seconds,
             self.analytics_version_http_timeout_seconds,
         )

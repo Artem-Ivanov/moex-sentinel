@@ -1,35 +1,30 @@
-# PROD rollout — admission по IN_WORK — 17.10.2026
+# PROD completeness и rollout — 18.10.2026
 
-## Цель и scope
-По явному запросу пользователя убрать реальные TEST-заглушки из production code path, сверить полноту реализации PROD по всему торговому потоку и только после устранения подтверждённых пробелов выпустить изменения на PROD с обычной технической приёмкой. Сохранять настоящий Sandbox/Test contour и тестовые doubles в tests; считать заглушкой только production wiring/ветку, которая подменяет, пропускает или делает неполным обязательное PROD поведение. Любая возможная торговля после релиза должна идти только по существующему `IN_WORK` + TRADE и уже заданным общим финансовым лимитам.
+## Цель и авторизация
+Пользователь поручил исправить реальные пробелы PROD, сохранив настоящий TEST/Sandbox и doubles в tests, затем выполнить deployment. Полный scope и TTL-политика подтверждены; 18.10 дано явное «Приступай к реализации после к деплою». Повторное согласование уже разрешённых шагов не требуется. Root координирует, исполнители пишут код, независимые агенты проверяют. Git branches/worktrees/stage/commit/push не выполняются.
 
-## Проверка актуальности до выполнения
-- Кодовая веха 16.10 заявлена локально завершённой; общий independent review `C0/I0/M0`, Python 2515 PASS/196 PostgreSQL SKIP, frontend 257 PASS/typecheck/build PASS. См. `develop/reports/position-driven-admission-20261016/review-integration.md` и root logs.
-- Текущий runbook говорит, что PROD остаётся на `vps-20261015-env-4a71589e8766` до отдельного релиза; он требует согласованный Core/Worker/UI, точный source manifest, сохранение volumes/HOLD/config и ограниченную health/UI приёмку.
-- В checkout 66 изменённых tracked files + untracked docs/tests/plan и пользовательский PNG; HEAD/index не содержат локальную реализацию. Запрещены stage/commit/push и нельзя случайно включить PNG/секреты/нецелевой scratch.
-- Изменение не содержит DDL/миграции. PostgreSQL-only тесты до релиза не прошли (отдельная TEST DB недоступна); блокировка/конкурентные свойства PG остаются ограничением.
+Источники: `docs/superpowers/specs/2026-10-17-prod-completeness-design.md`, `docs/superpowers/plans/2026-10-18-prod-completeness.md`, актуальная очередь `docs/phase-1-implementation-plan.md`, инварианты `AGENT_BRIEF.md`. История решений и старых gates сохранена в progress.md/WORK_LOG; прежние receipts не подтверждают текущий runtime. HEAD f751ab3; продуктовые изменения этой вехи остаются dirty.
 
-## Фазы и gates
-1. [done] Сверить release inputs с reviewed source, состав package и безопасные rollout wrappers; проверить локальную доступность build/SSH, не раскрывая credentials.
-2. [pending] Сформировать уникальный tag/archive/source manifest только из явно перечисленного продукта, провести preflight против текущего PROD (release/schema/containers/config/trading state/active intents; read-only), затем независимое pre-execution review. Code-only prep разрешён при caps=null и ровно известной сохранённой UNCERTAIN; перед rollout остановиться при любом runtime drift, новых неопределённых intents, изменении HOLD/IN_WORK/лимитов или отсутствии clean-stop proof.
-3. [pending] После review подготовить immutable Core/Worker/frontend images без изменения private ENV, caps, DB/volumes. Analytics/schema остаются прежними; миграции нет. Обновления compose должны быть точно объяснены и ограничены согласованным приложением/runtime defaults.
-4. [done] Scoped operator-authenticated read-only GET для единственного PENDING runtime; strict intent-state allowlist; honest `NOT_RECHECKED` boundary; fail-closed admission/null-caps/arm/recovery checks; stable UNCERTAIN reference binding; lifecycle/failure-injection tests. Independent `env_core_reviewer` verdict C0/I0/M0: `develop/reports/position-driven-admission-deploy-20261017/protocol-fix-review.md`.
-5. [in_progress] Новая пользовательская prerequisite-веха: независимая инвентаризация TEST-specific defaults/no-op/fallback и production composition; классифицировать допустимые Sandbox/test code paths vs реальные incomplete PROD paths; согласовать scope/design/DoD перед реализацией, выполнить только подтверждённые правки и тесты, independent cross-review.
-6. [pending] Пересобрать immutable package с новым API и принятыми production fixes, получить свежее разрешённое application-level intent receipt, повторить exact preflight, выполнить deployment и ограниченную техническую приёмку. Не запускать STOP без свежего receipt; PROD DB/SQLite напрямую не читать.
-7. [pending] Независимое post-deploy cross-review receipts; обновить tracked runbook/очередь и локальные CURRENT/WORK_LOG с точной границей того, что проверено.
+## Сверка актуальности и решения
+- PC1 isolation/unary availability и PC3 diagnostics/alerts/UI приняты после independent C0/I0/M0. PC2 после исправления durable UNCERTAIN, status allowlist, bounded RPC, TTL confirmation window и actual SDK-entry expiry guard получил final independent C0/I0/M0. Evidence PC1/PC2/PC3 в `develop/reports/prod-completeness-20261018/pc*/`.
+- PC4 новый полный AnalyticsHTTP→Core market/risk/admission→Worker PROD strategy→SDK-only fake→durable ledger/outbox→authenticated CoreHTTP/PG исполнение прошёл независимо вместе с ingress:4PASS, combined-boundary review C0/I0/M0. Existing PG flow fixture несовместима с active-state guard уже в HEAD: local IN_WORK DTO не публикуется в Core, где остаётся IN_QUEUE; узкий test-only fix поручен PC1 автору до full suite.
+- Python3.12 .venv готов; отдельный PostgreSQL16 tmpfs localhost55434/database sentinel_prod_completeness_test. Не использовать PROD SQL/SQLite или только новый schema в неизвестной рабочей DB. Root frontend259PASS/typecheck/buildPASS; fullPython/PG ещё не принят.
+- Новый PC5 helper и 21offline tests сданы автором, independent review выполняется; root обнаружил потенциальные реальные wiring defects, helper нельзя исполнять до исправлений/review. Никакие live сервисы ещё не переключались.
+- Clean-stop receipt разрешён вместо прежнего helper-specific exact-SQLite-intent freshness gate: independent OPS architect и hashes четырёх oldWorker lifecycle modules подтверждают корректный источник доказательств. Требуется pinned ID/image/restarts/restart=no, exit0/noOOM/FinishedAt после SIGTERM, сохранение полной storage identity. Marker APPLICATION_STOPPED вспомогательный, сам по себе не доказывает drain. Никакого свежего exact-intent/terminal-resolution утверждения без источника.
+- Релиз включает ЧЕТЫРЕ immutable image: Core, Worker, Analytics, UI. Core/UI/Analytics совместимые readers идут до Worker. Candidate Compose выводится из active parent с ровно двумя добавленными binding: Core MARKET_TRADING_STATUS_TTL_SECONDS=30 и Worker BROKER_REQUEST_TIMEOUT_SECONDS=10. Private ENV, прочие defaults/Compose drift, caps, ARM/Resume/HOLD не меняются.
 
-## Acceptance / stop conditions
-- Новый RELEASE_TAG / images и точные source/archive hashes подтверждены.
-- Никаких изменений private env, численных значений четырёх caps, HOLD, финансовых строк/заявок/исполнений, schema/volumes, nginx/auth или TEST/shared services. Ожидаемы и проверяются отдельно только текущая дневная baseline, owner/generation/lease и admission revision/status, которые новый Core штатно готовит при старте/передаче.
-- Worker clean stop и штатный owner/lease переход проверены непосредственно перед rollout; carry-through разрешён ровно для сохранённой UNCERTAIN intent `022634125f04`, любые новые/изменившиеся неизвестные операции — стоп. Не трактовать отсутствие broker ID/fill как разрешение.
-- После rollout все целевые сервисы здоровы, endpoint/UI базово доступны, стратегия/режим/лимиты совпали с preflight; подтверждена только техническая готовность, не фактическая торговля.
-- Не коммитить, не пушить, не менять Git index/ветки; сохранить пользовательский PNG.
+## Выполнение и DoD
+1. [done] Audit/spec/plan, independent review, pinnedSDK1.49.3, dedicatedtestPG.
+2. [done] PC1/PC2/PC3 fixes, financialACCOUNTanchor/closedUIDcorrectivefix, independentfinalC0/I0/M0.
+3. [done] FullPRODcomposedPGtest +market/concurrencyfixtures; root2804PythonPASS2pg_dumpSKIP/259UI/type/build/Ruff/Black/diffPASS.
+4. [done] ActualRemoteOps/CLI/API-shaped tests, helpers38offlinePASS/18APIchecks, allfoundImportantclosedindependently.
+5. [done] Exact350source/34buildinputs/4templates package437, fourcandidateID/source/import/UInginx checks, exactreview0.
+6. [done] Rootauthorizedrollout09:02:08UTC: pinnedoldWorkerexit0/restarts0/restartno, readersfirst, samestorage/newWorker, uniquePENDING, oneownertransfergen6, boundedheartbeat/health/UI checksPASS.
+7. [done] Publichealth/renderedlogin+validacceptancereceipt, independentprod_ops_reviewC0/I0/M0, runbook/queue/context updated. No actualtradingacceptance/currentintentinspection; limitsnullattransfer. OptionalextraAPIbundle unavailableSSHtransport, cancelledread-onlyrequest; noextraDBinspection.
 
-## Открытые ограничения
-- Есть свежий read-only observation на 17.10 в `observation-before.json`; потребуется новый перед остановкой Worker.
-- Не проверены 196 PostgreSQL integration tests без отдельного тестового сервера.
-- Текущий локальный checkout dirty; деплой допустим только из exact reviewed manifest, без упаковки всего git status.
-- Предыдущий релизный helper для 15.10 ожидает STOP_REQUIRED/recovery-only и limits=null после owner transfer, что противоречит новой логике IN_WORK и не может быть запущен без адаптации и cross-review.
-- Старый Core/Worker `vps-20261015-env-4a71589e8766` допускается как rollback только при точной сверке, отсутствии новых grants/position-anchor JSON/cap writes и сохранении исходной UNCERTAIN; иначе только forward-fix с сохранением state, без downgrade/очистки.
-- Штатная runtime registration возвращает UUID только Worker; до owner transfer Core diagnostics не обновляются. Независимое review helper выявило I1 на этом шаге. Production DB lookup запрещён правилами проекта; ни один сервис не остановлен. Решение и доказательства — в progress.md и отчёте rollout helper; перед следующим deployment сохранить протокол в tracked cutover runbook.
-- Дополнительный independent review выявил I2: исходный helper допускал другие активные intent counts вместе с одной известной UNCERTAIN и выдавал старый Worker snapshot за текущее состояние; также lifecycle review M1. До rollout закрыть I2 строгим intent-state allowlist и не заявлять post-stop row-state verification без разрешённого источника; добавить lifecycle tests и повторное независимое review.
+## Ограничения и stop conditions
+- Последние исторические данные17.10: PROD TRADE, admission DISARMED/limits=null/effective_submit=false, IN_WORK+HOLD; одна UNCERTAIN без brokerID/fills/preRPCabortproof. Статус исторический NOT_RECHECKED, ref022634125f04. Не очищать/repost/Resume и не утверждать её resolution. После clean restart durable recovery state должен сохраниться; проверка rawDB запрещена.
+- Любой неclean stop (timeout/SIGKILL137/OOM/restart/container drift) останавливает дальнейшие Core/link/owner mutations. Preserve volumes/history. Новая candidate identity/storage/config не должны менять scope.
+- Admission invariants/current owner/generation/caps/ARM/config проверяются поддерживаемыми API. Volatile heartbeat/lease/readiness нельзя ошибочно считать immutable финансовым состоянием. Нулевые/отсутствующие лимиты не подбирать автоматически.
+- Ordinary deployment не требует полного backup/restore/integrity comparison. DDL этой вехой не добавлено. Rollback только доказанно совместимый application set с сохранением схемы/данных; иначе остановка/forward fix, без старого UID-gated fallback.
+- Все Critical/Important устраняются и независимо повторно проверяются до исполнения зависимого шага. Авторы не принимают свои изменения. Root сохраняет итоговые evidence и точную границу проверенного.

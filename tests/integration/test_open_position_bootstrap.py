@@ -178,7 +178,7 @@ def test_unavailable_market_allows_position_adoption_but_no_tick_or_order(tmp_pa
         )
     elif market_problem == "closed":
         market = market.model_copy(
-            update={"trading_status": market.trading_status.model_copy(update={"api_trade_available": False})}
+            update={"api_trading_status": market.api_trading_status.model_copy(update={"api_trade_available": False})}
         )
     elif market_problem == "crossed":
         market = market.model_copy(

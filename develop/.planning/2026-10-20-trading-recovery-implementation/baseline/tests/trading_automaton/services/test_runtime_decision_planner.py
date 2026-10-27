@@ -1,0 +1,326 @@
+"""Unit tests for runtime decision planner service."""
+
+import asyncio
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from sentinel_contracts.broker_execution import (
+    BrokerPosition,
+    LimitOrderEstimate,
+    OrderBookLevel,
+    OrderBookSnapshot,
+    OrderSide,
+)
+from sentinel_contracts.trading import DecisionKind
+from sentinel_contracts.trading_facts import AutomationCommand
+from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.config import StrategySettings
+from trading_automaton.domain.dtos import MarketIndicators
+from trading_automaton.domain.storage_dtos import IntentHistory, TradeLotRecord, TradingCycleState
+from trading_automaton.services.runtime_decision_planner import (
+    DecisionEstimatePort,
+    TradeDecision,
+    TradingDecisionPlanner,
+)
+
+NOW = datetime(2026, 8, 10, 10, tzinfo=UTC)
+
+
+def _command() -> AutomationCommand:
+    return baseline_command(
+        automation="automation-1",
+        broker="broker-1",
+        account="account-1",
+        instrument="instrument-1",
+    )
+
+
+def _order_book() -> OrderBookSnapshot:
+    return OrderBookSnapshot(
+        bids=(OrderBookLevel(Decimal("99.8"), 10),),
+        asks=(OrderBookLevel(Decimal("100"), 10),),
+        captured_at=NOW,
+    )
+
+
+def _history() -> IntentHistory:
+    return IntentHistory(
+        last_buy_price=Decimal("100"),
+        completed_partial_sell_steps=0,
+        actual_commissions=Decimal(),
+        total_bought_lots=0,
+        buy_commissions=Decimal(),
+    )
+
+
+def _cycle() -> TradingCycleState:
+    return TradingCycleState(
+        automation_id="automation-1",
+        pending_low=None,
+        last_buy_candle_at=None,
+        sell_armed=True,
+        last_sell_price=None,
+        updated_at=NOW,
+    )
+
+
+def _indicators_fallback() -> MarketIndicators:
+    return MarketIndicators(
+        averaging_step_percent=Decimal("0.5"),
+        minimum_net_profit_percent=Decimal("0.5"),
+        source="FALLBACK",
+        mean_5=None,
+        mean_20=None,
+        change_10_percent=None,
+        last_candle_at=NOW,
+        last_candle_open=Decimal("100"),
+        last_candle_close=Decimal("100"),
+        range_low=Decimal("95"),
+        range_high=Decimal("105"),
+    )
+
+
+def _lots() -> tuple[TradeLotRecord, ...]:
+    return (
+        TradeLotRecord(
+            "lot-1",
+            "automation-1",
+            "intent-1",
+            "reconciled",
+            1,
+            1,
+            Decimal("100"),
+            Decimal("0"),
+            NOW,
+            None,
+        ),
+    )
+
+
+def _run_async(task: object) -> object:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(task)
+    finally:
+        loop.close()
+
+
+class _DecisionSequence:
+    code = "SEQ"
+    version = "1"
+
+    def __init__(self, sequence: tuple[TradeDecision, ...]) -> None:
+        self.sequence = list(sequence)
+        self.calls = 0
+
+    def decide(self, context: object) -> TradeDecision:  # noqa: ARG002
+        self.calls += 1
+        if not self.sequence:
+            return TradeDecision(
+                kind=DecisionKind.WAIT,
+                quantity_lots=0,
+                limit_price=None,
+                reason_code="NO_DECISION",
+            )
+        return self.sequence.pop(0)
+
+
+class _WaitDecision:
+    def __init__(self) -> None:
+        self.code = "WAIT"
+        self.version = "1"
+        self.calls = 0
+
+    def decide(self, context: object) -> TradeDecision:  # noqa: ARG002
+        self.calls += 1
+        return TradeDecision(
+            kind=DecisionKind.WAIT,
+            quantity_lots=0,
+            limit_price=None,
+            reason_code="WAIT_STRATEGY",
+        )
+
+
+class _SpyEstimator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def estimate_limit_order(
+        self,
+        account_id: str,
+        instrument_id: str,
+        side: OrderSide,
+        quantity_lots: int,
+        price: Decimal,
+    ) -> LimitOrderEstimate:  # noqa: ARG002
+        self.calls += 1
+        assert account_id == "account-1"
+        assert instrument_id == "instrument-1"
+        assert side is OrderSide.BUY
+        assert quantity_lots == 1
+        assert price == Decimal("100")
+        return LimitOrderEstimate(
+            total_amount=price * quantity_lots * Decimal("10"),
+            estimated_commission=Decimal("2.5"),
+            currency="RUB",
+        )
+
+
+def test_wait_when_market_closed_does_not_call_estimate() -> None:
+    planner = TradingDecisionPlanner(
+        decisions=_WaitDecision(),
+    )
+    estimator: DecisionEstimatePort = _SpyEstimator()
+
+    result = _run_async(
+        planner.plan(
+            command=_command(),
+            position=BrokerPosition("instrument-1", Decimal("1"), Decimal("100"), Decimal("100"), "RUB"),
+            order_book=_order_book(),
+            history=_history(),
+            lots=_lots(),
+            cycle=_cycle(),
+            indicators=_indicators_fallback(),
+            session_open=False,
+            estimator=estimator,
+        )
+    )
+
+    assert result.decision.kind is DecisionKind.WAIT
+    assert result.decision.reason_code == "MARKET_SESSION_CLOSED"
+    assert result.estimated_commission == Decimal()
+    assert estimator.calls == 0
+
+
+def test_wait_plan_skips_estimate() -> None:
+    decisions = _WaitDecision()
+    planner = TradingDecisionPlanner(decisions=decisions)
+    estimator: DecisionEstimatePort = _SpyEstimator()
+
+    result = _run_async(
+        planner.plan(
+            command=_command(),
+            position=BrokerPosition("instrument-1", Decimal("1"), Decimal("100"), Decimal("100"), "RUB"),
+            order_book=_order_book(),
+            history=_history(),
+            lots=_lots(),
+            cycle=_cycle(),
+            indicators=_indicators_fallback(),
+            session_open=True,
+            estimator=estimator,
+        )
+    )
+
+    assert result.decision.kind is DecisionKind.WAIT
+    assert result.decision.reason_code == "WAIT_STRATEGY"
+    assert estimator.calls == 0
+
+
+def test_actionable_decision_is_recomputed_with_estimated_commission() -> None:
+    decisions = _DecisionSequence(
+        (
+            TradeDecision(
+                kind=DecisionKind.BUY_MORE,
+                quantity_lots=1,
+                limit_price=Decimal("100"),
+                reason_code="INITIAL_DECISION",
+            ),
+            TradeDecision(
+                kind=DecisionKind.WAIT,
+                quantity_lots=0,
+                limit_price=None,
+                reason_code="AFTER_ESTIMATE",
+            ),
+        )
+    )
+    planner = TradingDecisionPlanner(decisions=decisions)
+    estimator: DecisionEstimatePort = _SpyEstimator()
+
+    result = _run_async(
+        planner.plan(
+            command=_command(),
+            position=BrokerPosition("instrument-1", Decimal("1"), Decimal("100"), Decimal("100"), "RUB"),
+            order_book=_order_book(),
+            history=_history(),
+            lots=_lots(),
+            cycle=_cycle(),
+            indicators=_indicators_fallback(),
+            session_open=True,
+            estimator=estimator,
+        )
+    )
+
+    assert decisions.calls == 2
+    assert estimator.calls == 1
+    assert result.decision.kind is DecisionKind.WAIT
+    assert result.decision.reason_code == "AFTER_ESTIMATE"
+    assert result.estimated_commission == Decimal("2.5")
+    assert result.context_after_estimate is not None
+    estimated_order_amount = Decimal("1000")
+    assert result.context_after_estimate.commission_schedule.buy_rate == Decimal("2.5") / estimated_order_amount
+    assert result.context_after_estimate.commission_schedule.sell_rate == Decimal()
+
+
+def test_legacy_planner_uses_supplied_account_cash_and_position_count_for_quota() -> None:
+    planner = TradingDecisionPlanner(
+        decisions=_DecisionSequence((TradeDecision(DecisionKind.BUY_MORE, 12, Decimal("100"), "BUY"),))
+    )
+
+    result = _run_async(
+        planner.plan(
+            command=baseline_command(lot_size=1, order_quota_percent=Decimal("10")),
+            position=BrokerPosition("instrument-1", Decimal("1"), Decimal("100"), Decimal("100"), "RUB"),
+            order_book=_order_book(),
+            history=_history(),
+            lots=_lots(),
+            cycle=_cycle(),
+            indicators=_indicators_fallback(),
+            session_open=True,
+            estimator=None,
+            available_free_cash=Decimal("5000"),
+            positive_position_count=1,
+        )
+    )
+
+    assert (result.decision.kind, result.decision.quantity_lots) == (DecisionKind.BUY_MORE, 5)
+
+
+def test_real_strategy_sizes_first_buy_to_ten_lots_from_approved_example() -> None:
+    planner = TradingDecisionPlanner(settings=StrategySettings(enabled=True))
+    book = OrderBookSnapshot(
+        bids=(OrderBookLevel(Decimal("50"), 10),),
+        asks=(OrderBookLevel(Decimal("50"), 10),),
+        captured_at=NOW,
+    )
+    indicators = MarketIndicators(
+        averaging_step_percent=Decimal("0.5"),
+        minimum_net_profit_percent=Decimal("0.5"),
+        source="TEST",
+        mean_5=Decimal("50"),
+        mean_20=Decimal("50"),
+        change_10_percent=Decimal("0"),
+        last_candle_at=NOW,
+        last_candle_open=Decimal("50"),
+        last_candle_close=Decimal("50"),
+        range_low=Decimal("45"),
+        range_high=Decimal("55"),
+    )
+    cycle = _cycle().model_copy(update={"pending_low": Decimal("49")})
+
+    result = _run_async(
+        planner.plan(
+            command=baseline_command(lot_size=1, order_quota_percent=Decimal("10")),
+            position=BrokerPosition("instrument-1", Decimal(), Decimal(), Decimal("50"), "RUB"),
+            order_book=book,
+            history=_history(),
+            lots=(),
+            cycle=cycle,
+            indicators=indicators,
+            session_open=True,
+            estimator=None,
+            available_free_cash=Decimal("5000"),
+            positive_position_count=1,
+        )
+    )
+
+    assert (result.decision.kind, result.decision.quantity_lots) == (DecisionKind.BUY_MORE, 10)

@@ -3,13 +3,16 @@
 import asyncio
 import logging
 from contextlib import suppress
+from datetime import datetime
 from math import isfinite
 from time import monotonic
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sentinel_contracts.analytics import AnalyticsSnapshot, AnalyticsSnapshotRequest
 from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
 from sentinel_contracts.trading_facts import AutomationCommand
+from sentinel_contracts.worker_diagnostics import BrokerRuntimeDiagnostics
 from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
 
 LOGGER = logging.getLogger(__name__)
@@ -33,8 +36,10 @@ class AnalyticsBrokerRuntime:
         retry_limit: int = 5,
         recovery_probe_seconds: float = BROKER_RECOVERY_PROBE_SECONDS,
         account_id: str = "",
+        now=utc_now_ms,
     ) -> None:
         self._account_id = account_id
+        self._now = now
         self._analytics = analytics
         self._iteration = iteration
         self._tick_seconds = tick_seconds
@@ -46,6 +51,12 @@ class AnalyticsBrokerRuntime:
         self._recovery_probe_seconds = recovery_probe_seconds
         self._closed = asyncio.Event()
         self._run_lock = asyncio.Lock()
+        self._broker_status: Literal["IDLE", "RUNNING", "BLOCKED", "UNKNOWN"] = "IDLE"
+        self._decision_eligibility: Literal["READY", "NOT_READY", "UNKNOWN"] = "UNKNOWN"
+        self._reason = "NO_ACTIVE_COMMAND"
+        self._last_started_at: datetime | None = None
+        self._last_finished_at: datetime | None = None
+        self._last_success_at: datetime | None = None
 
     async def replace_commands(self, commands: tuple[AutomationCommand, ...]) -> None:
         """Publish command changes without blocking an iteration waiting on external I/O."""
@@ -115,4 +126,53 @@ class AnalyticsBrokerRuntime:
     async def run_once(self) -> None:
         """Serialize one finite application operation with shutdown."""
         async with self._run_lock:
-            await self._iteration.execute(is_closed=self._closed.is_set)
+            previous_timestamps = self._last_started_at, self._last_finished_at, self._last_success_at
+            started = floor_utc_millisecond(self._now())
+            self._last_started_at = started
+            self._last_finished_at = None
+            self._broker_status = "RUNNING"
+            self._decision_eligibility = "UNKNOWN"
+            self._reason = "ITERATION_RUNNING"
+            try:
+                outcome = await self._iteration.execute(is_closed=self._closed.is_set)
+            except BrokerOperationError as error:
+                self._last_finished_at = floor_utc_millisecond(self._now())
+                self._decision_eligibility = "UNKNOWN"
+                if error.retryable:
+                    self._broker_status = "RUNNING"
+                    self._reason = "BROKER_RETRYING"
+                else:
+                    self._broker_status = "BLOCKED"
+                    self._reason = "PERMANENT_BROKER_ERROR"
+                raise
+            except Exception:
+                self._last_finished_at = floor_utc_millisecond(self._now())
+                self._broker_status = "UNKNOWN"
+                self._decision_eligibility = "UNKNOWN"
+                self._reason = "NOT_OBSERVED"
+                raise
+            self._last_finished_at = floor_utc_millisecond(self._now())
+            if outcome == "NO_ACTIVE_COMMAND":
+                self._broker_status = "IDLE"
+                self._decision_eligibility = "UNKNOWN"
+                self._reason = "NO_ACTIVE_COMMAND"
+                self._last_started_at, self._last_finished_at, self._last_success_at = previous_timestamps
+                return
+            self._broker_status = "RUNNING"
+            self._last_success_at = self._last_finished_at
+            if outcome == "DECISION_FRAME_AVAILABLE":
+                self._decision_eligibility = "READY"
+                self._reason = "DECISION_FRAME_AVAILABLE"
+            else:
+                self._decision_eligibility = "NOT_READY"
+                self._reason = "NO_DECISION_FRAME"
+
+    def broker_runtime_diagnostics(self) -> BrokerRuntimeDiagnostics:
+        return BrokerRuntimeDiagnostics(
+            status=self._broker_status,
+            decision_eligibility=self._decision_eligibility,
+            reason=self._reason,
+            last_started_at=self._last_started_at,
+            last_finished_at=self._last_finished_at,
+            last_success_at=self._last_success_at,
+        )

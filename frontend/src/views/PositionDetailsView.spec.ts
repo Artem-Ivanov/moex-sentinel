@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/vue"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/vue"
 import { createMemoryHistory, createRouter, RouterView } from "vue-router"
 import { flushPromises } from "@vue/test-utils"
 import { afterEach, expect, it, vi } from "vitest"
@@ -57,6 +57,24 @@ it("shows automation state and trading details", async () => {
   expect(document.querySelector(".candlestick-chart__average-price-line")).toBeTruthy()
   expect((screen.getByRole("textbox", { name: "Максимальная доля квоты на одну заявку, %" }) as HTMLInputElement).value).toBe("10")
   expect(screen.getByText(/полная продажа и защитный стоп не ограничиваются/)).toBeTruthy()
+})
+
+it.each([
+  ["INCOMPLETE", "Сверка комиссий не завершена"],
+  ["UNKNOWN", "Комиссии требуют сверки"],
+  ["COMPLETE", null],
+  [undefined, null],
+])("explains commission status %s and preserves legacy responses", async (financial_status, explanation) => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...details,
+    automation: { ...automation, ...(financial_status ? { financial_status } : {}) },
+  })))
+  await renderDetailsView()
+  await screen.findByRole("heading", { name: "SBER — торговый автомат" })
+  const result = screen.getByText("Net P&L: 3.5").parentElement!
+  if (explanation) expect(within(result).getByText(explanation)).toBeTruthy()
+  else expect(within(result).queryByText(/сверк|Комиссии требуют/)).toBeNull()
+  expect(within(result).getByText("Комиссии: 0.5")).toBeTruthy()
 })
 
 it("saves the percent with the current revision and empty input resets the common setting", async () => {

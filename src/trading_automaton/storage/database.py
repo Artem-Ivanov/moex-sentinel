@@ -33,6 +33,22 @@ def downgrade_worker_states(engine: Engine) -> None:
         connection.commit()
 
 
+def downgrade_worker_execution_commission_cache(engine: Engine) -> None:
+    """Drop only an empty fee projection; trusted amounts are financial history."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if "execution_commission_cache" in inspect(connection).get_table_names():
+            count = connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM execution_commission_cache "
+                "WHERE effective_broker_commission IS NOT NULL"
+            ).scalar_one()
+            if count:
+                connection.rollback()
+                raise RuntimeError("Refusing to remove trusted execution commission cache values.")
+            connection.exec_driver_sql("DROP TABLE execution_commission_cache")
+        connection.commit()
+
+
 def create_worker_engine(database_url: str) -> Engine:
     if not database_url.startswith("sqlite:///"):
         raise ValueError("Trading worker supports only its private SQLite database.")

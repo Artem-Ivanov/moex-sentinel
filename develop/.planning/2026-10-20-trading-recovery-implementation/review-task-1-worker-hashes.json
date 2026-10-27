@@ -1,0 +1,18 @@
+{
+  "src/sentinel_contracts/worker_diagnostics.py": "2d271d4ab776a80e4ac804537d14874b005b0aedf278807709dec341da9e0a2f",
+  "src/trading_automaton/storage/execution_diagnostics.py": "410d54f81114aec38c4d09c3e33e6a1714199543a1bd130d995ebe0958debc9b",
+  "src/trading_automaton/runtime/streaming_coordinator.py": "7f1b7d51d7b71da49f4d1ea7dc4e23791bd43ab684303c4bafb3ca43d2097fba",
+  "src/trading_automaton/composition.py": "a433825d65f796825eef961e72e466a409e7660d39960e26b8e6e013d5fe0371",
+  "src/trading_automaton/adapters/core_client.py": "3c5b66c9af11668c318c2fc6f7461802a04de665f711ea98714a001145375246",
+  "src/moex_sentinel/api/app.py": "bba4fa597c47711c4c1a7d798b61ccabcfb40a3083790447b4108f24fc374bc2",
+  "src/moex_sentinel/views/schemas/automations.py": "8ac3e22f8b01f15b22b4eb895021587e747ce04140a4d2619e73d798165d3446",
+  "src/moex_sentinel/views/internal_automaton.py": "bb76dc1153c5a3eda7f05912bdeb78ee38270701828ee08fc80977b76b744b10",
+  "src/moex_sentinel/services/runtime_versions.py": "6abeefd073d7586a069e1e53f4643e3983c53bfa5c14aa7c2695e7a86327738a",
+  "tests/contracts/test_execution_diagnostics.py": "8591fbc980461670e9efb4b152f4b99d95e07343fcd96885f982bcdbb203a782",
+  "tests/trading_automaton/storage/test_execution_diagnostics.py": "e1de16abacca6b6a0b19c883fb32e513b8858c92e20fcc5f8906dd08301f3f3d",
+  "tests/trading_automaton/runtime/test_execution_diagnostics_budget.py": "7e261526b79e3661a6299cbff3a3e7b2d263abc1233d5653d6fca5730c094ed0",
+  "tests/trading_automaton/adapters/test_core_client.py": "c541ea51e19e8364e3fa4a7671e0ee93fefb87011ba5c9dd6f4ca1e3815bccfe",
+  "tests/api/test_runtime_versions.py": "960db84c6b385c238dc74b378eaf750cc4c07fbce64d47502474a195be048fd4",
+  "tests/api/test_internal_runtime.py": "7b912a67a20705b947bd3b60cc9dfa5972c7b7d1da405a7f034064bf4aa8de6b",
+  "tests/services/test_runtime_versions.py": "977aa42559a43915e991cf38522ae2b60c31bd150e90c92ce3cbb833f8a849b8"
+}

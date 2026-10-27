@@ -38,7 +38,13 @@ from sentinel_contracts.trading_facts import (
 class TradingFactMapper:
     """Apply one already validated envelope to session-bound repositories."""
 
-    def apply(self, uow: TradingFactsUnitOfWorkPort, envelope: FactEnvelope) -> None:
+    def apply(
+        self,
+        uow: TradingFactsUnitOfWorkPort,
+        envelope: FactEnvelope,
+        *,
+        age_policy_expired: bool = False,
+    ) -> None:
         """Map an already validated envelope within the supplied UoW without committing it."""
         scope_id = str(envelope.user_broker_id)
         automation_id = str(envelope.automation_id)
@@ -77,7 +83,7 @@ class TradingFactMapper:
             case BrokerOrderRecordedEnvelope():
                 uow.orders.append_order(scope_id, self._new_order(envelope))
             case BrokerOrderStateChangedEnvelope():
-                self._apply_order_state_change(uow, envelope)
+                self._apply_order_state_change(uow, envelope, age_policy_expired=age_policy_expired)
             case TradeExecutionRecordedEnvelope(payload=payload):
                 uow.orders.append_execution(
                     scope_id,
@@ -171,7 +177,12 @@ class TradingFactMapper:
                 raise AssertionError(f"Unsupported fact envelope type: {type(envelope).__name__}")
 
     @staticmethod
-    def _apply_order_state_change(uow: TradingFactsUnitOfWorkPort, envelope: BrokerOrderStateChangedEnvelope) -> None:
+    def _apply_order_state_change(
+        uow: TradingFactsUnitOfWorkPort,
+        envelope: BrokerOrderStateChangedEnvelope,
+        *,
+        age_policy_expired: bool = False,
+    ) -> None:
         """Validate the transition and update its aggregate without duplicating terminal repairs."""
         payload = envelope.payload
         scope_id = str(envelope.user_broker_id)
@@ -192,7 +203,12 @@ class TradingFactMapper:
         if from_state is not current.state and not terminal_repair:
             raise TradingFactPersistenceError(TradingFactErrorCode.INVALID_STATE, entity_type="broker_order_event")
         try:
-            validate_order_transition(current.state, to_state, finalized=current.terminal_at is not None)
+            validate_order_transition(
+                current.state,
+                to_state,
+                finalized=current.terminal_at is not None,
+                policy_expired=age_policy_expired,
+            )
         except ValueError as error:
             raise TradingFactPersistenceError(
                 TradingFactErrorCode.INVALID_STATE,

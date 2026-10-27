@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -17,6 +17,7 @@ from moex_sentinel.domain.portfolio import (
     OperationsPage,
 )
 from moex_sentinel.services.broker_factory import PortfolioAdapterFactory
+from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.services.portfolio import PortfolioAggregationService
 
 
@@ -522,3 +523,437 @@ def test_missing_scope_does_not_hide_another_brokers_accounts():
     assert [item.broker_id for item in result.accounts] == ["b2"]
     assert [error.code for error in result.errors] == ["BROKER_ACCOUNT_NOT_FOUND"]
     assert adapters["b1"].reads == []
+
+
+def test_scoped_operations_return_the_complete_filtered_source_page_and_cursor() -> None:
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    source_rows = tuple(
+        ExternalOperation(
+            operation_id=f"op-{index:03}",
+            account_id="account-1",
+            operation_type="OPERATION_TYPE_INPUT" if index < 99 else "BUY",
+            state="EXECUTED",
+            occurred_at=to_at - timedelta(seconds=index),
+            payment=None,
+            price=None,
+            quantity=Decimal("1"),
+            commission=None,
+        )
+        for index in range(500)
+    )
+
+    class ScopedAdapter(PortfolioAdapter):
+        calls = []
+
+        async def list_accounts(self):
+            return (
+                BrokerAccount("account-1", "Main", "OPEN", "BROKER"),
+                BrokerAccount("other-account", "Other", "OPEN", "BROKER"),
+            )
+
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            self.calls.append((account_id, cursor, limit, from_at, to_at))
+            return OperationsPage(source_rows, "next-page")
+
+    adapter = ScopedAdapter("account-1")
+    service = PortfolioAggregationService(BrokerRepository([broker("b1", "First")]), lambda _broker: adapter)
+
+    result = asyncio.run(
+        service.view_operations_scoped(
+            "b1",
+            "account-1",
+            limit=500,
+            cursor=None,
+            from_at=from_at,
+            to_at=to_at,
+        )
+    )
+
+    assert adapter.calls == [("account-1", None, 500, from_at, to_at)]
+    assert result.source_item_count == 500
+    assert result.selected_item_count == 401
+    assert len(result.items) == 401
+    assert result.next_cursor == "next-page"
+    assert result.source_exhausted is False
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_do_not_claim_interval_complete_from_a_continuation_page() -> None:
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+
+    class ScopedAdapter(PortfolioAdapter):
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            assert (account_id, cursor, limit, from_at, to_at) == (
+                "account-1",
+                "prior-page",
+                10,
+                datetime(2026, 10, 1, tzinfo=UTC),
+                datetime(2026, 10, 20, tzinfo=UTC),
+            )
+            return OperationsPage((), None)
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: ScopedAdapter("account-1")
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped(
+            "b1",
+            "account-1",
+            limit=10,
+            cursor="prior-page",
+            from_at=from_at,
+            to_at=to_at,
+        )
+    )
+
+    assert result.input_cursor == "prior-page"
+    assert result.next_cursor is None
+    assert result.source_exhausted is True
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_walked_by_client_cursor_keep_every_selected_row() -> None:
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    pages = {
+        None: OperationsPage(
+            (
+                ExternalOperation(
+                    operation_id="ignored",
+                    account_id="account-1",
+                    operation_type="OPERATION_TYPE_INPUT",
+                    state="EXECUTED",
+                    occurred_at=to_at,
+                    payment=None,
+                    price=None,
+                    quantity=Decimal("0"),
+                    commission=None,
+                ),
+                ExternalOperation(
+                    operation_id="newer",
+                    account_id="account-1",
+                    operation_type="BUY",
+                    state="EXECUTED",
+                    occurred_at=to_at - timedelta(seconds=1),
+                    payment=None,
+                    price=None,
+                    quantity=Decimal("1"),
+                    commission=None,
+                ),
+            ),
+            "page-2",
+        ),
+        "page-2": OperationsPage(
+            (
+                ExternalOperation(
+                    operation_id="older",
+                    account_id="account-1",
+                    operation_type="SELL",
+                    state="EXECUTED",
+                    occurred_at=to_at - timedelta(seconds=2),
+                    payment=None,
+                    price=None,
+                    quantity=Decimal("1"),
+                    commission=None,
+                ),
+            ),
+            None,
+        ),
+    }
+
+    class CursorAdapter(PortfolioAdapter):
+        calls = []
+
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            self.calls.append((account_id, cursor, limit, from_at, to_at))
+            return pages[cursor]
+
+    adapter = CursorAdapter("account-1")
+    service = PortfolioAggregationService(BrokerRepository([broker("b1", "First")]), lambda _broker: adapter)
+    cursor = None
+    collected = []
+    first_coverage = None
+    while True:
+        page = asyncio.run(
+            service.view_operations_scoped("b1", "account-1", limit=2, cursor=cursor, from_at=from_at, to_at=to_at)
+        )
+        collected.extend(item.operation.operation_id for item in page.items)
+        if cursor is None:
+            first_coverage = page.coverage_complete
+        if page.source_exhausted:
+            assert page.coverage_complete is False
+            break
+        cursor = page.next_cursor
+
+    assert collected == ["newer", "older"]
+    assert first_coverage is False
+    assert [call[1] for call in adapter.calls] == [None, "page-2"]
+
+
+@pytest.mark.parametrize(
+    ("next_cursor", "rows", "expected_code"),
+    [
+        ("same", (), "BROKER_OPERATIONS_INVALID_CURSOR"),
+        ("x" * 1025, (), "BROKER_OPERATIONS_INVALID_CURSOR"),
+        ("next", ("foreign",), "BROKER_OPERATIONS_SCOPE_MISMATCH"),
+    ],
+)
+def test_scoped_operations_reject_bad_source_cursor_and_cross_account_rows(next_cursor, rows, expected_code):
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    operations = tuple(
+        ExternalOperation(
+            operation_id=f"op-{index}",
+            account_id=account_id,
+            operation_type="BUY",
+            state="EXECUTED",
+            occurred_at=to_at - timedelta(seconds=index),
+            payment=None,
+            price=None,
+            quantity=Decimal("1"),
+            commission=None,
+        )
+        for index, account_id in enumerate(rows)
+    )
+
+    class InvalidAdapter(PortfolioAdapter):
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            return OperationsPage(operations, next_cursor)
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: InvalidAdapter("account-1")
+    )
+    input_cursor = "same" if next_cursor == "same" else None
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=input_cursor, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.items == ()
+    assert result.errors[0].code == expected_code
+    assert result.source_exhausted is None
+    assert result.coverage_complete is False
+    assert result.errors[0].message == "Не удалось прочитать историю операций."
+    assert result.input_cursor == input_cursor
+
+
+def test_scoped_operations_require_configured_account_before_adapter_creation():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    record = broker("b1", "First").model_copy(update={"account_id": "configured"})
+    service = PortfolioAggregationService(
+        BrokerRepository([record]),
+        lambda _broker: (_ for _ in ()).throw(AssertionError("scope mismatch must fail before SDK creation")),
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "other", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == "BROKER_ACCOUNT_SCOPE_MISMATCH"
+    assert result.items == ()
+    assert result.source_exhausted is None
+
+
+def test_scoped_operations_require_account_presence_in_selected_broker():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+
+    class ForeignAccountsAdapter(PortfolioAdapter):
+        async def list_accounts(self):
+            return (BrokerAccount("other", "Other", "OPEN", "BROKER"),)
+
+        async def get_operations(self, *_args, **_kwargs):
+            raise AssertionError("account absent from selected broker must not reach operations RPC")
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: ForeignAccountsAdapter("other")
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == "BROKER_ACCOUNT_NOT_FOUND"
+    assert result.items == ()
+    assert result.source_exhausted is None
+
+
+def test_scoped_operations_reject_disabled_broker_before_adapter_creation():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First", enabled=False)]),
+        lambda _broker: (_ for _ in ()).throw(AssertionError("disabled scope must not create an adapter")),
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == "BROKER_DISABLED"
+    assert result.items == ()
+    assert result.source_exhausted is None
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_mark_naive_source_timestamp_incomplete_and_sanitize_error():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    operation = ExternalOperation(
+        operation_id="naive-time",
+        account_id="account-1",
+        operation_type="BUY",
+        state="EXECUTED",
+        occurred_at=datetime(2026, 10, 19, 12),
+        payment=None,
+        price=None,
+        quantity=Decimal("1"),
+        commission=None,
+    )
+
+    class NaiveTimestampAdapter(PortfolioAdapter):
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            return OperationsPage((operation,), None)
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: NaiveTimestampAdapter("account-1")
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == "BROKER_OPERATIONS_INVALID_TIMESTAMP"
+    assert result.errors[0].message == "Не удалось прочитать историю операций."
+    assert result.items == ()
+    assert result.source_exhausted is None
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_filter_millisecond_boundaries_deduplicate_and_sort_stably():
+    from_at = datetime(2026, 10, 1, 0, 0, 0, 1000, tzinfo=UTC)
+    to_at = datetime(2026, 10, 1, 0, 0, 0, 4000, tzinfo=UTC)
+
+    def operation(operation_id, occurred_at):
+        return ExternalOperation(
+            operation_id=operation_id,
+            account_id="account-1",
+            operation_type="BUY",
+            state="EXECUTED",
+            occurred_at=occurred_at,
+            payment=None,
+            price=None,
+            quantity=Decimal("1"),
+            commission=None,
+        )
+
+    at_lower = operation("lower", from_at + timedelta(microseconds=999))
+    at_upper = operation("upper", to_at + timedelta(microseconds=999))
+    after_upper = operation("after-upper", to_at + timedelta(milliseconds=1))
+    same_time_z = operation("z", to_at - timedelta(microseconds=1000))
+    same_time_a = operation("a", to_at - timedelta(microseconds=1000))
+    page = OperationsPage((at_lower, same_time_z, at_upper, after_upper, same_time_a, same_time_a), None)
+
+    class BoundaryAdapter(PortfolioAdapter):
+        async def get_operations(self, account_id, cursor, limit, instrument_id=None, *, from_at=None, to_at=None):
+            return page
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: BoundaryAdapter("account-1")
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert [item.operation.operation_id for item in result.items] == ["upper", "a", "z"]
+    assert result.source_item_count == 6
+    assert result.selected_item_count == 3
+    assert result.source_exhausted is True
+    assert result.coverage_complete is True
+
+
+@pytest.mark.parametrize("invalid_page", ["oversized", "conflicting_duplicate"])
+def test_scoped_operations_reject_untrustworthy_source_pages(invalid_page):
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    operation = ExternalOperation(
+        operation_id="same",
+        account_id="account-1",
+        operation_type="BUY",
+        state="EXECUTED",
+        occurred_at=to_at - timedelta(seconds=1),
+        payment=None,
+        price=None,
+        quantity=Decimal("1"),
+        commission=None,
+    )
+    if invalid_page == "oversized":
+        items = (operation, operation.model_copy(update={"operation_id": "other"}))
+        limit = 1
+        expected_code = "BROKER_OPERATIONS_INVALID_PAGE"
+    else:
+        items = (operation, operation.model_copy(update={"quantity": Decimal("2")}))
+        limit = 2
+        expected_code = "BROKER_OPERATIONS_CONFLICTING_DUPLICATE"
+
+    class InvalidAdapter(PortfolioAdapter):
+        async def get_operations(
+            self, account_id, cursor, requested_limit, instrument_id=None, *, from_at=None, to_at=None
+        ):
+            return OperationsPage(items, None)
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]), lambda _broker: InvalidAdapter("account-1")
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=limit, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == expected_code
+    assert result.items == ()
+    assert result.source_exhausted is None
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_sanitize_adapter_error_and_do_not_read_other_scopes():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+
+    class FailedAdapter(PortfolioAdapter):
+        async def list_accounts(self):
+            raise TInvestAdapterError("BROKER_FAILURE", "secret-token leaked", retryable=False)
+
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First"), broker("b2", "Second")]),
+        lambda selected: FailedAdapter("account-1"),
+    )
+
+    result = asyncio.run(
+        service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+    )
+
+    assert result.errors[0].code == "BROKER_OPERATIONS_UNAVAILABLE"
+    assert "secret-token" not in result.errors[0].message
+    assert result.source_exhausted is None
+    assert result.coverage_complete is False
+
+
+def test_scoped_operations_reject_wrong_environment_before_adapter_creation():
+    from_at = datetime(2026, 10, 1, tzinfo=UTC)
+    to_at = datetime(2026, 10, 20, tzinfo=UTC)
+    service = PortfolioAggregationService(
+        BrokerRepository([broker("b1", "First")]),
+        lambda _broker: (_ for _ in ()).throw(AssertionError("wrong environment must fail before SDK")),
+        environment=ProdEnvironment(),
+    )
+
+    with pytest.raises(EnvironmentMismatchError, match="inactive environment"):
+        asyncio.run(
+            service.view_operations_scoped("b1", "account-1", limit=10, cursor=None, from_at=from_at, to_at=to_at)
+        )

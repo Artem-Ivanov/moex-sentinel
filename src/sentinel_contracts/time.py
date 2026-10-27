@@ -24,3 +24,12 @@ def require_utc_millisecond(value: datetime) -> datetime:
     if value.microsecond % 1000:
         raise ValueError("Timestamp precision must not exceed milliseconds.")
     return value.astimezone(UTC)
+
+
+def is_historical(occurred_at: datetime, captured_at: datetime) -> bool:
+    """Return whether a record is strictly more than 24 hours old at capture time."""
+    if any(value.tzinfo is None or value.utcoffset() is None for value in (occurred_at, captured_at)):
+        raise ValueError("Timestamps must be timezone-aware.")
+    occurred_utc = occurred_at.astimezone(UTC)
+    captured_utc = captured_at.astimezone(UTC)
+    return captured_utc > occurred_utc + timedelta(hours=24)

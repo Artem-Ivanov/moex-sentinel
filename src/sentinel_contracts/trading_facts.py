@@ -407,6 +407,35 @@ class AutomationStatus(StrictFrozenModel):
 class AutomationStatusesResult(StrictFrozenModel):
     automations: tuple[AutomationStatus, ...]
     missing_automation_ids: tuple[UUID, ...] = ()
+    commission_statuses: tuple["AutomationCommissionStatus", ...] = ()
+
+
+class AutomationCommissionStatus(StrictFrozenModel):
+    intent_id: UUID
+    automation_id: UUID
+    user_broker_id: UUID
+    currency: str
+    commission_status: Literal["KNOWN", "MISSING", "UNKNOWN"]
+    effective_broker_commission: Decimal | None = None
+
+    @model_validator(mode="after")
+    def validate_fee_projection(self) -> "AutomationCommissionStatus":
+        currency = self.currency.strip().upper()
+        if not currency or len(currency) > 8:
+            raise ValueError("Commission currency is invalid.")
+        object.__setattr__(self, "currency", currency)
+        amount = self.effective_broker_commission
+        if amount is not None:
+            if not amount.is_finite() or amount < 0 or amount >= Decimal("1e19"):
+                raise ValueError("Commission must have a finite supported amount.")
+            try:
+                if amount.quantize(Decimal("1e-9")) != amount:
+                    raise ValueError("Commission has more than 9 decimal places.")
+            except ArithmeticError as error:
+                raise ValueError("Commission is outside the supported range.") from error
+        elif self.commission_status == "KNOWN":
+            raise ValueError("Known commission must have a finite supported amount.")
+        return self
 
 
 class FactIngressErrorCode(StrEnum):

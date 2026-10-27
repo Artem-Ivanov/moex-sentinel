@@ -119,6 +119,7 @@ class TestAutomationFactReturning:
                     hold_reason=None if kind == "closed" else "accepted hold",
                     closed_at=datetime(2026, 8, 14, 12, 34, 56, 987000, tzinfo=UTC) if kind == "closed" else None,
                     revision=2,
+                    resume_requested=False,
                 )
             assert accepted == TradingAutomationDraft(**expected)
             assert accepted.updated_at > fact_value(TradingAutomationDraft).updated_at

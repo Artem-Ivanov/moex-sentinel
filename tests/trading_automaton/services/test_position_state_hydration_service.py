@@ -10,6 +10,8 @@ from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition
 from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
+from trading_automaton.domain.core_contracts import AutomationStatusesResult
+from trading_automaton.domain.storage_dtos import TradeLotRecord
 from trading_automaton.services.position_state_hydration import (
     PositionStateCacheService,
     PositionStateHydrationService,
@@ -64,6 +66,30 @@ class Repository:
 class InconsistentPositions:
     def reconcile(self, **values):
         return type("Result", (), {"consistent": False, "lots": (), "reason_code": "MISMATCH"})()
+
+
+class ConsistentLots:
+    def __init__(self, lots):
+        self.lots = lots
+
+    def reconcile(self, **values):
+        return type("Result", (), {"consistent": True, "lots": self.lots, "reason_code": None})()
+
+
+class LotRepository(Repository):
+    def __init__(self, lots):
+        self.lots = lots
+
+    def list_open_lots(self, automation_id):
+        return self.lots
+
+
+class CommissionStatuses:
+    def __init__(self, result):
+        self.result = result
+
+    def automation_statuses(self, automation_ids, commission_order_ids):
+        return self.result
 
 
 def test_hydrates_all_durable_and_market_state_before_snapshot() -> None:
@@ -121,6 +147,49 @@ def test_excludes_position_until_previous_core_snapshot_is_acknowledged() -> Non
         return await cache.get(str(command().automation_id))
 
     assert asyncio.run(scenario()) is None
+
+
+def test_confirmed_fee_overlay_is_applied_only_after_successful_reconciliation() -> None:
+    source_id = "00000000-0000-4000-8000-000000000405"
+    lot = TradeLotRecord(
+        id="lot-1",
+        automation_id=str(command().automation_id),
+        source_intent_id=source_id,
+        source="BROKER_FILL",
+        original_lots=2,
+        remaining_lots=1,
+        entry_price=Decimal("100"),
+        entry_commission=Decimal("1"),
+        opened_at=NOW,
+    )
+    status = {
+        source_id: {
+            "automation_id": str(command().automation_id),
+            "user_broker_id": str(command().user_broker_id),
+            "currency": "RUB",
+            "commission_status": "KNOWN",
+            "effective_broker_commission": Decimal("8"),
+        }
+    }
+
+    async def scenario():
+        cache = PositionStateCacheService()
+        service = PositionStateHydrationService(
+            LotRepository([lot]),
+            Portfolio(),
+            cache,
+            consistency=ConsistentLots([lot]),
+            commission_statuses=CommissionStatuses(AutomationStatusesResult({}, (), status)),
+            now=lambda: NOW,
+            prepared_metrics=PreparedMetrics(),
+        )
+        await service.hydrate((command(),))
+        return await cache.get(str(command().automation_id))
+
+    result = asyncio.run(scenario())
+
+    assert result is not None
+    assert result.lots[0].entry_commission == Decimal("4")
 
 
 def test_worker_hydration_and_planner_import_without_analytics_implementation():

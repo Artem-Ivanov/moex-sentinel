@@ -1,0 +1,36 @@
+{
+  "baseline_files": 582,
+  "changed_baseline_files": [
+    "src/sentinel_contracts/worker_diagnostics.py",
+    "src/moex_sentinel/composition.py",
+    "src/trading_automaton/composition.py",
+    "src/trading_automaton/runtime/streaming_coordinator.py",
+    "src/trading_automaton/adapters/core_client.py",
+    "src/moex_sentinel/api/app.py",
+    "src/moex_sentinel/views/internal_automaton.py",
+    "src/moex_sentinel/views/automations.py",
+    "src/moex_sentinel/views/portfolio.py",
+    "src/moex_sentinel/domain/portfolio.py",
+    "src/moex_sentinel/usecases/portfolio.py",
+    "src/moex_sentinel/services/runtime_versions.py",
+    "src/moex_sentinel/services/trading_fact_ports.py",
+    "src/moex_sentinel/services/portfolio.py",
+    "src/moex_sentinel/views/schemas/automations.py",
+    "src/moex_sentinel/views/schemas/portfolio.py",
+    "src/moex_sentinel/storage/repositories/trading_facts_uow.py",
+    "src/moex_sentinel/storage/repositories/order_facts.py",
+    "tests/api/test_runtime_versions.py",
+    "tests/api/test_internal_runtime.py",
+    "tests/services/test_runtime_versions.py",
+    "tests/services/test_portfolio_aggregation_service.py",
+    "tests/trading_automaton/adapters/test_core_client.py",
+    "docs/phase-1-implementation-plan.md"
+  ],
+  "missing_baseline_files": [],
+  "outside_assigned_baseline_files": [],
+  "author_report_hash_mismatches": [],
+  "d3_hashes_preserved": true,
+  "root_owned_document_changes": [
+    "docs/phase-1-implementation-plan.md"
+  ]
+}

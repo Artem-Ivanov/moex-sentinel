@@ -20,6 +20,7 @@ from sentinel_contracts.streaming_market import (
     StreamLastPrice,
     StreamOrderBook,
     StreamTradingStatus,
+    UnaryApiTradingStatus,
 )
 from sentinel_contracts.time import utc_now_ms
 
@@ -62,21 +63,30 @@ class MarketSourcePort(Protocol):
     async def replace_subscriptions(self, instrument_ids: set[str]) -> None: ...
     def events(self) -> AsyncIterator[MarketEvent]: ...
     async def get_candles(self, instrument_id: str, start: datetime, end: datetime) -> tuple[StreamCandle, ...]: ...
+    async def get_trading_status(self, instrument_id: str) -> bool: ...
 
 
 class _SourceRuntime:
     def __init__(
-        self, source: MarketSourcePort, now: Callable[[], datetime], recovery: MarketRecoveryPolicy, refresh: float
+        self,
+        source: MarketSourcePort,
+        now: Callable[[], datetime],
+        recovery: MarketRecoveryPolicy,
+        refresh: float,
+        trading_status_ttl: float,
     ) -> None:
         self.source = source
         self.now = now
         self.recovery = recovery
         self.refresh = refresh
+        self.trading_status_ttl = trading_status_ttl
         self.instruments: set[str] = set()
         self.states: dict[str, InstrumentMarketState] = {}
         self.candles: dict[str, dict[datetime, StreamCandle]] = {}
+        self.trading_status_pending: dict[str, asyncio.Task[bool]] = {}
         self.loaded: set[str] = set()
         self.changed = asyncio.Event()
+        self.trading_status_changed = asyncio.Event()
         self.connected = False
         self.generation = uuid4()
         self.captured_at = now()
@@ -99,6 +109,7 @@ class _SourceRuntime:
         if added := set(instruments) - self.instruments:
             self.instruments.update(added)
             self.changed.set()
+            self.trading_status_changed.set()
             self.touch()
 
     async def run(self) -> None:
@@ -112,6 +123,7 @@ class _SourceRuntime:
                 async with asyncio.TaskGroup() as tasks:
                     tasks.create_task(self.ingest())
                     tasks.create_task(self.refresh_history())
+                    tasks.create_task(self.refresh_trading_status())
                     tasks.create_task(self.watch_quiet_market())
             except asyncio.CancelledError:
                 raise
@@ -185,8 +197,8 @@ class _SourceRuntime:
             return
         if (
             not market.trading_status.limit_order_available
-            or not market.trading_status.api_trade_available
             or market.trading_status.captured_at > self.now()
+            or not market.has_fresh_api_trade_availability(self.now())
             or not valid_market_structure(market.order_book, self.candles.get(instrument_id, {}).values())
         ):
             return
@@ -202,6 +214,10 @@ class _SourceRuntime:
                 },
             )
             self.detected_at = None
+
+    def clear_trading_status_pending(self, instrument_id: str, task: asyncio.Task[bool]) -> None:
+        if self.trading_status_pending.get(instrument_id) is task:
+            self.trading_status_pending.pop(instrument_id, None)
 
     async def ingest(self) -> None:
         async for event in self.source.events():
@@ -302,6 +318,59 @@ class _SourceRuntime:
             with suppress(TimeoutError):
                 await asyncio.wait_for(self.changed.wait(), timeout=wait_seconds)
 
+    async def refresh_trading_status(self) -> None:
+        due: dict[str, datetime] = {}
+        interval = self.trading_status_ttl / 2
+        while True:
+            self.trading_status_changed.clear()
+            desired = self.instruments.copy()
+            now = self.now()
+            pending = [
+                instrument_id
+                for instrument_id in sorted(desired)
+                if instrument_id not in due or now >= due[instrument_id]
+            ]
+            for instrument_id in pending:
+                previous = self.trading_status_pending.get(instrument_id)
+                if previous is not None and not previous.done():
+                    due[instrument_id] = self.now() + timedelta(seconds=interval)
+                    continue
+                operation = asyncio.create_task(self.source.get_trading_status(instrument_id))
+                self.trading_status_pending[instrument_id] = operation
+                operation.add_done_callback(partial(self.clear_trading_status_pending, instrument_id))
+                try:
+                    available = await self.operations.run(operation, self.recovery.operation_timeout_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    due[instrument_id] = self.now() + timedelta(seconds=interval)
+                    LOGGER.warning("Market trading status unavailable", extra={"data": _failure_data(error)})
+                    continue
+                observed_at = self.now()
+                status = UnaryApiTradingStatus(
+                    api_trade_available=available,
+                    observed_at=observed_at,
+                    expires_at=observed_at + timedelta(seconds=self.trading_status_ttl),
+                )
+                current = self.states.get(instrument_id, InstrumentMarketState(instrument_id))
+                updated = current.model_copy(update={"api_trading_status": status})
+                if updated != current:
+                    self.states[instrument_id] = updated
+                    self.touch()
+                    self.observe_progress(instrument_id)
+                due[instrument_id] = observed_at + timedelta(seconds=interval)
+            now = self.now()
+            wait_seconds = min(
+                (
+                    max(0.001, (deadline - now).total_seconds())
+                    for instrument_id, deadline in due.items()
+                    if instrument_id in desired
+                ),
+                default=interval,
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.trading_status_changed.wait(), timeout=wait_seconds)
+
     def snapshot(self, instruments: tuple[str, ...]) -> MarketSourceSnapshot:
         values = []
         for instrument_id in instruments:
@@ -311,6 +380,8 @@ class _SourceRuntime:
                 and instrument_id in self.loaded
                 and market.order_book is not None
                 and market.trading_status is not None
+                and market.trading_status.limit_order_available
+                and market.has_fresh_api_trade_availability(self.now())
             )
             values.append(
                 MarketSourceInstrument(
@@ -351,6 +422,7 @@ class MarketSnapshotGateway:
         retry_seconds: float = 1.0,
         retry_limit: int = 5,
         refresh_seconds: float = 60.0,
+        trading_status_ttl_seconds: float = 30.0,
         recovery: MarketRecoveryPolicy | None = None,
     ) -> None:
         self._source_factory = source_factory
@@ -359,6 +431,7 @@ class MarketSnapshotGateway:
         self._now = now
         self._recovery = recovery or MarketRecoveryPolicy(retry_seconds=retry_seconds, retry_limit=retry_limit)
         self._refresh = refresh_seconds
+        self._trading_status_ttl = trading_status_ttl_seconds
         self._sources: dict[UUID, _SourceRuntime] = {}
         self._lock = asyncio.Lock()
 
@@ -386,7 +459,7 @@ class MarketSnapshotGateway:
                 runtime = None
             if runtime is None:
                 source = await run_sync(partial(self._source_factory, configuration), fallback=asyncio.to_thread)
-                runtime = _SourceRuntime(source, self._now, self._recovery, self._refresh)
+                runtime = _SourceRuntime(source, self._now, self._recovery, self._refresh, self._trading_status_ttl)
                 self._sources[request.source_id] = runtime
                 self._configurations[request.source_id] = configuration
             runtime.add(request.instrument_ids)

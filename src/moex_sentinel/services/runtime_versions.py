@@ -1,18 +1,40 @@
 """One bounded, thread-safe Worker observation belonging to this Core runtime."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
 from time import monotonic
+from typing import Literal
+from uuid import UUID
 
 from sentinel_contracts.runtime_versions import RuntimeVersion, VersionObservation
 from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
 from sentinel_contracts.tinvest import BrokerAccessMode, BrokerEnvironment
-from sentinel_contracts.worker_diagnostics import OutboxObservation, WorkerDiagnostics, WorkerObservation
+from sentinel_contracts.worker_diagnostics import (
+    BrokerRuntimeDiagnostics,
+    OutboxObservation,
+    WorkerAutomationExecutionDiagnostics,
+    WorkerDiagnostics,
+    WorkerExecutionDiagnostics,
+    WorkerObservation,
+)
 
 
 def _timestamp(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class ScopedWorkerExecutionObservation:
+    observation: Literal["OBSERVED", "UNKNOWN"]
+    reason: str
+    broker_id: UUID | None = None
+    captured_at: datetime | None = None
+    received_at: str | None = None
+    source_runtime_instance_id: UUID | None = None
+    source_generation: int | None = None
+    row: WorkerAutomationExecutionDiagnostics | None = None
 
 
 class WorkerVersionStore:
@@ -36,18 +58,46 @@ class WorkerVersionStore:
         self._diagnostics: WorkerDiagnostics | None = None
         self._diagnostics_received_at: str | None = None
         self._diagnostics_monotonic = 0.0
+        self._execution_projection: WorkerExecutionDiagnostics | None = None
+        self._execution_runtime_instance_id: UUID | None = None
+        self._execution_generation: int | None = None
+        self._execution_broker_id: UUID | None = None
+        self._execution_received_at: str | None = None
+        self._execution_received_monotonic = 0.0
         self._completion_age_ms: int | None = None
         self._completion_monotonic = 0.0
         self._oldest_pending_age_ms: int | None = None
         self._oldest_pending_monotonic = 0.0
 
     def observe(
-        self, metadata: RuntimeVersion, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None
+        self,
+        metadata: RuntimeVersion,
+        occurred_at: datetime,
+        diagnostics: WorkerDiagnostics | None = None,
+        *,
+        source_runtime_instance_id: UUID | None = None,
+        source_generation: int | None = None,
+        source_broker_id: UUID | None = None,
     ) -> None:
         if metadata.environment != self._environment or metadata.access_mode != self._access_mode:
             return
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             return
+        execution = None if diagnostics is None else diagnostics.execution_diagnostics
+        if execution is not None and (
+            source_runtime_instance_id is not None
+            and (
+                source_runtime_instance_id != metadata.instance_id
+                or source_generation is None
+                or source_generation <= 0
+                or source_broker_id is None
+                or (execution.broker_id is not None and execution.broker_id != source_broker_id)
+            )
+        ):
+            return
+        if execution is not None and source_runtime_instance_id is None and execution.observation == "OBSERVED":
+            execution = WorkerExecutionDiagnostics(reason="UNAUTHENTICATED_SOURCE")
+            diagnostics = diagnostics.model_copy(update={"execution_diagnostics": execution})
         timestamp = floor_utc_millisecond(occurred_at)
         with self._lock:
             now = floor_utc_millisecond(self._clock())
@@ -66,6 +116,12 @@ class WorkerVersionStore:
                 self._diagnostics_received_at = None
                 self._completion_age_ms = None
                 self._oldest_pending_age_ms = None
+                self._execution_projection = None
+                self._execution_runtime_instance_id = None
+                self._execution_generation = None
+                self._execution_broker_id = None
+                self._execution_received_at = None
+                self._execution_received_monotonic = 0.0
             if diagnostics is not None:
                 if previous is None or diagnostics.last_completed_at != previous.last_completed_at:
                     self._completion_age_ms = self._source_age(now, diagnostics.last_completed_at)
@@ -76,6 +132,12 @@ class WorkerVersionStore:
                 self._diagnostics = diagnostics
                 self._diagnostics_received_at = _timestamp(now)
                 self._diagnostics_monotonic = tick
+                self._execution_projection = execution
+                self._execution_runtime_instance_id = source_runtime_instance_id
+                self._execution_generation = source_generation
+                self._execution_broker_id = source_broker_id
+                self._execution_received_at = _timestamp(now) if execution is not None else None
+                self._execution_received_monotonic = tick if execution is not None else 0.0
             self._version = metadata
             self._occurred_at = timestamp
             self._received_at = _timestamp(now)
@@ -86,10 +148,29 @@ class WorkerVersionStore:
         return None if value is None else max(0, int((now - value).total_seconds() * 1000))
 
     @staticmethod
-    def _valid_progress(value: WorkerDiagnostics, previous: WorkerDiagnostics | None, heartbeat: datetime) -> bool:
+    def _valid_progress(
+        value: WorkerDiagnostics,
+        previous: WorkerDiagnostics | None,
+        heartbeat: datetime,
+    ) -> bool:
         if value.last_finished_at > heartbeat:
             return False
         if value.outbox.oldest_pending_at is not None and value.outbox.oldest_pending_at > heartbeat:
+            return False
+        if (
+            value.command_sync is not None
+            and value.command_sync.captured_at is not None
+            and value.command_sync.captured_at > heartbeat
+        ):
+            return False
+        if any(
+            timestamp is not None and timestamp > heartbeat
+            for timestamp in (
+                value.broker_runtime.last_started_at,
+                value.broker_runtime.last_finished_at,
+                value.broker_runtime.last_success_at,
+            )
+        ):
             return False
         if previous is None:
             return True
@@ -114,6 +195,113 @@ class WorkerVersionStore:
             tick = self._monotonic()
             return self._version_snapshot(tick), self._worker_snapshot(tick)
 
+    def execution_snapshot(
+        self,
+        *,
+        broker_id: UUID,
+        automation_id: UUID,
+        account_id: str,
+        instrument_id: str,
+        fact_instrument_id: UUID,
+        lot_size: int,
+        owner_runtime_instance_id: UUID | None,
+        owner_generation: int | None,
+    ) -> ScopedWorkerExecutionObservation:
+        with self._lock:
+            projection = self._execution_projection
+            source_runtime = self._execution_runtime_instance_id
+            source_generation = self._execution_generation
+            source_broker = self._execution_broker_id
+            received_at = self._execution_received_at
+            if projection is None:
+                return ScopedWorkerExecutionObservation("UNKNOWN", "NOT_OBSERVED", broker_id=broker_id)
+            if projection.reason == "UNAUTHENTICATED_SOURCE":
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    "UNAUTHENTICATED_SOURCE",
+                    broker_id=broker_id,
+                    captured_at=projection.captured_at,
+                    received_at=received_at,
+                )
+            if (
+                owner_runtime_instance_id is None
+                or owner_generation is None
+                or source_runtime != owner_runtime_instance_id
+                or source_generation != owner_generation
+            ):
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    "OWNER_CHANGED",
+                    broker_id=broker_id,
+                    captured_at=projection.captured_at,
+                    received_at=received_at,
+                    source_runtime_instance_id=source_runtime,
+                    source_generation=source_generation,
+                )
+            if source_broker != broker_id or projection.broker_id not in {None, broker_id}:
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    "INVALID_PROJECTION",
+                    broker_id=broker_id,
+                    received_at=received_at,
+                    source_runtime_instance_id=source_runtime,
+                    source_generation=source_generation,
+                )
+            if projection.observation == "UNKNOWN":
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    projection.reason,
+                    broker_id=broker_id,
+                    received_at=received_at,
+                    source_runtime_instance_id=source_runtime,
+                    source_generation=source_generation,
+                )
+            now = floor_utc_millisecond(self._clock())
+            age_ms = (now - projection.captured_at).total_seconds() * 1000
+            receipt_age_ms = (self._monotonic() - self._execution_received_monotonic) * 1000
+            if age_ms < -5000 or age_ms >= 30_000 or receipt_age_ms >= 30_000:
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    "STALE",
+                    broker_id=broker_id,
+                    captured_at=projection.captured_at,
+                    received_at=received_at,
+                    source_runtime_instance_id=source_runtime,
+                    source_generation=source_generation,
+                )
+            row = next(
+                (
+                    item
+                    for item in projection.rows
+                    if item.automation_id == automation_id
+                    and item.account_id == account_id
+                    and item.external_instrument_id == instrument_id
+                    and item.fact_instrument_id == fact_instrument_id
+                    and item.lot_size == lot_size
+                ),
+                None,
+            )
+            if row is None:
+                return ScopedWorkerExecutionObservation(
+                    "UNKNOWN",
+                    "INVALID_PROJECTION",
+                    broker_id=broker_id,
+                    captured_at=projection.captured_at,
+                    received_at=received_at,
+                    source_runtime_instance_id=source_runtime,
+                    source_generation=source_generation,
+                )
+            return ScopedWorkerExecutionObservation(
+                "OBSERVED",
+                "OBSERVED",
+                broker_id=broker_id,
+                captured_at=projection.captured_at,
+                received_at=received_at,
+                source_runtime_instance_id=source_runtime,
+                source_generation=source_generation,
+                row=row,
+            )
+
     def _version_snapshot(self, tick: float) -> VersionObservation:
         if self._version is None:
             return VersionObservation(reason="NOT_OBSERVED")
@@ -137,6 +325,7 @@ class WorkerVersionStore:
                 received_at=self._diagnostics_received_at,
                 age_ms=age_ms,
                 outbox=OutboxObservation(reason="STALE"),
+                broker_runtime=BrokerRuntimeDiagnostics(reason="STALE"),
             )
         completion_age = self._anchored_age(self._completion_age_ms, self._completion_monotonic, tick)
         if value.last_result == "ERROR":
@@ -147,9 +336,14 @@ class WorkerVersionStore:
             reason = "CONTROL_STALLED"
         else:
             reason = "CONTROL_PROGRESS"
+        command_sync = value.command_sync
+        if command_sync is not None and command_sync.captured_at is not None:
+            projection_age = (floor_utc_millisecond(self._clock()) - command_sync.captured_at).total_seconds() * 1000
+            if projection_age < -5000 or projection_age >= 30_000:
+                command_sync = None
         return WorkerObservation(
             observation="OBSERVED",
-            status="OK" if reason == "CONTROL_PROGRESS" else "DEGRADED",
+            status=("OK" if reason == "CONTROL_PROGRESS" and value.broker_runtime.status != "BLOCKED" else "DEGRADED"),
             reason=reason,
             instance_id=self._version.instance_id if self._version else None,
             received_at=self._diagnostics_received_at,
@@ -161,6 +355,8 @@ class WorkerVersionStore:
             last_result=value.last_result,
             error_code=value.error_code,
             outbox=self._outbox_snapshot(value, tick),
+            broker_runtime=value.broker_runtime,
+            command_sync=command_sync,
         )
 
     @staticmethod

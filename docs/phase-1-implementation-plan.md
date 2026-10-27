@@ -1,12 +1,285 @@
 # Актуальный план развития
 
-Актуализировано 2026-10-16: добавлена локальная веха допуска торговли через IN_WORK.
-Это единственный индекс текущей очереди. [Фаза 0](phase-0-trading-service-refactor.md)
-содержит завершённый baseline; [пунктовый аудит](milestone-audit.md)
-объясняет судьбу каждого прежнего требования. Предыдущая версия этого файла — `phase-1-implementation-plan-archive-2026-09-09.md` (необязательный локальный архив)
-сохранена как история приёмок, а не инструкция к повторному выполнению.
+## Активная веха27.10.2026: поздние комиссии и D1
 
-## Дополнение 16.10.2026: торговля по IN_WORK без ручного допуска — LOCAL DONE, NOT DEPLOYED
+Пользователь поручил реализовать оставшиеся F1/F2 и выделить отдельного агента мониторинга. [Контракт](superpowers/specs/2026-10-27-execution-commissions.md) и [план реализации](superpowers/plans/2026-10-27-fees-diagnostics.md) сверены с текущими callers и свежими read-only данными. F1 в реализации: отдельный additive учёт EXECUTED BROKER_FEE по exact parent/order/account, без изменения исходных исполнений. F2 локально готово:19testsPASS, independent C0/I0/M0; runtime ещё не обновлён. Синтетические100auto/50k истории по-прежнему могут исчерпать100ms, предел не скрыт.
+
+Выделенный trade_monitor_20261027 анализирует свежие root-collected snapshots без торговых команд. Срез27Oct07:57UTC: owner11 жив, оба IN_WORK, Core/broker GOLD284/SIBN1 совпадают, outbox fresh3/failed0, допуск открыт. Новые исполнения в текущем окне пока не подтверждены; D1 runtime UNKNOWN/BUDGET_EXCEEDED. Исторические результаты26Oct ниже не являются текущей диагностикой.
+
+## Активная веха26.10.2026: восстановление торговли и правило24часов
+
+Пользователь разрешил командную реализацию, проверку и deployment. Новая политика: временные записи старше24часов исторические; незавершённые заявки — административно FAILED. Подтверждённые исполнения, открытые лоты, история и идемпотентность сохраняются. Предыдущий запрет возрастной классификации D2 заменён этим решением; NOT_FOUND по-прежнему не доказывает неисполнение.
+
+Очередь текущей вехи: R1 — возрастная классификация и recovery без повторного submit; R2 — завершение возрастного резерва через свежую сверку и условное восстановление только системного HOLD; R3 — историчность в диагностике, регрессии и независимое review; R4 — адресный rollout и свежая диагностика. Контракт и DoD: [правило24часов](superpowers/specs/2026-10-26-order-history-24h.md). История20Oct ниже не подтверждает текущий runtime.
+
+Локальный план: `develop/.planning/2026-10-26-order-history-24h/task_plan.md`; evidence: `develop/reports/trading-recovery-24h-20261026/`.
+
+Статус26Oct: R1–R4 реализованы, прошли независимое кросс-ревью C0/I0 и выложены в PROD. Root verification:2967 backend PASS +исправленный отдельный PROD pipeline1PASS,2pg_dump SKIP;56ops/collectorPASS/Ruff/diffcheckPASS. Owner10→11, heartbeat/lease renewal подтверждены. Свежий срез15:53:31UTC: GOLD/SIBN IN_WORK11, outbox0, effective_can_submit=true/recovery_only=false, база26Oct. Три новых FILLED/execution: SIBN BUY1/SELL1 и GOLD SELL18. Старый GOLD80e… FAILED/historical, AGE_POLICY SETTLED0/unknowntrue; старый SIBN CANCELLED/historical. [Локальный отчёт](../develop/reports/trading-recovery-24h-20261026/report.md).
+
+Оставшиеся отдельные задачи после восстановления:
+- F1 — идемпотентный учёт поздних брокерских комиссий. В наблюдённом окне broker fees3.58₽ полностью объясняют остаток5045.34₽, но Core execution fees0. Не считать TAKE_PROFIT доказательством прибыли. DoD: delayed/replay fees, nested commission и BROKER_FEE без двойного учёта, проверка финансовых totals/PnL на isolated DB и независимое review. Торговлю сейчас не блокирует; новой политикой24h не исправлялось.
+- F2 — профиль Worker D1 UNKNOWN/BUDGET_EXCEEDED и адресное ускорение запроса в существующем100ms бюджете; heartbeat/command_sync/outbox и новые исполнения наблюдаются. Не увеличивать бюджет без измерений.
+
+Новый GOLD7713… FILLED имеет текущий IN_FLIGHT reserve до следующего permit; это не старый возрастной резерв. Будущий host restart с новым runtime ID всё ещё может потребовать controlled ownership recovery; auto takeover по одному lease expiry не добавлялся.
+
+
+Актуализировано 2026-10-20, срез23:23–23:25МСК: PROD Core/Worker обновлены,
+health и heartbeat/renewal проверены, owner generation10/revision515.
+D1 и D3 работают на VPS. GOLD остаётся UNCERTAIN с резервом18лотов;
+SIBN локально завершён CANCELLED без активного intent/резерва. Оба автомата
+HOLD9, торговля не возобновилась. Общий effective допуск открыт, ENV/лимиты
+сохранены. Первоначальная причина неизвестного результата GOLD не доказана.
+
+## PROD deployment и диагностика20.10.2026
+
+Пользователь отдельно разрешил Core/Worker deployment и bounded read-only
+диагностику без ручного снятия HOLD/резерва. Выполнены rollout8→9 и дополнительный
+Worker-only patch9→10 через существующий controlled owner-stopped CAS.
+Core при втором обновлении не пересоздавался; TEST, остальные сервисы,
+рабочие volumes и финансовая история сохранены.
+
+- **D1 — DEPLOYED / runtime checked.** Получены свежие scoped Worker OBSERVED
+  и Core facts, выполнены focused GET по действительно наблюдённым UUID.
+  Обнаружен и исправлен raw SQLite REAL → Decimal9 mismatch чтения комиссий;
+  result types соответствуют ORM Numeric(28,9). Root reader/budget18PASS,
+  итоговые ops56PASS, независимые exact-byte reviews C0/I0/M0.
+- **D3 — DEPLOYED / runtime checked.** Полный scoped интервал16–20Oct прочитан
+  с initial/exhausted/coverage_complete=true/errors0: операций0. Это не вывод
+  обо всей истории счёта.
+- **D2 — частичная диагностика, восстановление не завершено.** GOLD:
+  совпавший Worker/Core request, SELL18, нет broker response/external ID/terminal,
+  резерв IN_FLIGHT. Exact request-ID GetOrderState с VPS ответил50005/NOT_FOUND
+  при успешном GetAccounts; этот ответ не доказывает отсутствие исполнения.
+  SIBN: согласованные Worker/Core CANCELLED и terminal, активного intent и
+  резерва нет, но pre-RPC proof текущий D1 не выдаёт. Resume не отправлялся.
+
+Локальные evidence/report/tasks: `develop/reports/execution-diagnostics-prod-20261020/`.
+Нужны terminal/provenance evidence GOLD и проверка источника отмены SIBN;
+финансовое восстановление и ручной Resume не входили в последнее разрешение.
+Одноразовые ops helpers повторно не запускать: immutable image IDs/pins
+проверяются перед каждой отдельной выкладкой. Итоговый evidence review фиксируется
+в `final-audit-review.md` указанного каталога.
+
+## Реализация задач аудита20.10.2026 — локальная фаза до deployment
+
+Пользователь поручил реализацию всех трёх задач с сабагентами. План и контракты:
+[execution diagnostics and history](superpowers/plans/2026-10-20-execution-diagnostics-and-history.md).
+
+- **D1 — локально готово и независимо принято.** Optional Worker projection
+  через отдельное ограниченное read-only SQLite-соединение, внутренний capability
+  marker и authenticated `GET /api/trading-automations/{id}/execution-diagnostics`.
+  Выдаются scoped intent/order/execution/reservation и точные Core acceptance
+  envelopes; stale/unknown и отсутствие подтверждения Worker ACK явны. Старые
+  публичные ответы совместимы. Все замечания двух независимых рецензентов
+  закрыты, итог C0/I0/M0. Полнота ответа и отказ при подмене identity проверены.
+- **D3 — локально готово и независимо принято.** Новый `GET /api/operations/scoped`
+  читает одну страницу выбранного broker/account за заданный UTC-интервал,
+  сохраняет cursor и все подходящие операции, сообщает полноту. Продолжения
+  обходит клиент; старый агрегирующий endpoint и UI сохранены.
+- **D2 — процедура готова, причина и исправление остаются открытыми.**
+  [Runbook](deployment/uncertain-order-investigation.md) сверён с реальными
+  JSON-полями и цепочкой execution business ID → Core execution → envelope ID,
+  принят независимым рецензентом. Он не заменяет фактическую корреляцию двух
+  боевых intent после отдельно разрешённого deployment D1 и не разрешает
+  снятие HOLD, очистку резерва или повторный submit.
+
+Общий backend прогон: 2899 passed, два restore-теста пропущены без `pg_dump`;
+единственная setup error — существующий fixture требует отдельное имя БД.
+Этот же PROD pipeline отдельно прошёл на требуемой временной БД (1 passed).
+Финансовый сценарий использует поддельный SDK. После последних малых правок
+targeted API/storage/auth/PostgreSQL проверки дали 31 passed и повторный review
+C0/I0/M0; полный прогон относится к feature freeze до этих уточнений.
+В этой локальной фазе SSH/deployment/торговые действия не выполнялись.
+Отдельно разрешённый последующий deployment описан выше. Runtime ниже —
+исторический аудит до нового кода.
+
+## Дополнение 20.10.2026: приложение доступно, торговля заблокирована UNCERTAIN
+
+Применён `develop/skills/moex-trading-audit/SKILL.md`. Read-only SSH, supported
+API и bounded allowlist logs; рабочие SQL/SQLite не читались, состояния автоматов,
+настройки, заявки и сервисы не менялись. Core/Analytics/frontend healthy,
+Worker running, restart0. Публичные index/JS/CSS отвечают200; HTTP-проверка с
+`curl --insecure` не подтверждает доверие сертификату, browser UI не проверялся.
+
+26 GET в17:35:07–17UTC и17:37:28–34UTC успешны. Actual PROD/TRADE/strategy=true;
+effective admission=true, ownergen8/rev513, lease обновляется. База20Oct
+принята06:13:59UTC (09:13:59МСК), equity5051.38RUB. Сохранённые лимиты:
+заявка5001.1RUB, экспозиция5051.94RUB ACCOUNT_GROSS, одновременно1,
+дневной убыток252.5970RUB. Исторические DISARMED/recovery_only и сверка16Oct
+не являются текущим запретом отправки или свежим списком брокерских заявок.
+
+Оба найденных автомата HOLD9/active UNCERTAIN/no terminal, persisted reason
+`Uncertain broker intent could not be reconciled unambiguously`. Последние
+принятые решения WAIT/ACTIVE_INTENT относятся к19Oct10:33:33/37МСК и не
+подтверждают сегодняшний такт. Broker/Core GOLD18лотов совпадают; SIBN Core0,
+брокерская строка отсутствует; Worker ledger/provenance не проверялся.
+Iterations175902→176039, outbox0pending/0failed, sequence продвигается — это
+работа control/recovery, не доказательство исполнения заявки.
+
+В returned operations401запись(limit500), последняя08Sep, записей20Octнет;
+полнота истории неизвестна. Current service запрашивает1page, фильтрует и теряет
+next_cursor. Последний bounded Worker log срез содержит SDK NOT_FOUND;
+исходные intent/request/submit/fill/ACK ещё не коррелированы. Два наблюдённых
+Analytics warning завершились recovery через280/439ms; устойчивый отказ
+Analytics и причинная связь с HOLD не доказаны. NO_DECISION_FRAME приHOLD и
+Core versions.analytics NOT_CONFIGURED не равны падению Analytics. Логи усечены.
+
+Ближайшая очередь, без новых ручных торговых допусков:
+
+1. **P1 — scoped read-only диагностика исходных intent.** Показать по каждому
+   автомату process/request/broker order ID, времена и исход submit, executions,
+   terminal proof, sequence/ACK; неизвестное помечать явно. Worker публикует свою
+   проекцию, Core сохраняет границы scope. Приёмка: два текущих intent можно
+   однозначно проследить; тесты cross-scope/redaction/лимитов/unknown на изолированном
+   стенде. Существующие APIs этих данных не дают — это доказанный пробел.
+2. **P1, после диагностики — исправить установленную причину и безопасно
+   восстановить цикл.** Выбор исправления зависит от доказанного исхода двух
+   заявок. Сохранять intent/резерв до terminal proof, не повторять submit при
+   NOT_FOUND и не очищать UNCERTAIN вручную. Приёмка: isolated lost ACK, partial
+   fills, unknown/NOT_FOUND и replay; ровно одно применение исполнения и корректный
+   Core ACK. Request-only lookup закреплён контрактом/тестом: broker-ID fallback
+   сам по себе не считается доказанным исправлением.
+3. **P2 — проверяемая история операций за интервал.** Поддержать bounded date/cursor
+   чтение и completeness/truncation metadata, используя имеющиеся возможности
+   адаптера и snapshot collector. Приёмка: несколько страниц, фильтр денежных
+   операций, порядок/дедупликация, границы UTC/МСК и ошибки источников; нельзя
+   заявлять полноту по числу строк меньше limit.
+
+Локальные report/tasks/evidence: `develop/reports/application-audit-20261020/`.
+Collector/report author `audit_collector_author_20261020`, read-only архитектор
+`audit_architect_20261020`; итоговая независимая проверка `audit_review_20261020`
+фиксируется в final-review.md. Анализ не является разрешением на live recovery
+или deployment и не подтверждает новую торговлю.
+
+## Дополнение 19.10.2026: свежий статус торговли — HOLD / UNCERTAIN
+
+Применён сохранённый `develop/skills/moex-trading-audit/SKILL.md`. Supported API
+07:47UTC: effective_can_submit=true/denial reasons[], ownergen8/rev512,
+lease штатно обновляется. База19.10 принята09:18:46МСК, equity5051.92RUB;
+лимиты5001.1/5051.94/1/252.5970RUB сохранены. База и общий допуск не блокируют
+новые заявки; recovery_only остаётся provenance, ручной ARM не требуется.
+
+SIBN и GOLD теперь **HOLD9 / active UNCERTAIN без terminal proof**. Persisted
+причина обоих: Uncertain broker intent could not be reconciled unambiguously.
+Последние принятые Core решения10:33:33/37МСК — WAIT/ACTIVE_INTENT; на момент
+чтения их возраст около14минут, это не текущий tick. Вчерашнее IN_WORK/ожидание
+buy-window — история. Worker control и broker runtime продвигаются; outbox
+4pending/возраст1сек/retries0/failed0 не доказывает зависание. В ограниченных
+Worker логах повторяется BROKER_ORDER_NOT_FOUND/NOT_FOUND, но исходные заявки
+с этими строками ещё не коррелированы. Причина появления UNCERTAIN не доказана.
+
+Broker/Core GOLD18лотов совпали; SIBN брокерская строка отсутствует, Core0.
+Worker lot ledger/provenance не проверялись. Операций19.10 в полученных84строках
+API нет, последняя возвращённая08.09; полнота финансовой истории не заявляется.
+Core unresolved1 и Worker UNCERTAIN2 — разные сущности. Outstanding0 получен
+из historical reconciliation16Oct и не является свежим брокерским доказательством.
+
+Только диагностика, без SQL/SQLite/Resume/clear/repost/изменения ENV/deploy.
+Задачи: установить цепочку исходных intent/request→broker result→fills→fact/ACK
+по каждому автомату; исправлять только доказанный дефект на изолированном стенде,
+до terminal proof сохранять intent/резервы. При нехватке supported данных —
+минимальная scoped диагностика, без новых торговых допусков. Локальные отчёт,
+задачи и evidence: `develop/reports/trading-status-20261019/`. Collector author
+command_sync_author; независимый reviewer trading_resume_review закрыл I1–I3,
+collector и финальная сверка evidence/docs C0/I0/M0, receipt final-review.md.
+
+Дополнительная read-only проверка API с VPS19.10, результат11:03МСК:
+PROD endpoint корректный, DNS/TCP443 доступны; SDK1.49.3 с собственным CA
+проходит проверенный TLSv1.3, GetAccounts55ms и GetPortfolio45ms успешны.
+Настроенный счёт найден, reported access_levelFULL_ACCESS. Стандартный CA store
+хоста/контейнера не доверяет НУЦ цепочке(code19); SDK использует bundledCA,
+поэтому эта hostTLSошибка не объясняет текущие ответы брокера. ICMP не отвечает,
+но API по gRPC работает. Source hashes двух actualWorker lookup-модулей совпали.
+Безопасные структурные логи уточнили реальный RPC: GetOrderState/NOT_FOUND/50005.
+Recovery корректно использует REQUESTID, но не пробует известный exchangeID;
+это ограничение, не доказанная причина двух intent. По документации брокера
+метод может не видеть поручения старше суток. Возраст/исходныеID/submitрезультат
+этих intent ещё не коррелированы. Полный доступ в GetAccounts не подтверждает
+принятие торговой заявки. Отчёт/evidence:
+`develop/reports/broker-not-found-20261019/report.md`. Runtime/заявки не менялись.
+
+## Дополнение 17–18.10.2026: полнота PROD — DEPLOYED / TECHNICAL ACCEPTANCE PASS
+
+Продолжение 18.10 — **PROD runtime restored / decision API deployed**.
+На22:38МСК поддержанные postchecks подтверждают Core
+`decision-reasons-f7601c66362b`/imagee11 и прежний Worker1d426/image9d32 без
+перезапуска при этом обновлении. Public release link остаётся dd5. Ownergen8/
+revision511, lease штатно продлевается, effective=true/denial reasons пусты.
+Лимиты5001.1/5051.94/1/252.5970RUB ACCOUNT_GROSS, ENV, база и volume сохранены.
+SIBN после одного штатного Resume находится IN_WORK/rev5/grouped; новые события
+поступают. GOLD HOLD6/active UNCERTAIN не снимался; brokerGetOrderStateNOT_FOUND50005
+не позволяет вручную считать историческую заявку закрытой.
+
+A+B исправления Core работают: реальный Worker получает HTTP200 вместо422 при
+чтении исходного submit attempt, persisted hold_reason показывает причину HOLD.
+Добавлен bounded operator GET последних уже принятых Core решений:
+`/api/trading-automations/{id}/decision-reasons?limit=5` (max20). Только scoped
+broker/automation/stage STRATEGY_DECISION_MADE, latest поoccurred_at/event_id,
+наружу только event/time/nullable decision/reason и captured_at. Malformed latest
+не скрывается. Пакет меняет семь файлов Core; Worker/стратегия/ENV/DDL не меняются.
+
+Фактическое событие SIBN22:32:05МСК — **WAIT / BUY_WINDOW_UNCONFIRMED**.
+Стратегия ожидает подтверждённое окно покупки. Этот код объединяет отсутствие
+индикаторов и непрошедшую проверку buy_window_confirmed; сам по себе не доказывает
+закрытие рынка, конкретный пропуск свечей или недостаток средств. Exact Analytics
+window исторического решения операторский API пока не возвращает. Заявку не
+форсировали; исполнение новой сделки не входит в подтверждённый результат.
+
+ONECore-only rollout выполнен. Его6-секундный lease-postcheck завершился
+CORE_HEALTHY_LEASE_UNAVAILABLE, поэтому PASS самого helper не заявляется.
+Отдельные наблюдения22:31 и22:38МСК подтвердили тот же owner, продление lease,
+здоровый Core, сохранение Worker/caps и продвижение обычного цикла. UIHTTP200.
+Независимое source/OPS/bindings/integration review trading_resume_review:
+C0/I0/M0; peer adapter review command_sync_author закрыл lowercaseDockerabsence.
+Root96целевых/связанных sourceтестов и19OPSтестов PASS, Black/Ruff PASS.
+
+Планы до декомпозиции находятся в
+`develop/.planning/2026-10-18-prod-trading-resume/`: decision-reasons-milestone.md,
+decision-reasons-ops-milestone.md; предыдущие handoff/Resume receipts не повторять.
+Итоговые локальные доказательства:
+`develop/reports/prod-decision-reasons-20261018/acceptance.json`, runtime-final.json,
+live-decision-reasons.json, rollout-observation-02.json, image-hash-probe.json.
+Техническая веха завершена; историческая неопределённость GOLD и ожидание условий
+стратегии остаются явными границами торговой приёмки.
+
+Пользователь подтвердил сохранять настоящий TEST/Sandbox и mocks в tests,
+исправлять только реальные PROD-пробелы и выпустить исправленный результат.
+Независимый статический [аудит](audits/prod-completeness-20261017.md) выявил
+недостаточную контурную изоляцию части operator admission API, неиспользуемый
+order TTL/cancel, скрытый permanent Worker block, неподтверждённый API trade
+flag и ограниченные gaps alerts/Analytics-to-PROD integration coverage.
+Подмен PROD RPC на Sandbox в просмотренной композиции не обнаружено.
+
+Согласован дизайн TTL: отменять остаток после исходного durable deadline,
+учитывать реальные fills, удерживать active intent/резерв до terminal proof
+и атомарной финализации; UNKNOWN сохраняет HOLD/UNCERTAIN без повторного post.
+Обычный подтверждённый cancel не вводит ручной HOLD; следующий fresh strategy
+intent проходит новый permit и общие лимиты. Lifecycle никогда не делает Resume.
+Письменная [спецификация](superpowers/specs/2026-10-17-prod-completeness-design.md)
+принята поручением пользователя18.10 приступить к реализации и затем к деплою.
+По независимо проверенному [плану](superpowers/plans/2026-10-18-prod-completeness.md)
+реализованы Core isolation/unary availability, Worker TTL/cancel/recovery,
+diagnostics/alerts/UI и полный production-composition happy path. Общий прогон
+также выявил и закрыл дефект ACCOUNT anchor rotation/закрытого UID; финансовая
+история и idempotency сохранены. Independent source/integration/financial и
+deployment review завершились C0/I0/M0.
+
+18.10 в 09:02:08 UTC выполнен rollout `vps-20261018-prod-437cc0757b90`: четыре
+image Core/Worker/Analytics/UI, clean stop прежнего Worker и единственная
+передача owner на generation 6. Health/ping и UI index/assets прошли; Chrome
+подтвердил отображение страницы входа. Схема исходников осталась на 0007,
+DDL/приватный ENV/численные caps/volumes не менялись, команды HOLD/Resume не отправлялись.
+Root Python: 2804 PASS, 2 SKIP только rehearsal восстановления без pg_dump;
+frontend: 259 PASS, typecheck/build PASS; Ruff/Black PASS.
+
+Это техническая приёмка deployment. При передаче owner limits=null и новые
+заявки не разрешены; для запуска нужны четыре общих лимита. Реальные исполнения
+и свежий exact intent не проверялись. Историческая UNCERTAIN 17.10 помечена
+HISTORICAL_NOT_RECHECKED. Дополнительный post-rollout bundle не получен из-за
+транспортных сбоев SSH; валидный acceptance receipt, публичный health и rendered
+UI доступны. Подробности и границы — в [runbook](deployment/prod-trading-start.md).
+
+## Дополнение 16.10.2026: торговля по IN_WORK без ручного допуска — INCLUDED IN PROD RELEASE 18.10
 
 По прямому решению пользователя отдельные ручные допуски убираются: для новой
 заявки достаточно включённого режима торговли, автомата `IN_WORK`, биржевых и
@@ -23,9 +296,10 @@ READ_ONLY и отключённая стратегия продолжают бл
 Реализация C1 contracts, C2 Core и C3 Worker/UI завершена; независимое
 кросс-ревью: C0/I0/M0. Целевой Core набор: 236 passed. Полный локальный Python
 suite прошёл: 2515 passed, 196 PostgreSQL-only skipped без отдельной тестовой БД.
-Рабочий checkout содержит локальный результат; deployment не запрашивался и не
-выполнялся. До отдельного выпуска runtime VPS продолжает старый ручной canary/ARM
-путь. Локальный код не подтверждает состояние VPS или live торговую приёмку.
+На завершение вехи16.10 код находился только в checkout; переключение сервисов
+тогда не выполнялось. Наблюдение17.10 относилось к прежнему ручному canary/ARM
+пути. Этот промежуточный статус заменён rollout18.10, описанным выше; исторические
+результаты16–17.10 не подтверждают свежую runtime или live торговую приёмку.
 
 ## Дополнение 10.10.2026: процент квоты одной заявки — DEPLOYED PROD
 

@@ -16,6 +16,7 @@ from sentinel_contracts.streaming_market import (
     StreamLastPrice,
     StreamOrderBook,
     StreamTradingStatus,
+    UnaryApiTradingStatus,
 )
 
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(lambda value: value.astimezone(UTC))]
@@ -125,6 +126,12 @@ class _StrictTradingStatus(StreamTradingStatus):
     captured_at: UtcDatetime
 
 
+class _StrictUnaryApiTradingStatus(UnaryApiTradingStatus):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    observed_at: UtcDatetime
+    expires_at: UtcDatetime
+
+
 class _StrictCandle(StreamCandle):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
     captured_at: UtcDatetime
@@ -136,6 +143,7 @@ class _StrictMarketState(InstrumentMarketState):
     order_book: _StrictOrderBook | None = None
     last_price: _StrictLastPrice | None = None
     trading_status: _StrictTradingStatus | None = None
+    api_trading_status: _StrictUnaryApiTradingStatus | None = None
     candle: _StrictCandle | None = None
 
 

@@ -52,3 +52,25 @@ def test_bootstrap_only_permits_worker_activation_from_hold(origin_name: str, cu
             validate_automation_transition(
                 current, AutomationState.IN_WORK, origin=TransitionOrigin(origin_name), bootstrap=True
             )
+
+
+def test_recovery_resume_is_explicit_and_only_permits_worker_hold_to_queue() -> None:
+    assert validate_automation_transition(
+        AutomationState.HOLD,
+        AutomationState.IN_QUEUE,
+        origin=TransitionOrigin.WORKER_FACT,
+        recovery_resume=True,
+    ) is True
+    with pytest.raises(InvalidAutomationTransition):
+        validate_automation_transition(
+            AutomationState.HOLD,
+            AutomationState.IN_QUEUE,
+            origin=TransitionOrigin.WORKER_FACT,
+        )
+    with pytest.raises(InvalidAutomationTransition):
+        validate_automation_transition(
+            AutomationState.HOLD,
+            AutomationState.IN_QUEUE,
+            origin=TransitionOrigin.USER_COMMAND,
+            recovery_resume=True,
+        )

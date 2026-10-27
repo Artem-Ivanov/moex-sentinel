@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -141,6 +141,7 @@ def test_reuses_one_async_client_context_for_broker_lifetime() -> None:
 class FakeOrders:
     def __init__(self) -> None:
         self.requests = []
+        self.cancel_requests = []
 
     async def get_order_price(self, request):
         self.requests.append(request)
@@ -204,6 +205,10 @@ class FakeOrders:
             order_date=NOW,
             stages=(SimpleNamespace(execution_time=NOW),),
         )
+
+    async def cancel_order(self, **values):
+        self.cancel_requests.append(values)
+        return SimpleNamespace(time=NOW)
 
 
 class FakeSandbox:
@@ -616,6 +621,87 @@ def test_accepted_permit_expiry_before_sdk_entry_emits_zero_fill_proof():
     assert not hasattr(client.orders, "posted")
 
 
+def test_permit_expiring_before_scheduled_sdk_entry_aborts_without_post():
+    base_time = datetime(2026, 8, 7, 12, tzinfo=UTC)
+    expires_at = base_time + timedelta(seconds=1)
+    market_expiry = base_time + timedelta(minutes=1)
+    request = prod_dispatch_request().model_copy(
+        update={"market_valid_until": market_expiry, "submit_deadline": market_expiry}
+    )
+    permit = SubmitPermit(
+        permit_id=uuid4(),
+        runtime_instance_id=UUID("00000000-0000-4000-8000-000000000002"),
+        idempotency_key=UUID("00000000-0000-4000-8000-000000000003"),
+        generation=1,
+        revision=1,
+        configuration_fingerprint="a" * 64,
+        request_fingerprint=prod_request_fingerprint(request),
+        issued_at=base_time,
+        expires_at=expires_at,
+        server_response_at=base_time,
+        risk_snapshot_id=uuid4(),
+    )
+    clock = [0.0]
+    observed_now = [base_time]
+
+    class Admission:
+        async def authorize_submit(self, _request):
+            return SubmitGate(permit=permit, expires_monotonic=1.0)
+
+        def abort_proof(self, _request, granted, reason):
+            return PreRpcAbortProof(
+                permit_id=granted.permit_id,
+                idempotency_key=granted.idempotency_key,
+                request_fingerprint=granted.request_fingerprint,
+                runtime_instance_id=granted.runtime_instance_id,
+                generation=granted.generation,
+                configuration_fingerprint=granted.configuration_fingerprint,
+                aborted_at=observed_now[0],
+                reason=reason,
+            )
+
+    async def scenario():
+        client = FakeClient()
+        post_entries = []
+        original_post = client.orders.post_order
+
+        async def record_post(**values):
+            post_entries.append(values)
+            return await original_post(**values)
+
+        client.orders.post_order = record_post
+        session = BrokerSdkSession(
+            PROD_TOKEN,
+            PROD_TARGET,
+            environment="PROD",
+            access_mode="TRADE",
+            account_id="account",
+            broker_connection=prod_connection(),
+            submit_admission=Admission(),
+            client_factory=lambda *_args, **_kwargs: client,
+            monotonic=lambda: clock[0],
+            now=lambda: observed_now[0],
+        )
+        await session.start()
+
+        def expire_permit():
+            clock[0] = 2.0
+            observed_now[0] = base_time + timedelta(seconds=2)
+
+        asyncio.get_running_loop().call_soon(expire_permit)
+        state = await session.dispatch_limit_order(request)
+        await session.close()
+        return client, state, post_entries
+
+    client, state, post_entries = asyncio.run(scenario())
+
+    assert state.status == "CANCELLED"
+    assert state.pre_rpc_abort_proof is not None
+    assert state.pre_rpc_abort_proof.reason == "PERMIT_EXPIRED_BEFORE_POST"
+    assert post_entries == []
+    assert not hasattr(client.orders, "posted")
+
+
 def test_order_state_prefers_latest_execution_stage_time() -> None:
     earlier = datetime(2026, 8, 7, 11, 59, tzinfo=UTC)
     later = datetime(2026, 8, 7, 12, 1, tzinfo=UTC)
@@ -638,6 +724,24 @@ def test_order_state_prefers_latest_execution_stage_time() -> None:
     )
 
     assert _order_state(response).executed_at == later
+
+
+def test_unknown_sdk_execution_status_maps_to_uncertain():
+    money = SimpleNamespace(units=100, nano=0, currency="rub")
+    response = SimpleNamespace(
+        order_id="order-1",
+        order_request_id="intent-1",
+        execution_report_status="EXECUTION_REPORT_STATUS_UNSPECIFIED",
+        lots_requested=1,
+        lots_executed=0,
+        initial_order_price=money,
+        total_order_amount=SimpleNamespace(units=0, nano=0, currency="rub"),
+        initial_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+        executed_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+        executed_order_price=SimpleNamespace(units=0, nano=0, currency="rub"),
+    )
+
+    assert _order_state(response).status == "UNCERTAIN"
 
 
 def test_prod_recovery_looks_up_exact_request_id_without_listing_orders():
@@ -840,6 +944,123 @@ def test_terminal_order_state_invalidates_account_snapshot() -> None:
         return state.status, client.sandbox.portfolio_calls, client.sandbox.money_calls
 
     assert asyncio.run(scenario()) == ("FILLED", 2, 2)
+
+
+def test_never_completing_sdk_status_rpc_times_out_and_session_closes() -> None:
+    async def scenario():
+        client = FakeClient()
+        entered = asyncio.Event()
+
+        async def never_returns(**_values):
+            entered.set()
+            await asyncio.Event().wait()
+
+        client.orders.get_order_state = never_returns
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            request_timeout_seconds=0.01,
+        )
+        await session.start()
+        with pytest.raises(TInvestAdapterError, match="timed out"):
+            await asyncio.wait_for(session.get_order_state("account", "order-1"), timeout=0.2)
+        assert entered.is_set()
+        await asyncio.wait_for(session.close(), timeout=0.2)
+        return client
+
+    assert asyncio.run(scenario()).exited == 1
+
+
+def test_cancellation_ignoring_sdk_calls_have_a_pending_call_cap() -> None:
+    async def scenario():
+        client = FakeClient()
+        release = asyncio.Event()
+        calls = []
+
+        async def ignores_cancellation(**_values):
+            calls.append(None)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+                raise
+
+        client.orders.get_order_state = ignores_cancellation
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            request_timeout_seconds=0.01,
+        )
+        await session.start()
+        for _attempt in range(2):
+            with pytest.raises(TInvestAdapterError, match="timed out"):
+                await session.get_order_state("account", "order-1")
+        with pytest.raises(TInvestAdapterError, match="still pending"):
+            await session.get_order_state("account", "order-1")
+        await asyncio.wait_for(session.close(), timeout=0.2)
+        release.set()
+        await asyncio.sleep(0)
+        return len(calls), client.exited
+
+    assert asyncio.run(scenario()) == (2, 1)
+
+
+def test_cancel_order_uses_scoped_exchange_id_and_requires_trade_mode():
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
+            account_id="account",
+        )
+        await session.start()
+        await session.cancel_order("account", "order-42")
+        await session.close()
+        return client.orders.cancel_requests
+
+    assert asyncio.run(scenario()) == [{"account_id": "account", "order_id": "order-42"}]
+
+
+def test_cancel_order_rejects_account_mismatch_before_sdk_call():
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            access_mode="TRADE",
+            account_id="account",
+        )
+        await session.start()
+        with pytest.raises(ValueError, match="Broker account mismatch"):
+            await session.cancel_order("other-account", "order-42")
+        await session.close()
+        return client.orders.cancel_requests
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_cancel_order_rejects_read_only_before_sdk_call():
+    async def scenario():
+        client = FakeClient()
+        session = BrokerSdkSession(
+            "synthetic-token",
+            "sandbox-invest-public-api.tbank.ru:443",
+            client_factory=lambda *_args, **_kwargs: client,
+            access_mode="READ_ONLY",
+            account_id="account",
+        )
+        await session.start()
+        with pytest.raises(ValueError, match="READ_ONLY forbids broker mutation"):
+            await session.cancel_order("account", "order-42")
+        await session.close()
+        return client.orders.cancel_requests
+
+    assert asyncio.run(scenario()) == []
 
 
 def test_maps_account_snapshot_rate_limit_to_retryable_broker_error() -> None:

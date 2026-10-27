@@ -6,7 +6,10 @@ from fastapi.testclient import TestClient
 from moex_sentinel.api.app import create_app
 from moex_sentinel.api.auth import hash_password
 from moex_sentinel.domain.trading_admission import AdmissionConflictError
+from moex_sentinel.storage.models import Base
+from moex_sentinel.storage.models.trading_admission import TradingAccountAdmissionModel
 from sentinel_contracts.trading_admission import AdmissionLimits, AdmissionStatus, AdmissionView, SubmitDenialReason
+from tests.storage.trading_facts_helpers import user_broker_model
 
 
 def test_authenticated_limits_put_route_is_registered(tmp_path):
@@ -97,3 +100,48 @@ def test_limits_put_requires_operator_session_csrf_and_maps_revision_conflict(tm
     assert success.status_code == 200
     assert success.json()["revision"] == 8
     assert success.json()["limits"]["exposure_scope"] == "ACCOUNT_GROSS"
+
+
+def test_test_operator_cannot_mutate_prod_admission_through_http(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPLICATION_ENVIRONMENT", "TEST")
+    monkeypatch.setenv("BROKER_ACCESS_MODE", "READ_ONLY")
+    monkeypatch.setenv("AUTH_USERNAME", "operator")
+    monkeypatch.setenv("AUTH_PASSWORD_HASH", hash_password("long synthetic password"))
+    monkeypatch.setenv("AUTH_INSECURE_LOOPBACK", "true")
+    broker_id = "00000000-0000-4000-8000-000000000099"
+    path = f"/api/brokers/{broker_id}/trading-admission/limits"
+    payload = {
+        "expected_revision": 1,
+        "limits": {
+            "currency": "RUB",
+            "max_order_notional": "1000",
+            "exposure_scope": "ACCOUNT_GROSS",
+            "max_exposure": "5000",
+            "max_outstanding_orders": 3,
+            "max_daily_loss": "250",
+        },
+    }
+
+    with TestClient(
+        create_app(database_url=f"sqlite:///{tmp_path / 'cross-environment.db'}"),
+        base_url="http://127.0.0.1:8000",
+    ) as client:
+        Base.metadata.create_all(client.app.state.database_engine)
+        broker = user_broker_model(broker_id, "prod-account")
+        broker.environment = "PROD"
+        with client.app.state.session_factory.begin() as session:
+            session.add(broker)
+            session.flush()
+            session.add(TradingAccountAdmissionModel(user_broker_id=broker_id, revision=1, limits=None))
+
+        login = client.post("/api/auth/login", json={"username": "operator", "password": "long synthetic password"})
+        assert login.status_code == 200
+        csrf = login.json()["csrf_token"]
+        response = client.put(path, json=payload, headers={"X-CSRF-Token": csrf})
+
+        assert response.status_code == 409
+        with client.app.state.session_factory() as session:
+            admission = session.get(TradingAccountAdmissionModel, broker_id)
+            assert admission is not None
+            assert admission.revision == 1
+            assert admission.limits is None

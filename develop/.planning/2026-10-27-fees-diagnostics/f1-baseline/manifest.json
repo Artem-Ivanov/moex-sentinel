@@ -1,0 +1,69 @@
+{
+  "baseline": "pre-P1 dirty workspace snapshot",
+  "files": [
+    {
+      "path": "src/moex_sentinel/domain/portfolio.py",
+      "exists": true,
+      "sha256": "f607964288301fae286a4c383f16dc39b929a021921538665bc96a97fef2c498",
+      "bytes": 3477
+    },
+    {
+      "path": "src/moex_sentinel/domain/execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "src/moex_sentinel/adapters/tinvest/portfolio.py",
+      "exists": true,
+      "sha256": "5526cff7c09a540f3af18066e5473b0e844116aaf0c4a48ee38d6aded46d1d55",
+      "bytes": 9216
+    },
+    {
+      "path": "src/moex_sentinel/storage/models/__init__.py",
+      "exists": true,
+      "sha256": "8bc89460693453cedf1888a266988217adbe2083b0279a728e8bfb83a9dfee73",
+      "bytes": 1924
+    },
+    {
+      "path": "src/moex_sentinel/storage/models/execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "src/moex_sentinel/storage/repositories/execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "src/moex_sentinel/services/execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "alembic/versions/0008_execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "tests/adapters/test_tinvest_portfolio_adapter.py",
+      "exists": true,
+      "sha256": "5e1a88bc54b40276ba353f60c53787e5d1f74cfc20dab5479f2ace1e3530d1d4",
+      "bytes": 7072
+    },
+    {
+      "path": "tests/domain/test_execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "tests/storage/test_execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "tests/services/test_execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "tests/integration/postgresql/test_execution_commissions.py",
+      "exists": false
+    },
+    {
+      "path": "tests/integration/postgresql/test_execution_commissions_migration.py",
+      "exists": false
+    }
+  ]
+}

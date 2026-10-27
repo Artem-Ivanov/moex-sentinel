@@ -1,0 +1,25 @@
+# Продолжить после установленного Core — сверка до делегирования
+
+## Проверенные факты
+
+ONE recovery6d71 PID123368: freshpreflight16:03:47/rev509 → cleanstop oldWorker14116016:03:50.963 (exit0/restartno, freshstructuredmarker, durablestopproof) → persistentCorea905healthy16:04:08.569 → CANDIDATE_WORKER_STARTING16:04:08.616 → DOCKER_COMMAND_FAILED ДО PENDING/CAS. Источники recovery-launch.json/recovery-observation-02.txt.
+
+Read-only16:05:54 доказал причину: тот же wrapper config --quiet без REMOTE_ENV_FILE возвращает1 `couldn't find env file .../deploy/remote/.env.production`; с canonical `/etc/moex-sentinel/production.env` возвращает0. В helper start_worker_once путь ENV не передан, хотя CorePrimitive его передавал. CurrentCorea905/container89357571 healthy/start16:03:53.981, marker3aee805e; oldWorker141160 всё ещё exactstopped/restartno/exit0/тотжеvolume. Workercreate не прошёл предварительную config validation.
+
+Supported API16:07:45: owner0767/gen7/soleexpired/rev510, caps/fingerprint прежние, unresolved1; fresh PENDING после failedstart16:04:08.616 —404. B readprojection теперь доказана: SIBN HOLD3/seq78672/bootstrapfalse/reason `Worker restarted; manual RESUME is required`; GOLD HOLD6/reason `PROD broker submit outcome is uncertain`. Оба не Resume. A normalGET200 ещё не проверен: Worker остановлен.
+
+## Scope/DoD и rootACK
+
+Исправить ровно3 existing owned files expired-owner-recovery/{recover_expired_owner.py,test_recover_expired_owner.py,author-report.md}: явно canonical ENV в Worker wrapper invocation и отдельный one-shot CLI `--continue-worker`. Original6d71 сохранён root локально как prod-core-recovery-20261018/recovery-first-attempt-6d71.py и immutable remote original; новый helper root развернёт под другим именем, историю/оригинал не менять. Source4/image/package/deps/inputc560 unchanged.
+
+Continuation до mutation проверяет: exact original helper6d71/inputc560/attempt+launch+полный8-phaseprefix без дальнейших ready/PENDING/CAS, previousprocess завершён, durable stopproof/readback; current exactoldWorker141160 СУЩЕСТВУЕТ и cleanstopped (не произвольнаяabsence, поскольку данныйwrapperне дошёлдоrecreate); source/image/storage/ENV/caps/baseline/positions и other3services unchanged; currentCorea905/89357571healthy и activatedmarker3aee805e соответствует phase/полному overlay; owner7expired/ген7, freshrevision, no competingWorker/newPENDING послеfailedstart. Не вызывать old full preflight/read_runtimeexec наstoppedWorker.
+
+Далее separateexclusive/fsync continuation marker ДО первого Worker up и append-only phases, затем reuse уже проверенного tail: ONE canonicalENV Worker recreate → uniquePENDING actualafterStartedAt/singleprocess/sameimage+storage → freshstableCAS7→8 ОДИНPOST/lostACKonlyGET → normalrenew/expectedheartbeat/effectiveTrue/capspreserved. Stop/Core install/activation/fallback/rootoldattempt НЕ повторяются. OldWorker отсутствует только ПОСЛЕ нового успешного recreate, тогда применяется существующий durableproof+strictabsence guard. Политика неизвестного результата/UNKNOWN/GOLDHOLD неизменна.
+
+Meaningful tests: actual subprocess env canonical (независимо от унаследованного env); exact history/hash/stop/targetCore/currentoldworker/PENDING/conflict drift rejection; duplicatecontinuation; no stop/Coreactivation calls; ONEup/ONEPOST/lostACKresolve; actual pinned adapter entry и postchecks. Root tests/styles + independent exactcode/input/state reviewC0/I0 перед live. Не добавлять новые финансовые gates/ARM/reconciliation или sourcechanges. RootACK этих конкретных3files/границ выдан; author толькоlocal, live толькоroot послеreview.
+
+## Bound continuation evidence
+Root ACK `--continue-worker --continuation-evidence PATH`. Создан новый root600 immutable `/root/moex-sentinel-expired-owner7-recovery-20261018/worker-continuation-evidence.json`, локальный artifact в prod-core-recovery-20261018/. SHAe60cc63a3ae09fe7cae89439d417b421f37b8b325979140f27fd14d79f300cce, captured16:13:54. original{helper6d,inputsс560,launchffd3a22e,phase76c5b533,stop50276666,pid123368absent}; installed_core/stopped_worker — реальный reader metadata; api{admission owner7rev510stable/caps, baseline, positions, pendingafterfailedstart404}. CurrentCore893/a905/marker3aee, quietcanonical0/default1 повторно доказаны. Helper живьём перечитывает актуальные proof/context перед отдельнымmarker, snapshot не заменяет livechecks. Originalinput/deps/historyнеизменны, никакогоcontinuationзапускапока.
+
+### Continuation artifact shape — root review
+Read-only SSH подтвердил launch.json SHAffd3 с phase=LAUNCHED без pid/status; PID123368 находится в отдельном файле pid (SHA4c4631b0). Local recovery-launch.json — summary другого shape. Original remote helper называется recover_expired_owner.py (6d71), originalrecover_expired_owner.py отсутствует. Helper5a9 имел I1: неверный path/shape; live не запускался, author получил узкий ACK на исправление и real-shape regression. Evidence: develop/reports/prod-core-recovery-20261018/worker-continuation-launch-binding.json. Root 27 unittest PASS не отменяют найденное I1; новый freeze/review обязателен.

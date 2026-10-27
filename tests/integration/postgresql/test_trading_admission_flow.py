@@ -13,6 +13,7 @@ from pydantic import TypeAdapter
 from sqlalchemy.orm import sessionmaker
 
 from moex_sentinel.api import app as app_module
+from moex_sentinel.domain.trading_admission import AdmissionConflictError
 from moex_sentinel.services.trading_admission_ports import (
     AdmissionInstrument,
     AdmissionOrderEstimate,
@@ -21,8 +22,13 @@ from moex_sentinel.services.trading_admission_ports import (
     AdmissionRiskSnapshot,
 )
 from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import BrokerOrderModel, TradeExecutionModel
-from moex_sentinel.storage.models.trading_admission import TradingSubmitReservationModel
+from moex_sentinel.storage.models import BrokerOrderModel, TradeExecutionModel, TradingAutomationModel
+from moex_sentinel.storage.models.trading_admission import (
+    TradingAccountAdmissionModel,
+    TradingAdmissionEventModel,
+    TradingSubmitReservationModel,
+)
+from moex_sentinel.storage.repositories.trading_admission import TradingAdmissionRepository
 from sentinel_contracts.broker_execution import OrderSide
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_admission import (
@@ -31,9 +37,11 @@ from sentinel_contracts.trading_admission import (
     CaptureBaselineRequest,
     OwnerStoppedRequest,
     ReconciliationRequest,
+    RevokeRequest,
     RuntimeRegistrationRequest,
     SubmitAuthorizationRequest,
     SubmitPermit,
+    UpdateLimitsRequest,
 )
 from sentinel_contracts.trading_facts import FactEnvelope
 from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
@@ -44,6 +52,7 @@ from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
 from trading_automaton.composition import build_worker_recovery
 from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.domain.errors import CoreOperationError
+from trading_automaton.services.fact_synchronization import FactSynchronizationService
 from trading_automaton.services.order_dispatch import OrderDispatchService
 from trading_automaton.services.order_tracking import OrderTrackingService
 from trading_automaton.services.trading_admission import TradingAdmissionService as WorkerAdmissionService
@@ -154,11 +163,49 @@ def _envelopes(rows):
     ]
 
 
+def _settled_reservation_facts(factory, broker_id):
+    with factory() as session:
+        rows = session.query(TradingSubmitReservationModel).filter_by(user_broker_id=str(broker_id), state="SETTLED")
+        return {
+            row.idempotency_key: (
+                row.state,
+                row.request_fingerprint,
+                row.reserved_cash,
+                row.reserved_position_units,
+                row.payload.get("executed_lots"),
+                row.payload.get("executed_amount"),
+                row.payload.get("executed_commission"),
+                row.created_at,
+            )
+            for row in rows
+        }
+
+
+def _assert_settled_reservations_rebased(factory, broker_id, reconciliation_id):
+    with factory() as session:
+        rows = session.query(TradingSubmitReservationModel).filter_by(user_broker_id=str(broker_id), state="SETTLED")
+        rows = tuple(rows)
+    assert rows
+    for row in rows:
+        assert row.payload["anchor_reconciliation_id"] == str(reconciliation_id)
+        assert row.payload["anchor_executed_lots"] == row.payload["executed_lots"]
+
+
 def _run_worker_expired_permit_flow(
-    tmp_path, factory, worker, admission, worker_command, armed, monkeypatch, *, delivery_mode, finalization_mode
+    tmp_path,
+    factory,
+    worker,
+    admission,
+    worker_command,
+    armed,
+    monkeypatch,
+    *,
+    delivery_mode,
+    finalization_mode,
+    worker_db_name="admission-worker-outbox.db",
 ):
     proof_key = uuid4()
-    worker_engine = create_worker_engine(f"sqlite:///{tmp_path / 'admission-worker-outbox.db'}")
+    worker_engine = create_worker_engine(f"sqlite:///{tmp_path / worker_db_name}")
     WorkerBase.metadata.create_all(worker_engine)
     local_worker = LocalAutomationRepository(
         sessionmaker(worker_engine, expire_on_commit=False),
@@ -283,7 +330,7 @@ def _run_worker_expired_permit_flow(
         local_worker.finish_run(WORKER_ID)
 
     local_worker._factory.kw["bind"].dispose()
-    reopened_engine = create_worker_engine(f"sqlite:///{tmp_path / 'admission-worker-outbox.db'}")
+    reopened_engine = create_worker_engine(f"sqlite:///{tmp_path / worker_db_name}")
     reopened = LocalAutomationRepository(
         sessionmaker(reopened_engine, expire_on_commit=False),
         fact_writer=FactOutboxWriter(clock=_now),
@@ -497,6 +544,7 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
 
     monkeypatch.setenv("BROKER_ACCESS_MODE", "TRADE")
     app = app_module.create_app(database_url=isolated_postgresql_database_url, test_auth_bypass=True)
+    activation_engine = None
     with TestClient(app) as core:
         risk = _FreshRisk()
         admission = core.app.state.usecases.trading_admission
@@ -550,10 +598,42 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
             assert len(claimed_commands) == 1
             claimed_command = claimed_commands[0]
             assert claimed_command.state is AutomationState.IN_QUEUE
-            worker_command = claimed_command.model_copy(update={"state": AutomationState.IN_WORK})
-            assert worker_command.user_broker_id == BROKER_ID
-            assert worker_command.broker_id == BROKER_ID
-            assert worker_command.account_id == ACCOUNT_ID
+            assert claimed_command.user_broker_id == BROKER_ID
+            assert claimed_command.broker_id == BROKER_ID
+            assert claimed_command.account_id == ACCOUNT_ID
+
+            activation_engine = create_worker_engine(f"sqlite:///{tmp_path / 'activation-worker.db'}")
+            WorkerBase.metadata.create_all(activation_engine)
+            activation_worker = LocalAutomationRepository(
+                sessionmaker(activation_engine, expire_on_commit=False),
+                fact_writer=FactOutboxWriter(clock=_now),
+                environment="PROD",
+            )
+            assert activation_worker.cache_command(claimed_command)
+            assert activation_worker.transition_state(
+                automation_id=str(automation_id),
+                state=AutomationState.IN_WORK,
+                safe_message="Synthetic worker activation",
+                occurred_at=_now(),
+            )
+            synchronization = FactSynchronizationService(
+                activation_worker,
+                worker,
+                now=_now,
+                sleep=lambda _seconds: None,
+                deadline_ms=0,
+            )
+            assert synchronization.flush_outbox()
+            with factory() as session:
+                activated = session.get_one(TradingAutomationModel, str(automation_id))
+                assert (activated.state, activated.revision, activated.last_sequence_number) == ("IN_WORK", 2, 1)
+            worker_command = claimed_command.model_copy(
+                update={
+                    "state": AutomationState.IN_WORK,
+                    "revision": 2,
+                    "last_sequence_number": 1,
+                }
+            )
 
             today = _now().astimezone(ZoneInfo("Europe/Moscow")).date()
             baseline = asyncio.run(
@@ -709,6 +789,8 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                     blocked_units=Decimal(0),
                     mark_price=Decimal("10"),
                     currency="RUB",
+                    lot_size=10,
+                    mark_captured_at=_now(),
                 ),
             )
             second_key = uuid4()
@@ -720,72 +802,69 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                 settled_first = next(item for item in reservations if item.idempotency_key == str(first_key))
                 assert settled_first.state == "SETTLED"
 
-            # A failed R2 is stored as an attempt but must leave trusted R1 attached.
-            risk.order_states = ()
+            # Incomplete submit evidence must not grant or mutate a reservation.
             risk.unknown_reasons = ("synthetic incomplete snapshot",)
-            before_failed_reconcile = admission.view(str(BROKER_ID))
-            failed = asyncio.run(
-                admission.reconcile(
-                    str(BROKER_ID),
-                    ReconciliationRequest(expected_revision=before_failed_reconcile.revision, canary_uid=CANARY_UID),
-                    runtime_instance_id=worker.runtime_instance_id,
-                    generation=worker._registration.generation,
-                )
-            )
-            after_failed_reconcile = admission.view(str(BROKER_ID))
-            assert not failed.can_arm
-            assert after_failed_reconcile.recovery_only
-            assert after_failed_reconcile.reconciliation.reconciliation_id == reconciliation.reconciliation_id
-            assert after_failed_reconcile.reconciliation.reconciliation_id != failed.reconciliation_id
+            unknown_key = uuid4()
+            unknown = submit(unknown_key)
+            assert unknown.permit is None
+            assert unknown.denial.reason.value == "DATA_UNKNOWN"
+            with factory() as session:
+                reservations = session.query(TradingSubmitReservationModel).all()
+                assert len(reservations) == 2
+                unresolved_second = next(item for item in reservations if item.idempotency_key == str(second_key))
+                assert unresolved_second.state == "IN_FLIGHT"
+                assert unresolved_second.reserved_cash == Decimal("101")
 
+            # Fresh terminal broker evidence settles the unresolved R2 through the
+            # normal worker authorization and pre-RPC finalization path.
             risk.unknown_reasons = ()
             risk.positions = (
                 AdmissionPosition(
                     instrument_uid=CANARY_UID,
-                    quantity_units=Decimal("10"),
+                    quantity_units=Decimal("20"),
                     blocked_units=Decimal(0),
                     mark_price=Decimal("10"),
                     currency="RUB",
+                    lot_size=10,
+                    mark_captured_at=_now(),
                 ),
             )
             risk.order_states = (
                 AdmissionOrderState(
                     request_id=str(second_key),
-                    broker_order_id="flow-second-new-order",
+                    broker_order_id="flow-second-filled-order",
                     instrument_uid=CANARY_UID,
                     side=OrderSide.BUY,
                     requested_lots=1,
-                    executed_lots=0,
-                    executed_amount=Decimal(0),
-                    executed_commission=Decimal(0),
+                    executed_lots=1,
+                    executed_amount=Decimal("100"),
+                    executed_commission=Decimal("1"),
                     currency="RUB",
-                    status="NEW",
+                    status="FILLED",
                     attributable=True,
                     unknown_reason=None,
                 ),
             )
-            before_torn_reconcile = admission.view(str(BROKER_ID))
-            torn = asyncio.run(
-                admission.reconcile(
-                    str(BROKER_ID),
-                    ReconciliationRequest(expected_revision=before_torn_reconcile.revision, canary_uid=CANARY_UID),
-                    runtime_instance_id=worker.runtime_instance_id,
-                    generation=worker._registration.generation,
-                )
+            asyncio.run(worker_gate.prepare(CANARY_UID))
+            _run_worker_expired_permit_flow(
+                tmp_path,
+                factory,
+                worker,
+                admission,
+                worker_command,
+                armed,
+                monkeypatch,
+                delivery_mode=delivery_mode,
+                finalization_mode=finalization_mode,
+                worker_db_name="admission-worker-terminal-proof.db",
             )
-            after_torn_reconcile = admission.view(str(BROKER_ID))
-            assert not torn.can_arm
-            assert torn.status.value == "DATA_UNKNOWN"
-            assert after_torn_reconcile.recovery_only
-            assert after_torn_reconcile.reconciliation.reconciliation_id == reconciliation.reconciliation_id
-            assert after_torn_reconcile.reconciliation.reconciliation_id != torn.reconciliation_id
+            settled_facts_before_rotation = _settled_reservation_facts(factory, BROKER_ID)
             with factory() as session:
-                unresolved_second = (
+                settled_second = (
                     session.query(TradingSubmitReservationModel).filter_by(idempotency_key=str(second_key)).one()
                 )
-                assert unresolved_second.state == "UNKNOWN"
-                assert unresolved_second.reserved_cash == Decimal("101")
-                assert unresolved_second.reserved_position_units == 0
+                assert settled_second.state == "SETTLED"
+                assert settled_second.reserved_cash == settled_second.reserved_position_units == 0
 
             risk.positions = (
                 AdmissionPosition(
@@ -794,22 +873,8 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                     blocked_units=Decimal(0),
                     mark_price=Decimal("10"),
                     currency="RUB",
-                ),
-            )
-            risk.order_states = (
-                AdmissionOrderState(
-                    request_id=str(second_key),
-                    broker_order_id="flow-second-partial-cancelled-order",
-                    instrument_uid=CANARY_UID,
-                    side=OrderSide.BUY,
-                    requested_lots=1,
-                    executed_lots=1,
-                    executed_amount=Decimal("100"),
-                    executed_commission=Decimal("1"),
-                    currency="RUB",
-                    status="CANCELLED",
-                    attributable=True,
-                    unknown_reason=None,
+                    lot_size=10,
+                    mark_captured_at=_now(),
                 ),
             )
             before_recovery = admission.view(str(BROKER_ID))
@@ -824,11 +889,8 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
             after_recovery = admission.view(str(BROKER_ID))
             assert recovered.can_arm
             assert after_recovery.reconciliation.reconciliation_id == recovered.reconciliation_id
-            with factory() as session:
-                settled_second = (
-                    session.query(TradingSubmitReservationModel).filter_by(idempotency_key=str(second_key)).one()
-                )
-                assert settled_second.state == "SETTLED"
+            _assert_settled_reservations_rebased(factory, BROKER_ID, recovered.reconciliation_id)
+            assert _settled_reservation_facts(factory, BROKER_ID) == settled_facts_before_rotation
 
             risk.order_states = ()
             before_clear = admission.view(str(BROKER_ID))
@@ -841,6 +903,8 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                 )
             )
             assert cleared.can_arm
+            _assert_settled_reservations_rebased(factory, BROKER_ID, cleared.reconciliation_id)
+            assert _settled_reservation_facts(factory, BROKER_ID) == settled_facts_before_rotation
             ready = admission.view(str(BROKER_ID))
             assert not ready.recovery_only
             assert ready.unresolved_reservation_count == 0
@@ -857,6 +921,26 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                 ),
                 actor="test-operator",
             )
+            risk.positions = (
+                AdmissionPosition(
+                    instrument_uid=CANARY_UID,
+                    quantity_units=Decimal("20"),
+                    blocked_units=Decimal(0),
+                    mark_price=Decimal("10"),
+                    currency="RUB",
+                    lot_size=10,
+                    mark_captured_at=_now(),
+                ),
+            )
+            with factory() as session:
+                latest_automation = session.get_one(TradingAutomationModel, str(automation_id))
+                worker_command = worker_command.model_copy(
+                    update={
+                        "state": AutomationState(latest_automation.state),
+                        "revision": latest_automation.revision,
+                        "last_sequence_number": latest_automation.last_sequence_number,
+                    }
+                )
             _run_worker_expired_permit_flow(
                 tmp_path,
                 factory,
@@ -868,8 +952,61 @@ def test_prod_trade_settings_http_enrollment_transfer_recovery_and_next_submit(
                 delivery_mode=delivery_mode,
                 finalization_mode=finalization_mode,
             )
+            assert _settled_reservation_facts(factory, BROKER_ID) == settled_facts_before_rotation
         finally:
             http.close()
             if "worker_http" in locals():
                 worker_http.close()
+            if activation_engine is not None:
+                activation_engine.dispose()
+    engine.dispose()
+
+
+def test_test_scoped_repository_rejects_prod_operator_mutations_transactionally(isolated_postgresql_database_url):
+    broker_id = str(uuid4())
+    engine = create_database_engine(isolated_postgresql_database_url)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    with factory.begin() as session:
+        broker = user_broker_model(broker_id, "prod-cross-contour-account")
+        broker.environment = "PROD"
+        broker.fqdn = "invest-public-api.tbank.ru:443"
+        session.add(broker)
+        session.flush()
+        session.add(TradingAccountAdmissionModel(user_broker_id=broker_id, revision=1, limits=None))
+
+    repository = TradingAdmissionRepository(factory, application_environment="TEST")
+    limits = AdmissionLimits(
+        currency="RUB",
+        max_order_notional=Decimal("1000"),
+        exposure_scope="ACCOUNT_GROSS",
+        max_exposure=Decimal("5000"),
+        max_outstanding_orders=3,
+        max_daily_loss=Decimal("250"),
+    )
+    with pytest.raises(AdmissionConflictError):
+        repository.update_limits(
+            broker_id,
+            UpdateLimitsRequest(expected_revision=1, limits=limits),
+            actor="test-operator",
+            now=_now(),
+        )
+    with pytest.raises(AdmissionConflictError):
+        repository.revoke(
+            RevokeRequest(expected_revision=1, reason="synthetic cross-contour test"),
+            broker_id=broker_id,
+            now=_now(),
+            actor="test-operator",
+        )
+    with pytest.raises(ValueError, match="Trading admission has not been registered"):
+        repository.get_view(broker_id, now=_now())
+    with pytest.raises(ValueError, match="Pending runtime scope is unavailable"):
+        repository.pending_runtime_candidate(broker_id, "worker", _now() - timedelta(minutes=1))
+
+    with factory() as session:
+        admission = session.get(TradingAccountAdmissionModel, broker_id)
+        assert admission is not None
+        assert admission.revision == 1
+        assert admission.limits is None
+        assert admission.admission_status == "DISARMED"
+        assert session.query(TradingAdmissionEventModel).filter_by(user_broker_id=broker_id).count() == 0
     engine.dispose()

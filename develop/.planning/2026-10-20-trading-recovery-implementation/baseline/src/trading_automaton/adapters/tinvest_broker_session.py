@@ -1,0 +1,681 @@
+"""Long-lived T-Invest async client session owned by one broker runtime."""
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from decimal import ROUND_DOWN, Decimal
+from math import floor, isfinite
+from time import monotonic as system_monotonic
+from typing import Any, Literal
+from uuid import UUID
+
+from grpc import StatusCode
+from t_tech.invest import AioRequestError, AsyncClient
+from t_tech.invest.schemas import (
+    GetOperationsByCursorRequest,
+    GetOrderPriceRequest,
+    OrderDirection,
+    OrderIdType,
+    OrderType,
+    PriceType,
+    Quotation,
+)
+
+from moex_sentinel.adapters.tinvest.converters import enum_name, execution_unit_price, quotation_to_decimal
+from moex_sentinel.adapters.tinvest.errors import TInvestAdapterError
+from sentinel_contracts.broker_execution import (
+    BrokerConnection,
+    BrokerOrderState,
+    BrokerPosition,
+    BrokerRecoveryOperation,
+    OrderSide,
+)
+from sentinel_contracts.time import floor_utc_millisecond
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
+from sentinel_contracts.trading_admission import (
+    PreRpcAbortProof,
+    SubmitAuthorizationRequest,
+    SubmitDenialReason,
+    submit_request_fingerprint,
+)
+from trading_automaton.domain.dtos import CommissionQuote, CommissionRefreshRequest, DispatchRequest
+from trading_automaton.domain.errors import CoreOperationError
+
+LOGGER = logging.getLogger(__name__)
+_TLS_UNWRAP_FAILURE = "Stream removed (Unwrap failed (TSI_DATA_CORRUPTED))"
+_MAX_TIMING_MS = 2_147_483_647
+
+
+def _default_client_factory(token: str, *, target: str) -> AsyncClient:
+    return AsyncClient(token, target=target)
+
+
+def _consume_task_result(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+class BrokerSdkSession:
+    def __init__(
+        self,
+        token: str,
+        target: str,
+        *,
+        environment: str = "TEST",
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
+        broker_connection: BrokerConnection | None = None,
+        submit_admission: Any | None = None,
+        client_factory: Callable[..., Any] = _default_client_factory,
+        snapshot_ttl_seconds: float = 60.0,
+        request_timeout_seconds: float = 10.0,
+        monotonic: Callable[[], float] = system_monotonic,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        resolve_tinvest_endpoint(environment, "TINVEST_SANDBOX" if environment == "TEST" else "TINVEST_PROD", target)
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        if environment == "PROD" and not account_id.strip():
+            raise ValueError("PROD requires selected account_id")
+        if environment == "PROD" and access_mode == "TRADE" and (submit_admission is None or broker_connection is None):
+            raise ValueError("PROD TRADE requires a validated Core broker connection and submit admission")
+        if broker_connection is not None and (
+            broker_connection.token != token
+            or broker_connection.target != target
+            or broker_connection.environment != environment
+            or broker_connection.access_mode != access_mode
+            or broker_connection.account_id != account_id
+        ):
+            raise ValueError("SDK session configuration differs from the validated Core broker connection")
+        if (
+            environment == "PROD"
+            and access_mode == "TRADE"
+            and broker_connection is not None
+            and broker_connection.configuration_fingerprint is None
+        ):
+            raise ValueError("PROD TRADE Core broker connection requires a configuration fingerprint")
+        self._environment = environment
+        self._access_mode = access_mode
+        self._account_id = account_id
+        self._broker_connection = broker_connection
+        self._configuration_fingerprint = (
+            None if broker_connection is None else broker_connection.configuration_fingerprint
+        )
+        self._submit_admission = submit_admission
+        if snapshot_ttl_seconds <= 0:
+            raise ValueError("Account snapshot TTL must be positive.")
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not isfinite(request_timeout_seconds)
+            or request_timeout_seconds <= 0
+        ):
+            raise ValueError("Broker request timeout must be finite and positive.")
+        self._token = token
+        self._target = target
+        self._client_factory = client_factory
+        self._snapshot_ttl_seconds = snapshot_ttl_seconds
+        self._request_timeout_seconds = request_timeout_seconds
+        self._monotonic = monotonic
+        self._now = now
+        self._client: Any | None = None
+        self._services: Any | None = None
+        self._snapshot_lock = asyncio.Lock()
+        self._positions_cache: dict[str, tuple[float, tuple[BrokerPosition, ...]]] = {}
+        self._money_cache: dict[str, tuple[float, dict[str, Decimal]]] = {}
+        self._rpc_tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def services(self) -> Any:
+        if self._services is None:
+            raise RuntimeError("Broker SDK session is not started.")
+        return self._services
+
+    async def start(self) -> None:
+        if self._services is not None:
+            return
+        self._client = self._client_factory(self._token, target=self._target)
+        self._services = await self._client.__aenter__()
+
+    async def close(self) -> None:
+        if self._client is None:
+            return
+        pending = {task for task in self._rpc_tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=min(self._request_timeout_seconds, 0.1))
+        client = self._client
+        exit_task = asyncio.create_task(client.__aexit__(None, None, None))
+        done, _pending = await asyncio.wait({exit_task}, timeout=self._request_timeout_seconds)
+        if exit_task not in done:
+            exit_task.cancel()
+            exit_task.add_done_callback(_consume_task_result)
+            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker session close timed out.", retryable=True)
+        self._client = None
+        self._services = None
+        async with self._snapshot_lock:
+            self._positions_cache.clear()
+            self._money_cache.clear()
+        exit_task.result()
+
+    async def quote(self, request: CommissionRefreshRequest, side: str) -> CommissionQuote:
+        self._validate_account(request.key.account_id)
+        direction = OrderDirection.ORDER_DIRECTION_BUY if side == "BUY" else OrderDirection.ORDER_DIRECTION_SELL
+        response = await self._broker_request(
+            self.services.orders.get_order_price(
+                GetOrderPriceRequest(
+                    account_id=request.key.account_id,
+                    instrument_id=request.instrument_id,
+                    price=_quotation(request.price),
+                    direction=direction,
+                    quantity=request.quantity_lots,
+                )
+            )
+        )
+        return CommissionQuote(
+            order_amount=quotation_to_decimal(response.initial_order_amount),
+            total_commission=quotation_to_decimal(response.executed_commission),
+            service_commission=quotation_to_decimal(response.service_commission),
+            deal_commission=quotation_to_decimal(response.deal_commission),
+        )
+
+    async def get_positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
+        self._validate_account(account_id)
+        async with self._snapshot_lock:
+            cached = self._positions_cache.get(account_id)
+            now = self._monotonic()
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            response = await self._broker_request(
+                (
+                    self.services.sandbox.get_sandbox_portfolio(account_id=account_id)
+                    if self._environment == "TEST"
+                    else self.services.operations.get_portfolio(account_id=account_id)
+                ),
+                snapshot_operation="GetSandboxPortfolio" if self._environment == "TEST" else "GetPortfolio",
+            )
+            blocked_instruments: set[str] = set()
+            if self._environment == "PROD":
+                inventory = await self._broker_request(
+                    self.services.operations.get_positions(account_id=account_id), snapshot_operation="GetPositions"
+                )
+                blocked_instruments = {
+                    item.instrument_uid for item in inventory.securities if item.blocked != 0 or item.exchange_blocked
+                }
+            positions = tuple(
+                BrokerPosition(
+                    instrument_id=item.instrument_uid,
+                    quantity_lots=quotation_to_decimal(item.quantity_lots),
+                    average_price=quotation_to_decimal(item.average_position_price),
+                    current_price=quotation_to_decimal(item.current_price),
+                    currency=str(item.average_position_price.currency).upper(),
+                    blocked=item.instrument_uid in blocked_instruments
+                    or bool(getattr(item, "blocked", False))
+                    or quotation_to_decimal(getattr(item, "blocked_lots", Quotation(units=0, nano=0))) != 0,
+                )
+                for item in response.positions
+                if str(getattr(item, "instrument_type", "")).upper().split("_")[-1] != "CURRENCY"
+            )
+            self._positions_cache[account_id] = (now + self._snapshot_ttl_seconds, positions)
+            return positions
+
+    async def get_free_cash(self, account_id: str, currency: str) -> Decimal:
+        self._validate_account(account_id)
+        async with self._snapshot_lock:
+            cached = self._money_cache.get(account_id)
+            now = self._monotonic()
+            if cached is None or cached[0] <= now:
+                response = await self._broker_request(
+                    (
+                        self.services.sandbox.get_sandbox_positions(account_id=account_id)
+                        if self._environment == "TEST"
+                        else self.services.operations.get_positions(account_id=account_id)
+                    ),
+                    snapshot_operation="GetSandboxPositions" if self._environment == "TEST" else "GetPositions",
+                )
+                values: dict[str, Decimal] = {}
+                for item in response.money:
+                    item_currency = str(item.currency).upper()
+                    values[item_currency] = values.get(item_currency, Decimal()) + _money_value(item)
+                for item in getattr(response, "blocked", ()):
+                    item_currency = str(item.currency).upper()
+                    values[item_currency] = values.get(item_currency, Decimal()) - _money_value(item)
+                if any(value < 0 for value in values.values()):
+                    raise ValueError("Blocked cash exceeds available balance")
+                cached = (now + self._snapshot_ttl_seconds, values)
+                self._money_cache[account_id] = cached
+            return cached[1].get(currency.upper(), Decimal())
+
+    async def invalidate_account_snapshot(self, account_id: str) -> None:
+        async with self._snapshot_lock:
+            self._positions_cache.pop(account_id, None)
+            self._money_cache.pop(account_id, None)
+
+    async def dispatch_limit_order(self, request: DispatchRequest) -> BrokerOrderState:
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        self._validate_account(request.account_id)
+        gate = None
+        permit_remaining_ms = None
+        if self._environment == "PROD":
+            self._validate_connection_binding(request)
+            gate = await self._submit_admission.authorize_submit(request)
+            if gate.denial is not None:
+                if gate.denial.outcome_uncertain or gate.denial.reason is SubmitDenialReason.ALREADY_CONSUMED:
+                    raise CoreOperationError(retryable=True)
+                return self._cancel_before_post(
+                    request,
+                    submit_denial_reason=gate.denial.reason,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                )
+            if gate.abort_proof is not None:
+                if gate.permit is None:
+                    raise CoreOperationError(retryable=False)
+                self._validate_permit_binding(request, gate.permit)
+                if (
+                    gate.abort_proof.permit_id != gate.permit.permit_id
+                    or gate.abort_proof.idempotency_key != gate.permit.idempotency_key
+                    or gate.abort_proof.request_fingerprint != gate.permit.request_fingerprint
+                    or gate.abort_proof.runtime_instance_id != gate.permit.runtime_instance_id
+                    or gate.abort_proof.generation != gate.permit.generation
+                    or gate.abort_proof.configuration_fingerprint != gate.permit.configuration_fingerprint
+                ):
+                    raise CoreOperationError(retryable=False)
+                return self._cancel_before_post(
+                    request,
+                    gate.abort_proof,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                    permit_remaining_ms=gate.permit_remaining_ms,
+                )
+            if gate.permit is None or gate.expires_monotonic is None:
+                raise CoreOperationError(retryable=False)
+            self._validate_permit_binding(request, gate.permit)
+            if self._market_expired(request) or self._monotonic() >= gate.expires_monotonic:
+                reason = "MARKET_EXPIRED_BEFORE_POST" if self._market_expired(request) else "PERMIT_EXPIRED_BEFORE_POST"
+                proof = self._submit_admission.abort_proof(request, gate.permit, reason)
+                remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
+                return self._cancel_before_post(
+                    request,
+                    proof,
+                    submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                    permit_remaining_ms=remaining_ms,
+                )
+            permit_remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
+
+        async def enter_sdk_post() -> Any:
+            if self._environment == "PROD":
+                if gate is None or gate.permit is None or gate.expires_monotonic is None:
+                    raise CoreOperationError(retryable=False)
+                market_expired = self._market_expired(request)
+                permit_expired = self._monotonic() >= gate.expires_monotonic
+                if market_expired or permit_expired:
+                    reason = "MARKET_EXPIRED_BEFORE_POST" if market_expired else "PERMIT_EXPIRED_BEFORE_POST"
+                    proof = self._submit_admission.abort_proof(request, gate.permit, reason)
+                    remaining_ms = _bounded_milliseconds((gate.expires_monotonic - self._monotonic()) * 1000)
+                    return self._cancel_before_post(
+                        request,
+                        proof,
+                        submit_authorization_elapsed_ms=gate.authorization_elapsed_ms,
+                        permit_remaining_ms=remaining_ms,
+                    )
+            return await self.services.orders.post_order(
+                instrument_id=request.instrument_id,
+                quantity=request.quantity_lots,
+                price=_quotation(request.limit_price),
+                direction=(
+                    OrderDirection.ORDER_DIRECTION_BUY
+                    if request.side.value == "BUY"
+                    else OrderDirection.ORDER_DIRECTION_SELL
+                ),
+                account_id=request.account_id,
+                order_type=OrderType.ORDER_TYPE_LIMIT,
+                order_id=request.idempotency_key,
+                price_type=PriceType.PRICE_TYPE_CURRENCY,
+            )
+
+        response = await self._broker_request(enter_sdk_post())
+        state = response if isinstance(response, BrokerOrderState) else _order_state(response)
+        if self._environment == "PROD" and state.pre_rpc_abort_proof is None:
+            state = state.model_copy(
+                update={
+                    "submit_authorization_elapsed_ms": gate.authorization_elapsed_ms,
+                    "permit_remaining_ms": permit_remaining_ms,
+                }
+            )
+        await self._invalidate_if_terminal(request.account_id, state)
+        return state
+
+    def is_bound_to(self, connection: BrokerConnection, admission: Any) -> bool:
+        return (
+            self._broker_connection is connection
+            and self._submit_admission is admission
+            and self._token == connection.token
+            and self._target == connection.target
+            and self._account_id == connection.account_id
+            and self._configuration_fingerprint == connection.configuration_fingerprint
+        )
+
+    def _validate_connection_binding(self, request: DispatchRequest) -> None:
+        connection = self._broker_connection
+        if (
+            connection is None
+            or request.broker_id != connection.broker_id
+            or request.account_id != connection.account_id
+            or request.configuration_fingerprint != connection.configuration_fingerprint
+        ):
+            raise CoreOperationError(retryable=False)
+
+    def _validate_permit_binding(self, request: DispatchRequest, permit: Any) -> None:
+        if (
+            request.market_valid_until is None
+            or request.submit_deadline is None
+            or request.admission_runtime_instance_id is None
+            or request.admission_generation is None
+            or request.admission_revision is None
+            or request.configuration_fingerprint is None
+        ):
+            raise CoreOperationError(retryable=False)
+        try:
+            authorization = SubmitAuthorizationRequest(
+                broker_id=UUID(request.broker_id),
+                account_id=request.account_id,
+                automation_id=UUID(request.automation_id),
+                idempotency_key=UUID(request.idempotency_key),
+                generation=request.admission_generation,
+                revision=request.admission_revision,
+                configuration_fingerprint=request.configuration_fingerprint,
+                instrument_uid=request.instrument_id,
+                lot_size=request.lot_size,
+                currency=request.reservation_currency,
+                side=request.side.value,
+                quantity_lots=request.quantity_lots,
+                limit_price=request.limit_price,
+                market_valid_until=floor_utc_millisecond(request.market_valid_until),
+                submit_deadline=floor_utc_millisecond(request.submit_deadline),
+            )
+            runtime_instance_id = UUID(request.admission_runtime_instance_id)
+        except (TypeError, ValueError) as error:
+            raise CoreOperationError(retryable=False) from error
+        if (
+            permit.runtime_instance_id != runtime_instance_id
+            or permit.idempotency_key != authorization.idempotency_key
+            or permit.generation != authorization.generation
+            or permit.revision != authorization.revision
+            or permit.configuration_fingerprint != authorization.configuration_fingerprint
+            or permit.request_fingerprint != submit_request_fingerprint(authorization)
+        ):
+            raise CoreOperationError(retryable=False)
+
+    def _market_expired(self, request: DispatchRequest) -> bool:
+        return (
+            request.market_valid_until is not None and floor_utc_millisecond(self._now()) >= request.market_valid_until
+        )
+
+    @staticmethod
+    def _cancel_before_post(
+        request: DispatchRequest,
+        proof: PreRpcAbortProof | None = None,
+        *,
+        submit_denial_reason: SubmitDenialReason | None = None,
+        submit_authorization_elapsed_ms: int | None = None,
+        permit_remaining_ms: int | None = None,
+    ) -> BrokerOrderState:
+        return BrokerOrderState(
+            broker_order_id="",
+            idempotency_key=request.idempotency_key,
+            status="CANCELLED",
+            requested_lots=request.quantity_lots,
+            executed_lots=0,
+            requested_amount=request.limit_price * request.quantity_lots * request.lot_size,
+            executed_amount=Decimal(),
+            estimated_commission=Decimal(),
+            executed_commission=Decimal(),
+            currency=request.reservation_currency,
+            pre_rpc_abort_proof=proof,
+            submit_denial_reason=submit_denial_reason,
+            submit_authorization_elapsed_ms=submit_authorization_elapsed_ms,
+            permit_remaining_ms=permit_remaining_ms,
+        )
+
+    def _validate_account(self, account_id: str) -> None:
+        if self._account_id and account_id != self._account_id:
+            raise ValueError("Broker account mismatch")
+
+    async def get_order_state(
+        self,
+        account_id: str,
+        broker_order_id: str,
+    ) -> BrokerOrderState:
+        self._validate_account(account_id)
+        response = await self._broker_request(
+            self.services.orders.get_order_state(
+                account_id=account_id,
+                order_id=broker_order_id,
+                price_type=PriceType.PRICE_TYPE_CURRENCY,
+            )
+        )
+        state = _order_state(response, order_state=True)
+        await self._invalidate_if_terminal(account_id, state)
+        return state
+
+    async def cancel_order(self, account_id: str, broker_order_id: str) -> None:
+        self._validate_account(account_id)
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        await self._broker_request(
+            self.services.orders.cancel_order(
+                account_id=account_id,
+                order_id=broker_order_id,
+            )
+        )
+
+    async def find_by_idempotency_key(
+        self,
+        account_id: str,
+        idempotency_key: str,
+    ) -> BrokerOrderState | None:
+        self._validate_account(account_id)
+        if self._environment == "PROD":
+            try:
+                response = await self._broker_request(
+                    self.services.orders.get_order_state(
+                        account_id=account_id,
+                        order_id=idempotency_key,
+                        price_type=PriceType.PRICE_TYPE_CURRENCY,
+                        order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST,
+                    )
+                )
+            except TInvestAdapterError as error:
+                if error.code in {"BROKER_ORDER_NOT_FOUND", "BROKER_REQUEST_LOOKUP_UNSUPPORTED"}:
+                    return None
+                raise
+            if response.order_request_id != idempotency_key:
+                return None
+            state = _order_state(response, order_state=True)
+            await self._invalidate_if_terminal(account_id, state)
+            return state
+        response = await self._broker_request(self.services.orders.get_orders(account_id=account_id))
+        for order in response.orders:
+            if order.order_request_id == idempotency_key:
+                state = _order_state(order, order_state=True)
+                await self._invalidate_if_terminal(account_id, state)
+                return state
+        return None
+
+    async def _invalidate_if_terminal(self, account_id: str, state: BrokerOrderState) -> None:
+        if state.status in {"FILLED", "REJECTED", "CANCELLED", "EXPIRED"}:
+            await self.invalidate_account_snapshot(account_id)
+
+    @staticmethod
+    def _snapshot_error(error: AioRequestError, *, snapshot_read: bool = False) -> TInvestAdapterError:
+        """Retry the observed TLS unwrap failure only for side-effect-free account reads."""
+        status = enum_name(error.code)
+        mapping = {
+            "UNAUTHENTICATED": ("BROKER_AUTH_FAILED", "Проверка токена не пройдена.", False),
+            "PERMISSION_DENIED": ("BROKER_FORBIDDEN", "Недостаточно прав доступа.", False),
+            "NOT_FOUND": ("BROKER_ORDER_NOT_FOUND", "Состояние заявки пока недоступно.", False),
+            "UNIMPLEMENTED": ("BROKER_REQUEST_LOOKUP_UNSUPPORTED", "Поиск заявки по ключу недоступен.", False),
+            "RESOURCE_EXHAUSTED": ("BROKER_RATE_LIMITED", "Превышен лимит запросов.", True),
+            "UNAVAILABLE": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
+            "DEADLINE_EXCEEDED": ("BROKER_UNAVAILABLE", "Площадка временно недоступна.", True),
+        }
+        code, message, retryable = mapping.get(
+            status,
+            ("BROKER_UNAVAILABLE", "Не удалось получить данные площадки.", False),  # noqa: RUF001
+        )
+        if snapshot_read and error.code is StatusCode.UNKNOWN and error.details.strip() == _TLS_UNWRAP_FAILURE:
+            retryable = True
+        return TInvestAdapterError(code, message, retryable=retryable)
+
+    async def _broker_request(
+        self,
+        request: Awaitable[Any],
+        *,
+        snapshot_operation: (
+            Literal["GetSandboxPortfolio", "GetSandboxPositions", "GetPortfolio", "GetPositions"] | None
+        ) = None,
+    ) -> Any:
+        """Translate SDK failures once; the runtime owns retry delays and recovery probes."""
+        active = {task for task in self._rpc_tasks if not task.done()}
+        if len(active) >= 2:
+            close = getattr(request, "close", None)
+            if close is not None:
+                close()
+            raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker requests are still pending.", retryable=True)
+        task = asyncio.ensure_future(request)
+        self._rpc_tasks.add(task)
+        task.add_done_callback(self._rpc_tasks.discard)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=self._request_timeout_seconds)
+            if task not in done:
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+                raise TInvestAdapterError("BROKER_UNAVAILABLE", "Broker request timed out.", retryable=True)
+            return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(_consume_task_result)
+            raise
+        except AioRequestError as error:
+            mapped = self._snapshot_error(error, snapshot_read=snapshot_operation is not None)
+            LOGGER.warning(
+                "Broker SDK request failed",
+                extra={
+                    "reason_code": "BROKER_SDK_REQUEST_FAILED",
+                    "data": {
+                        "operation": snapshot_operation or "broker_request",
+                        "grpc_status": error.code.name if isinstance(error.code, StatusCode) else "UNRECOGNIZED",
+                        "code": mapped.code,
+                        "retryable": mapped.retryable,
+                        "tls_unwrap_failure": error.details.strip() == _TLS_UNWRAP_FAILURE,
+                    },
+                },
+            )
+            raise mapped from error
+
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None:
+        positions = await self.get_positions(account_id)
+        for position in positions:
+            if position.instrument_id == instrument_id:
+                return position
+        return None
+
+    async def inspect_recent_operations(
+        self,
+        account_id: str,
+        instrument_id: str,
+        limit: int,
+    ) -> tuple[BrokerRecoveryOperation, ...]:
+        self._validate_account(account_id)
+        response = await self._broker_request(
+            self.services.operations.get_operations_by_cursor(
+                GetOperationsByCursorRequest(
+                    account_id=account_id,
+                    instrument_id=instrument_id,
+                    limit=limit,
+                )
+            )
+        )
+        return tuple(
+            BrokerRecoveryOperation(
+                operation_id=item.id,
+                side={"OPERATION_TYPE_BUY": OrderSide.BUY, "OPERATION_TYPE_SELL": OrderSide.SELL}.get(
+                    enum_name(item.type)
+                ),
+                executed=enum_name(item.state) == "OPERATION_STATE_EXECUTED",
+                occurred_at=floor_utc_millisecond(item.date),
+                quantity_units=Decimal(item.quantity_done),
+                price=quotation_to_decimal(item.price),
+                commission=quotation_to_decimal(item.commission),
+                currency=str(item.price.currency).upper(),
+            )
+            for item in response.items
+        )
+
+
+def _money_value(item: Any) -> Decimal:
+    units, nano = item.units, item.nano
+    currency = str(item.currency)
+    if (
+        type(units) is not int
+        or type(nano) is not int
+        or abs(nano) >= 1_000_000_000
+        or units * nano < 0
+        or units < 0
+        or nano < 0
+        or len(currency) != 3
+        or not currency.isascii()
+        or not currency.isalpha()
+    ):
+        raise ValueError("Invalid broker money units or currency")
+    return quotation_to_decimal(item)
+
+
+def _bounded_milliseconds(value: float) -> int:
+    return max(-_MAX_TIMING_MS, min(_MAX_TIMING_MS, floor(value)))
+
+
+def _quotation(value: Decimal) -> Quotation:
+    units = int(value.to_integral_value(rounding=ROUND_DOWN))
+    nano = int((value - Decimal(units)) * Decimal("1000000000"))
+    return Quotation(units=units, nano=nano)
+
+
+def _broker_timestamp(response: Any) -> datetime | None:
+    stage_times = tuple(
+        value
+        for stage in getattr(response, "stages", ())
+        if (value := getattr(stage, "execution_time", None)) is not None
+    )
+    if stage_times:
+        value = max(stage_times)
+        return floor_utc_millisecond(value) if isinstance(value, datetime) else None
+    value = getattr(response, "order_date", None)
+    return floor_utc_millisecond(value) if isinstance(value, datetime) else None
+
+
+def _order_state(response: Any, *, order_state: bool = False) -> BrokerOrderState:
+    statuses = {
+        "EXECUTION_REPORT_STATUS_NEW": "ACCEPTED",
+        "EXECUTION_REPORT_STATUS_PARTIALLYFILL": "PARTIALLY_FILLED",
+        "EXECUTION_REPORT_STATUS_FILL": "FILLED",
+        "EXECUTION_REPORT_STATUS_CANCELLED": "CANCELLED",
+        "EXECUTION_REPORT_STATUS_REJECTED": "REJECTED",
+    }
+    status = enum_name(response.execution_report_status)
+    initial = response.initial_order_price
+    return BrokerOrderState(
+        broker_order_id=response.order_id,
+        idempotency_key=response.order_request_id,
+        status=statuses.get(status, "UNCERTAIN"),
+        requested_lots=response.lots_requested,
+        executed_lots=response.lots_executed,
+        requested_amount=quotation_to_decimal(initial),
+        executed_amount=quotation_to_decimal(response.total_order_amount),
+        estimated_commission=quotation_to_decimal(response.initial_commission),
+        executed_commission=quotation_to_decimal(response.executed_commission),
+        currency=str(initial.currency).upper(),
+        executed_price=execution_unit_price(response, order_state=order_state),
+        executed_at=_broker_timestamp(response),
+    )

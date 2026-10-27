@@ -74,12 +74,14 @@ def test_worker_operational_timeouts_and_cache_values_are_configurable() -> None
         AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS="2.5",
         AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS="75",
         AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS="90",
+        BROKER_REQUEST_TIMEOUT_SECONDS="4.5",
     )
 
     assert settings.core_http_timeout_seconds == 13.5
     assert settings.analytics_http_timeout_seconds == 2.5
     assert settings.broker_recovery_probe_seconds == 75
     assert settings.account_snapshot_ttl_seconds == 90
+    assert settings.broker_request_timeout_seconds == 4.5
 
 
 def test_worker_operational_settings_keep_existing_timeouts_and_recovery_defaults() -> None:
@@ -89,6 +91,7 @@ def test_worker_operational_settings_keep_existing_timeouts_and_recovery_default
     assert settings.analytics_http_timeout_seconds == 1
     assert settings.broker_recovery_probe_seconds == 60
     assert settings.account_snapshot_ttl_seconds == 60
+    assert settings.broker_request_timeout_seconds == 10
 
 
 @pytest.mark.parametrize(
@@ -100,6 +103,7 @@ def test_worker_operational_settings_keep_existing_timeouts_and_recovery_default
         "AUTOMATON_ANALYTICS_HTTP_TIMEOUT_SECONDS",
         "AUTOMATON_BROKER_RECOVERY_PROBE_SECONDS",
         "AUTOMATON_ACCOUNT_SNAPSHOT_TTL_SECONDS",
+        "BROKER_REQUEST_TIMEOUT_SECONDS",
     ],
 )
 @pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity", "-Infinity"])
@@ -230,6 +234,13 @@ def test_strategy_settings_read_complete_environment_override(monkeypatch: pytes
     assert settings.order_retry_limit == 6
     assert settings.core_retry_limit == 7
     assert settings.enabled is False
+
+
+def test_strategy_retry_limit_is_documented_as_deprecated_compatibility_only():
+    field = StrategySettings.model_fields["order_retry_limit"]
+
+    assert "deprecated" in (field.description or "").lower()
+    assert "resend" in (field.description or "").lower()
 
 
 @pytest.mark.parametrize(

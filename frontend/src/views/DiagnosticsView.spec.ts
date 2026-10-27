@@ -20,6 +20,11 @@ const worker = {
     pending_count: 2, failed_count: 1, oldest_pending_at: "2026-10-03T08:30:00.000Z",
     oldest_pending_age_ms: 1800123, max_retry_count: 5,
   },
+  broker_runtime: {
+    status: "BLOCKED" as const, decision_eligibility: "UNKNOWN" as const,
+    reason: "PERMANENT_BROKER_ERROR" as const, last_started_at: "2026-10-03T08:59:00.000Z",
+    last_finished_at: "2026-10-03T08:59:01.000Z", last_success_at: null,
+  },
 }
 
 function deferred() {
@@ -105,6 +110,11 @@ it("shows Worker control progress and detailed outbox status separately from ser
   expect(screen.getByText("Версия Worker: 1.4.2")).toBeTruthy()
   expect(screen.getByText("Состояние доставки: DEGRADED")).toBeTruthy()
   expect(screen.getByText("Причина: Есть устаревшие события в очереди")).toBeTruthy()
+  expect(screen.getByRole("article", { name: "Состояние брокерского runtime" })).toBeTruthy()
+  expect(screen.getByText("Состояние: Брокер заблокирован")).toBeTruthy()
+  expect(screen.getByText("Причина: Постоянная ошибка брокерской операции")).toBeTruthy()
+  expect(screen.getByText("Готовность кадра для решения: UNKNOWN")).toBeTruthy()
+  expect(screen.getByText("Возраст наблюдения брокера: 0.1 с")).toBeTruthy()
   expect(screen.getByText("Ожидают доставки: 2")).toBeTruthy()
   expect(screen.getByText("Ошибки доставки: 1")).toBeTruthy()
   expect(screen.getByText("Максимум повторов: 5")).toBeTruthy()
@@ -112,6 +122,39 @@ it("shows Worker control progress and detailed outbox status separately from ser
   expect(screen.getByText("Возраст старейшего события: 1800.1 с")).toBeTruthy()
   expect(screen.getByText("2026-10-03T08:30:00.000Z").getAttribute("datetime")).toBe("2026-10-03T08:30:00.000Z")
   expect(screen.queryByText("Общий статус: OK")).toBeNull()
+})
+
+it("keeps broker failure separate from control progress and hides broker details", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+    ...snapshot,
+    status: "DEGRADED",
+    worker: {
+      ...worker,
+      reason: "CONTROL_PROGRESS",
+      broker_runtime: {
+        ...worker.broker_runtime,
+        status: "BLOCKED",
+        reason: "PERMANENT_BROKER_ERROR",
+        decision_eligibility: "UNKNOWN",
+      },
+    },
+  })))
+  render(DiagnosticsView)
+  await screen.findByText("Общий статус: DEGRADED")
+  expect(screen.getByText("Причина: Worker завершил цикл управления")).toBeTruthy()
+  expect(screen.getByText("Состояние: Брокер заблокирован")).toBeTruthy()
+  expect(screen.getByText("Причина: Постоянная ошибка брокерской операции")).toBeTruthy()
+  expect(screen.queryByText(/token|secret|Synthetic denial/i)).toBeNull()
+})
+
+it("shows UNKNOWN for an older Worker payload without broker diagnostics", async () => {
+  const { broker_runtime: _omitted, ...oldWorker } = worker
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ ...snapshot, worker: oldWorker })))
+  render(DiagnosticsView)
+  await screen.findByText("Общий статус: UNKNOWN")
+  expect(screen.getByText("Состояние: UNKNOWN")).toBeTruthy()
+  expect(screen.getByText("Причина: Наблюдение брокера ещё не получено")).toBeTruthy()
+  expect(screen.getByText("Готовность кадра для решения: UNKNOWN")).toBeTruthy()
 })
 
 it("shows unavailable Worker and outbox readings as dashes while preserving observed zero", async () => {
@@ -172,6 +215,9 @@ it("supports older payloads without Worker diagnostics and clears them on failed
   vi.stubGlobal("fetch", fetchMock)
   render(DiagnosticsView)
   await screen.findByText("Наблюдение Worker отсутствует в этом ответе")
+  expect(screen.getByRole("article", { name: "Состояние брокерского runtime" })).toBeTruthy()
+  expect(screen.getByText("Состояние: UNKNOWN")).toBeTruthy()
+  expect(screen.getByText("Готовность кадра для решения: UNKNOWN")).toBeTruthy()
   await fireEvent.click(screen.getByRole("button", { name: "Обновить" }))
   pending.reject(new Error("private"))
   await screen.findByRole("alert")

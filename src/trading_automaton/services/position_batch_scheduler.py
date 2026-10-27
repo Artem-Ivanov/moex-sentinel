@@ -96,7 +96,10 @@ class PositionBatchSchedulerService:
                 return self._result(item, snapshot, "ACTIVE_INTENT")
             if not item.commission_profile_available:
                 return self._result(item, snapshot, "COMMISSION_PROFILE_UNAVAILABLE")
-            if not (state.trading_status.limit_order_available and state.trading_status.api_trade_available):
+            if not (
+                state.trading_status.limit_order_available
+                and state.has_fresh_api_trade_availability(snapshot.created_at)
+            ):
                 return self._result(item, snapshot, "MARKET_SESSION_CLOSED")
             try:
                 evaluation = await self._decider.decide(item, state)

@@ -1,0 +1,19 @@
+{
+  "src/sentinel_contracts/worker_diagnostics.py": "4dabe175f3c9b9fccdb4e4bc6013228353968be83291e545b468c05593177d26",
+  "src/trading_automaton/storage/execution_diagnostics.py": "4c958effe0b89dc39c475891b87284b8df0ac220208b19d20b1957806aa3d23c",
+  "src/trading_automaton/runtime/streaming_coordinator.py": "7f1b7d51d7b71da49f4d1ea7dc4e23791bd43ab684303c4bafb3ca43d2097fba",
+  "src/trading_automaton/composition.py": "48c2b8bfb4a8514a11e659513d8e4c8f26bdf0403a531eb36be4ad17e4e9ba1e",
+  "src/trading_automaton/adapters/core_client.py": "3c5b66c9af11668c318c2fc6f7461802a04de665f711ea98714a001145375246",
+  "src/moex_sentinel/api/app.py": "bba4fa597c47711c4c1a7d798b61ccabcfb40a3083790447b4108f24fc374bc2",
+  "src/moex_sentinel/views/schemas/automations.py": "b7adfd06695b7ade0514be89fc413373eafefaa537f5c7f661f496b99d42e9a1",
+  "src/moex_sentinel/views/internal_automaton.py": "6ff8a25812b4da00416c6073d3d95db7814ee52f6beba5e985842f3684112ee6",
+  "src/moex_sentinel/services/runtime_versions.py": "b398e6b4fe8c7d1123b936ef64624ba322805cd4f25b4ed8cf0df075deaa0156",
+  "tests/contracts/test_execution_diagnostics.py": "bab2f109158e5bda70118f5e6532a2c7363400395d2776c50ee85b7821f51a82",
+  "tests/trading_automaton/storage/test_execution_diagnostics.py": "3b95e9790c65282345b16854114ab60c988ba01d95df655bd9a04d389c130e5a",
+  "tests/trading_automaton/runtime/test_execution_diagnostics_budget.py": "6f6796810c4ccd73cf18db85dafef9117f508fdb1e9a4773982c592f21af1bea",
+  "tests/trading_automaton/adapters/test_core_client.py": "0860b875c66f3a7ec4ed219cb715419019c19be01f103e840057e1f8b5fa04d2",
+  "tests/api/test_runtime_versions.py": "36dbdf76a12f7f57f779bc3d42cc955b811074e3708a335d9b08bdbc2aba5048",
+  "tests/api/test_internal_runtime.py": "7b912a67a20705b947bd3b60cc9dfa5972c7b7d1da405a7f034064bf4aa8de6b",
+  "tests/services/test_runtime_versions.py": "fbad1b5e22ac90e4322318052ee7e4ed643e180781fab3b2f445841aca75c0af",
+  "tests/trading_automaton/runtime/__init__.py": "209a1530e6e15008abd22c06c059608db371e46e5b5fcc8b0292de45211797b0"
+}

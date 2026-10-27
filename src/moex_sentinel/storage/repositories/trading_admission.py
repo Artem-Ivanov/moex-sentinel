@@ -10,7 +10,7 @@ from hmac import compare_digest
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from moex_sentinel.domain.trading_admission import (
@@ -20,6 +20,8 @@ from moex_sentinel.domain.trading_admission import (
     broker_configuration_fingerprint,
 )
 from moex_sentinel.storage.models.automation_facts import TradingAutomationModel
+from moex_sentinel.storage.models.order_facts import BrokerOrderEventModel, BrokerOrderModel
+from moex_sentinel.storage.models.position_facts import PositionLotModel
 from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
 from moex_sentinel.storage.models.trading_admission import (
     TradingAccountAdmissionModel,
@@ -29,7 +31,9 @@ from moex_sentinel.storage.models.trading_admission import (
     TradingSubmitReservationModel,
     WorkerRuntimeInstanceModel,
 )
+from moex_sentinel.storage.models.trading_observability import AutomationEventModel
 from moex_sentinel.storage.models.user_brokers import UserBrokerModel
+from sentinel_contracts.time import is_historical, require_utc_millisecond
 from sentinel_contracts.trading_admission import (
     AdmissionBaseline,
     AdmissionLimits,
@@ -56,6 +60,8 @@ from sentinel_contracts.trading_admission import (
     UpdateLimitsRequest,
     submit_request_fingerprint,
 )
+
+WORKER_UNCERTAIN_HOLD_REASON = "Uncertain broker intent could not be reconciled unambiguously"
 
 
 @dataclass(frozen=True)
@@ -124,8 +130,16 @@ class AdmissionSubmitContext:
 
 
 class TradingAdmissionRepository:
-    def __init__(self, factory: sessionmaker[Session]) -> None:
+    def __init__(self, factory: sessionmaker[Session], *, application_environment: str | None = None) -> None:
+        if application_environment is not None and application_environment not in {"TEST", "PROD"}:
+            raise ValueError("Unsupported application environment.")
         self._factory = factory
+        self._application_environment = application_environment
+
+    def _environment_matches(self, broker: UserBrokerModel | None) -> bool:
+        return broker is not None and (
+            self._application_environment is None or broker.environment == self._application_environment
+        )
 
     @staticmethod
     def _current_configuration_fingerprint(broker: UserBrokerModel, access_mode: str) -> str:
@@ -157,6 +171,7 @@ class TradingAdmissionRepository:
                 or broker.state != "ACTIVE"
                 or broker.external_account_id is None
                 or broker.environment != request.application_environment
+                or not self._environment_matches(broker)
             ):
                 raise ValueError("Configured worker broker scope is unavailable.")
 
@@ -230,6 +245,15 @@ class TradingAdmissionRepository:
         self, broker_id: str, worker_id: str, registered_after: datetime
     ) -> PendingRuntimeCandidate | None:
         with self._factory() as session:
+            broker = session.get(UserBrokerModel, broker_id)
+            if (
+                broker is None
+                or broker.archived_at is not None
+                or broker.state != "ACTIVE"
+                or broker.external_account_id is None
+                or not self._environment_matches(broker)
+            ):
+                raise ValueError("Pending runtime scope is unavailable.")
             candidates = session.scalars(
                 select(WorkerRuntimeInstanceModel)
                 .where(
@@ -256,6 +280,291 @@ class TradingAdmissionRepository:
             registration_status="PENDING",
             registered_at=runtime.registered_at,
         )
+
+    def expects_trading(self, broker_id: str) -> bool:
+        with self._factory() as session:
+            broker = session.get(UserBrokerModel, broker_id)
+            admission = session.get(TradingAccountAdmissionModel, broker_id)
+            if (
+                broker is None
+                or not self._environment_matches(broker)
+                or broker.archived_at is not None
+                or broker.state != "ACTIVE"
+                or broker.external_account_id is None
+                or admission is None
+                or admission.owner_runtime_instance_id is None
+                or admission.owner_generation is None
+            ):
+                return False
+            owner = session.get(WorkerRuntimeInstanceModel, admission.owner_runtime_instance_id)
+            if (
+                owner is None
+                or owner.user_broker_id != broker_id
+                or owner.environment != broker.environment
+                or owner.registration_status != RuntimeRegistrationStatus.OWNER.value
+                or owner.generation != admission.owner_generation
+                or owner.access_mode != "TRADE"
+                or not owner.strategy_enabled
+            ):
+                return False
+            return bool(
+                session.scalar(
+                    select(func.count())
+                    .select_from(TradingAutomationModel)
+                    .where(
+                        TradingAutomationModel.user_broker_id == broker_id,
+                        TradingAutomationModel.state == "IN_WORK",
+                        TradingAutomationModel.closed_at.is_(None),
+                    )
+                )
+            )
+
+    @staticmethod
+    def _has_age_policy_candidate(session: Session, broker_id: str) -> bool:
+        reservations = session.scalars(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.user_broker_id == broker_id,
+                TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+            )
+        )
+        return any(
+            isinstance((policy := reservation.payload.get("_age_policy")), dict)
+            and type(policy.get("version")) is int
+            and policy["version"] == 1
+            and isinstance(policy.get("expired_at"), str)
+            for reservation in reservations
+        )
+
+    @staticmethod
+    def _has_worker_technical_hold(session: Session, broker_id: str) -> bool:
+        automations = session.scalars(
+            select(TradingAutomationModel).where(
+                TradingAutomationModel.user_broker_id == broker_id,
+                TradingAutomationModel.state == "HOLD",
+                TradingAutomationModel.suspended_from_state == "IN_WORK",
+                TradingAutomationModel.hold_reason == WORKER_UNCERTAIN_HOLD_REASON,
+                TradingAutomationModel.closed_at.is_(None),
+            )
+        )
+        for automation in automations:
+            event = session.scalar(
+                select(AutomationEventModel)
+                .where(
+                    AutomationEventModel.user_broker_id == broker_id,
+                    AutomationEventModel.automation_id == automation.id,
+                    AutomationEventModel.fact_kind == "AUTOMATION_STATE_CHANGED",
+                )
+                .order_by(AutomationEventModel.sequence_number.desc())
+                .limit(1)
+            )
+            if event is not None and (
+                event.payload.get("state") == "HOLD"
+                and event.payload.get("suspended_from_state") == "IN_WORK"
+                and event.payload.get("hold_reason") == automation.hold_reason
+                and event.expected_revision + 1 == automation.revision
+            ):
+                return True
+        return False
+
+    def age_policy_candidate_ids(self, broker_id: str) -> frozenset[str]:
+        with self._factory() as session:
+            return frozenset(
+                reservation.idempotency_key
+                for reservation in session.scalars(
+                    select(TradingSubmitReservationModel).where(
+                        TradingSubmitReservationModel.user_broker_id == broker_id,
+                        TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+                    )
+                )
+                if isinstance((policy := reservation.payload.get("_age_policy")), dict)
+                and type(policy.get("version")) is int
+                and policy["version"] == 1
+                and isinstance(policy.get("expired_at"), str)
+            )
+
+    def age_policy_candidate_anchor_lots(self, broker_id: str) -> tuple[tuple[str, int], ...] | None:
+        """Return Core-known lots for unresolved age-policy UIDs; None means untrusted/missing metadata."""
+        with self._factory() as session:
+            reservations = session.scalars(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.user_broker_id == broker_id,
+                    TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+                )
+            ).all()
+            candidates = [
+                item
+                for item in reservations
+                if isinstance((policy := item.payload.get("_age_policy")), dict)
+                and type(policy.get("version")) is int
+                and policy["version"] == 1
+                and isinstance(policy.get("expired_at"), str)
+            ]
+            if not candidates:
+                return ()
+            result: dict[str, int] = {}
+            for reservation in candidates:
+                instrument = session.scalar(
+                    select(BrokerInstrumentModel).where(
+                        BrokerInstrumentModel.user_broker_id == broker_id,
+                        BrokerInstrumentModel.external_instrument_id == reservation.instrument_uid,
+                    )
+                )
+                if instrument is None or type(instrument.lot_size) is not int or instrument.lot_size <= 0:
+                    return None
+                prior = result.setdefault(reservation.instrument_uid, instrument.lot_size)
+                if prior != instrument.lot_size:
+                    return None
+            return tuple(sorted(result.items()))
+
+    def needs_age_policy_recovery(self, broker_id: str) -> bool:
+        with self._factory() as session:
+            return self._has_age_policy_candidate(session, broker_id) or self._has_worker_technical_hold(
+                session, broker_id
+            )
+
+    @staticmethod
+    def _age_policy_order_is_valid(
+        session: Session, reservation: TradingSubmitReservationModel, *, captured_at: datetime
+    ) -> bool:
+        policy = reservation.payload.get("_age_policy")
+        if (
+            not isinstance(policy, dict)
+            or type(policy.get("version")) is not int
+            or policy.get("version") != 1
+            or not isinstance(policy.get("expired_at"), str)
+        ):
+            return False
+        try:
+            expired_at = require_utc_millisecond(datetime.fromisoformat(policy["expired_at"].replace("Z", "+00:00")))
+        except (TypeError, ValueError):
+            return False
+        order = session.scalar(
+            select(BrokerOrderModel).where(
+                BrokerOrderModel.user_broker_id == reservation.user_broker_id,
+                BrokerOrderModel.idempotency_key == reservation.idempotency_key,
+            )
+        )
+        if (
+            order is None
+            or order.automation_id != reservation.automation_id
+            or not (
+                (order.state == "FAILED" and order.terminal_at is None)
+                or (order.state in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"} and order.terminal_at is not None)
+            )
+            or order.idempotency_key != reservation.idempotency_key
+            or order.side != reservation.side
+            or order.quantity_lots != reservation.quantity_lots
+        ):
+            return False
+        try:
+            require_utc_millisecond(order.created_at)
+            if not is_historical(order.created_at, expired_at) or expired_at > captured_at:
+                return False
+        except ValueError:
+            return False
+        event = session.scalar(
+            select(BrokerOrderEventModel)
+            .where(
+                BrokerOrderEventModel.user_broker_id == reservation.user_broker_id,
+                BrokerOrderEventModel.broker_order_id == order.id,
+                BrokerOrderEventModel.safe_reason == "ORDER_AGE_LIMIT_EXCEEDED",
+            )
+            .order_by(BrokerOrderEventModel.created_at, BrokerOrderEventModel.id)
+            .limit(1)
+        )
+        return (
+            event is not None
+            and event.occurred_at == expired_at
+            and event.from_state
+            in {"CREATED", "DISPATCH_PENDING", "SUBMITTING", "SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNCERTAIN"}
+            and event.to_state == "FAILED"
+            and event.safe_reason == "ORDER_AGE_LIMIT_EXCEEDED"
+            and event.safe_message == "Order exceeded 24-hour processing limit"
+        )
+
+    @staticmethod
+    def _account_positions_match_ledger(
+        session: Session, broker_id: str, anchors: tuple[ReconciliationPositionAnchor, ...]
+    ) -> bool:
+        broker_units = {item.instrument_uid: item.quantity_units for item in anchors}
+        ledger_units: dict[str, Decimal] = {}
+        rows = session.execute(
+            select(
+                BrokerInstrumentModel.external_instrument_id,
+                BrokerInstrumentModel.lot_size,
+                PositionLotModel.remaining_lots,
+            )
+            .join(
+                TradingAutomationModel,
+                and_(
+                    TradingAutomationModel.user_broker_id == PositionLotModel.user_broker_id,
+                    TradingAutomationModel.id == PositionLotModel.automation_id,
+                ),
+            )
+            .join(
+                BrokerInstrumentModel,
+                and_(
+                    BrokerInstrumentModel.user_broker_id == TradingAutomationModel.user_broker_id,
+                    BrokerInstrumentModel.id == TradingAutomationModel.instrument_id,
+                ),
+            )
+            .where(PositionLotModel.user_broker_id == broker_id)
+        )
+        for uid, lot_size, remaining_lots in rows:
+            ledger_units[uid] = ledger_units.get(uid, Decimal(0)) + Decimal(remaining_lots * lot_size)
+        return all(
+            broker_units.get(uid, Decimal(0)) == ledger_units.get(uid, Decimal(0))
+            for uid in set(broker_units) | set(ledger_units)
+        )
+
+    @staticmethod
+    def _request_worker_technical_resume(session: Session, broker_id: str, *, now: datetime) -> None:
+        holds = list(
+            session.scalars(
+                select(TradingAutomationModel).where(
+                    TradingAutomationModel.user_broker_id == broker_id,
+                    TradingAutomationModel.state == "HOLD",
+                    TradingAutomationModel.suspended_from_state == "IN_WORK",
+                    TradingAutomationModel.hold_reason == WORKER_UNCERTAIN_HOLD_REASON,
+                    TradingAutomationModel.closed_at.is_(None),
+                )
+            )
+        )
+        for automation in holds:
+            event = session.scalar(
+                select(AutomationEventModel)
+                .where(
+                    AutomationEventModel.user_broker_id == broker_id,
+                    AutomationEventModel.automation_id == automation.id,
+                    AutomationEventModel.fact_kind == "AUTOMATION_STATE_CHANGED",
+                )
+                .order_by(AutomationEventModel.sequence_number.desc())
+                .limit(1)
+            )
+            if event is None or not (
+                event.payload.get("state") == "HOLD"
+                and event.payload.get("suspended_from_state") == "IN_WORK"
+                and event.payload.get("hold_reason") == automation.hold_reason
+                and event.expected_revision + 1 == automation.revision
+            ):
+                continue
+            session.execute(
+                update(TradingAutomationModel)
+                .where(
+                    TradingAutomationModel.user_broker_id == broker_id,
+                    TradingAutomationModel.id == automation.id,
+                    TradingAutomationModel.state == "HOLD",
+                    TradingAutomationModel.suspended_from_state == "IN_WORK",
+                    TradingAutomationModel.revision == automation.revision,
+                    TradingAutomationModel.hold_reason == automation.hold_reason,
+                    TradingAutomationModel.resume_requested.is_(False),
+                    TradingAutomationModel.closed_at.is_(None),
+                )
+                .values(
+                    resume_requested=True,
+                    updated_at=now,
+                )
+            )
 
     def get_runtime_credential(self, runtime_instance_id: str) -> WorkerRuntimeCredentialRecord | None:
         with self._factory() as session:
@@ -738,6 +1047,41 @@ class TradingAdmissionRepository:
             )
 
     @staticmethod
+    def _settled_reservation_execution_is_valid(reservation: TradingSubmitReservationModel) -> bool:
+        payload = reservation.payload
+        executed_lots = payload.get("executed_lots", 0)
+        anchor_executed_lots = payload.get("anchor_executed_lots", 0)
+        age_policy = payload.get("_age_policy")
+        age_settlement = payload.get("settlement_reason") == "AGE_POLICY"
+        broker_unknown = payload.get("broker_outcome_unknown", False)
+        try:
+            executed_amount = Decimal(str(payload.get("executed_amount", "0")))
+            executed_commission = Decimal(str(payload.get("executed_commission", "0")))
+        except (ArithmeticError, ValueError):
+            return False
+        return (
+            type(executed_lots) is int
+            and 0 <= executed_lots <= reservation.quantity_lots
+            and type(anchor_executed_lots) is int
+            and 0 <= anchor_executed_lots <= executed_lots
+            and executed_amount.is_finite()
+            and executed_amount >= 0
+            and executed_commission.is_finite()
+            and executed_commission >= 0
+            and (executed_lots != 0 or executed_amount == 0)
+            and (executed_lots == 0 or executed_amount > 0)
+            and (
+                not age_settlement
+                or (
+                    isinstance(age_policy, dict)
+                    and type(age_policy.get("version")) is int
+                    and age_policy["version"] == 1
+                )
+            )
+            and (not broker_unknown or (age_settlement and payload.get("last_reconciled_order_state") == "UNKNOWN"))
+        )
+
+    @staticmethod
     def _apply_submit_settlement(
         session: Session,
         broker_id: str,
@@ -810,6 +1154,29 @@ class TradingAdmissionRepository:
         if valid and anchor_result is not None:
             anchor_id = str(anchor_result.reconciliation_id)
             for reservation in reservations:
+                anchor_lots = int(reservation.payload.get("anchor_executed_lots", 0))
+                prior_lots = int(reservation.payload.get("executed_lots", 0))
+                if reservation.state == SubmitReservationState.SETTLED.value:
+                    if reservation.payload.get(
+                        "anchor_reconciliation_id"
+                    ) != anchor_id or not TradingAdmissionRepository._settled_reservation_execution_is_valid(
+                        reservation
+                    ):
+                        valid = False
+                        break
+                    if prior_lots < anchor_lots:
+                        valid = False
+                        break
+                    if prior_lots > anchor_lots:
+                        uid_anchor = anchors.get(reservation.instrument_uid)
+                        if uid_anchor is None:
+                            valid = False
+                            break
+                        sign = Decimal(1) if reservation.side == "BUY" else Decimal(-1)
+                        expected_units[reservation.instrument_uid] += sign * Decimal(
+                            (prior_lots - anchor_lots) * uid_anchor.lot_size
+                        )
+                    continue
                 if reservation.payload.get("anchor_reconciliation_id") != anchor_id:
                     valid = False
                     break
@@ -817,48 +1184,39 @@ class TradingAdmissionRepository:
                 if uid_anchor is None:
                     valid = False
                     break
-                anchor_lots = int(reservation.payload.get("anchor_executed_lots", 0))
-                prior_lots = int(reservation.payload.get("executed_lots", 0))
-                if reservation.state == SubmitReservationState.SETTLED.value:
-                    lots = prior_lots
-                    state = None
-                    status = SubmitReservationState.SETTLED.value
-                    gross = Decimal(str(reservation.payload.get("executed_amount", "0")))
-                    fee = Decimal(str(reservation.payload.get("executed_commission", "0")))
-                else:
-                    state = states_by_id[reservation.idempotency_key][0]
-                    status = state.status.upper()
-                    lots = state.executed_lots if state.executed_lots is not None else -1
-                    gross = state.executed_amount
-                    fee = state.executed_commission
-                    prior_gross = Decimal(str(reservation.payload.get("executed_amount", "0")))
-                    prior_fee = Decimal(str(reservation.payload.get("executed_commission", "0")))
-                    if (
-                        not state.attributable
-                        or state.unknown_reason is not None
-                        or state.broker_order_id is None
-                        or state.instrument_uid != reservation.instrument_uid
-                        or state.side is None
-                        or state.side.value != reservation.side
-                        or state.requested_lots != reservation.quantity_lots
-                        or lots < prior_lots
-                        or lots < anchor_lots
-                        or lots > reservation.quantity_lots
-                        or gross is None
-                        or not gross.is_finite()
-                        or gross < prior_gross
-                        or fee is None
-                        or not fee.is_finite()
-                        or fee < prior_fee
-                        or state.currency != "RUB"
-                        or (status not in terminal_states and status not in active_states)
-                        or (status == "REJECTED" and lots != 0)
-                        or (lots == 0 and gross != 0)
-                        or (lots > 0 and gross <= 0)
-                    ):
-                        valid = False
-                        break
-                    updates.append((reservation, state, status in terminal_states))
+                state = states_by_id[reservation.idempotency_key][0]
+                status = state.status.upper()
+                lots = state.executed_lots if state.executed_lots is not None else -1
+                gross = state.executed_amount
+                fee = state.executed_commission
+                prior_gross = Decimal(str(reservation.payload.get("executed_amount", "0")))
+                prior_fee = Decimal(str(reservation.payload.get("executed_commission", "0")))
+                if (
+                    not state.attributable
+                    or state.unknown_reason is not None
+                    or state.broker_order_id is None
+                    or state.instrument_uid != reservation.instrument_uid
+                    or state.side is None
+                    or state.side.value != reservation.side
+                    or state.requested_lots != reservation.quantity_lots
+                    or lots < prior_lots
+                    or lots < anchor_lots
+                    or lots > reservation.quantity_lots
+                    or gross is None
+                    or not gross.is_finite()
+                    or gross < prior_gross
+                    or fee is None
+                    or not fee.is_finite()
+                    or fee < prior_fee
+                    or state.currency != "RUB"
+                    or (status not in terminal_states and status not in active_states)
+                    or (status == "REJECTED" and lots != 0)
+                    or (lots == 0 and gross != 0)
+                    or (lots > 0 and gross <= 0)
+                ):
+                    valid = False
+                    break
+                updates.append((reservation, state, status in terminal_states))
                 if lots < anchor_lots or gross is None or fee is None:
                     valid = False
                     break
@@ -922,6 +1280,7 @@ class TradingAdmissionRepository:
             if (
                 broker is None
                 or broker.environment != "PROD"
+                or not self._environment_matches(broker)
                 or broker.state != "ACTIVE"
                 or broker.archived_at is not None
                 or broker.external_account_id != baseline.account_id
@@ -1078,6 +1437,24 @@ class TradingAdmissionRepository:
             checked_at = final_clock() if require_unarmed else now
             if require_unarmed and (risk_snapshot_valid_until is None or risk_snapshot_valid_until <= checked_at):
                 raise AdmissionConflictError("Automatic reconciliation risk snapshot expired before save.")
+            unresolved_reservations = list(
+                session.scalars(
+                    select(TradingSubmitReservationModel).where(
+                        TradingSubmitReservationModel.user_broker_id == broker_id,
+                        TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+                    )
+                )
+            )
+            age_policy_recovery = bool(unresolved_reservations) and all(
+                isinstance(item.payload.get("_age_policy"), dict)
+                and item.payload["_age_policy"].get("version") == 1
+                for item in unresolved_reservations
+            )
+            technical_hold_recovery = (
+                result.scope == "ACCOUNT"
+                and not unresolved_reservations
+                and self._has_worker_technical_hold(session, broker_id)
+            )
             if (
                 broker is None
                 or broker.environment != "PROD"
@@ -1094,7 +1471,14 @@ class TradingAdmissionRepository:
                     require_unarmed
                     and (
                         admission.admission_status != AdmissionStatus.DISARMED.value
-                        or admission.recovery_only
+                        or (
+                            admission.recovery_only
+                            and not (
+                                result.scope == "ACCOUNT"
+                                and (age_policy_recovery or technical_hold_recovery)
+                                and admission.recovery_runtime_instance_id == admission.owner_runtime_instance_id
+                            )
+                        )
                         or admission.baseline_id is None
                         or result.captured_at.astimezone(ZoneInfo("Europe/Moscow")).date()
                         != checked_at.astimezone(ZoneInfo("Europe/Moscow")).date()
@@ -1119,17 +1503,23 @@ class TradingAdmissionRepository:
                 raise AdmissionConflictError("Broker configuration changed before reconciliation was saved.")
             if (
                 result.scope == "ACCOUNT"
-                and session.scalar(
-                    select(TradingSubmitReservationModel.reservation_id)
-                    .where(
-                        TradingSubmitReservationModel.user_broker_id == broker_id,
-                        TradingSubmitReservationModel.state.in_(("IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN")),
+                and unresolved_reservations
+                and not (
+                    require_unarmed
+                    and all(
+                        isinstance(item.payload.get("_age_policy"), dict)
+                        and item.payload["_age_policy"].get("version") == 1
+                        for item in unresolved_reservations
                     )
-                    .limit(1)
                 )
-                is not None
             ):
                 raise AdmissionConflictError("Account reconciliation cannot rewrite unresolved account reservations.")
+            if (
+                require_unarmed
+                and result.scope == "ACCOUNT"
+                and not self._account_positions_match_ledger(session, broker_id, result.position_anchors)
+            ):
+                raise AdmissionConflictError("Fresh account positions do not match the Core lot ledger.")
             result = self._reconcile_submit_reservations(
                 session,
                 admission,
@@ -1164,6 +1554,25 @@ class TradingAdmissionRepository:
                 result.status is ReconciliationStatus.ACCOUNT_ONLY and result.scope == "ACCOUNT" and not result.reasons
             )
             if trusted_anchor:
+                if (
+                    result.unresolved_reservation_count == 0
+                    and result.active_ordinary_order_count == 0
+                    and result.active_stop_order_count == 0
+                ):
+                    settled_reservations = session.scalars(
+                        select(TradingSubmitReservationModel).where(
+                            TradingSubmitReservationModel.user_broker_id == broker_id,
+                            TradingSubmitReservationModel.state == SubmitReservationState.SETTLED.value,
+                        )
+                    )
+                    for reservation in settled_reservations:
+                        if not self._settled_reservation_execution_is_valid(reservation):
+                            continue
+                        reservation.payload = {
+                            **reservation.payload,
+                            "anchor_reconciliation_id": model.reconciliation_id,
+                            "anchor_executed_lots": reservation.payload.get("executed_lots", 0),
+                        }
                 admission.reconciliation_id = model.reconciliation_id
                 if (
                     admission.recovery_only
@@ -1173,6 +1582,14 @@ class TradingAdmissionRepository:
                 ):
                     admission.recovery_only = False
                     admission.recovery_runtime_instance_id = None
+                if (
+                    require_unarmed
+                    and self._account_positions_match_ledger(session, broker_id, result.position_anchors)
+                    and result.unresolved_reservation_count == 0
+                    and result.active_ordinary_order_count == 0
+                    and result.active_stop_order_count == 0
+                ):
+                    self._request_worker_technical_resume(session, broker_id, now=result.captured_at)
             admission.revision += 1
             admission.admission_status = AdmissionStatus.DISARMED.value
             admission.arm_revision = None
@@ -1201,6 +1618,13 @@ class TradingAdmissionRepository:
         )
         if not unresolved:
             return result.model_copy(update={"unresolved_reservation_count": 0})
+        if result.scope == "ACCOUNT" and all(
+            isinstance(item.payload.get("_age_policy"), dict) and item.payload["_age_policy"].get("version") == 1
+            for item in unresolved
+        ):
+            return TradingAdmissionRepository._settle_age_policy_candidates(
+                session, result, unresolved, order_states=order_states
+            )
         reservations = list(
             session.scalars(
                 select(TradingSubmitReservationModel).where(
@@ -1387,6 +1811,130 @@ class TradingAdmissionRepository:
             }
         )
 
+    @staticmethod
+    def _settle_age_policy_candidates(
+        session: Session,
+        result: ReconciliationResult,
+        reservations: list[TradingSubmitReservationModel],
+        *,
+        order_states: tuple[AdmissionOrderState, ...],
+    ) -> ReconciliationResult:
+        states_by_id: dict[str, list[AdmissionOrderState]] = {}
+        for state in order_states:
+            states_by_id.setdefault(state.request_id, []).append(state)
+        expected_ids = {item.idempotency_key for item in reservations}
+        valid = (
+            result.scope == "ACCOUNT"
+            and result.status is ReconciliationStatus.ACCOUNT_ONLY
+            and not result.reasons
+            and result.active_ordinary_order_count == 0
+            and result.active_stop_order_count == 0
+            and set(states_by_id) == expected_ids
+            and all(len(items) == 1 for items in states_by_id.values())
+            and TradingAdmissionRepository._account_positions_match_ledger(
+                session, str(result.broker_id), result.position_anchors
+            )
+        )
+        updates: list[tuple[TradingSubmitReservationModel, AdmissionOrderState, bool]] = []
+        if valid:
+            for reservation in reservations:
+                state = states_by_id[reservation.idempotency_key][0]
+                if not TradingAdmissionRepository._age_policy_order_is_valid(
+                    session, reservation, captured_at=result.captured_at
+                ):
+                    valid = False
+                    break
+                durable_order = session.scalar(
+                    select(BrokerOrderModel).where(
+                        BrokerOrderModel.user_broker_id == reservation.user_broker_id,
+                        BrokerOrderModel.idempotency_key == reservation.idempotency_key,
+                    )
+                )
+                if durable_order is None:
+                    valid = False
+                    break
+                if state.unknown_reason == "REQUEST_NOT_FOUND" and not state.attributable:
+                    if durable_order.state != "FAILED" or durable_order.terminal_at is not None:
+                        valid = False
+                        break
+                    updates.append((reservation, state, True))
+                    continue
+                status = state.status.upper()
+                lots = state.executed_lots
+                amount = state.executed_amount
+                commission = state.executed_commission
+                prior_lots = int(reservation.payload.get("executed_lots", 0))
+                prior_amount = Decimal(str(reservation.payload.get("executed_amount", "0")))
+                prior_commission = Decimal(str(reservation.payload.get("executed_commission", "0")))
+                durable_status = durable_order.state
+                if (
+                    not state.attributable
+                    or state.unknown_reason is not None
+                    or state.broker_order_id is None
+                    or state.instrument_uid != reservation.instrument_uid
+                    or state.side is None
+                    or state.side.value != reservation.side
+                    or state.requested_lots != reservation.quantity_lots
+                    or lots is None
+                    or lots < prior_lots
+                    or lots > reservation.quantity_lots
+                    or amount is None
+                    or not amount.is_finite()
+                    or amount < prior_amount
+                    or commission is None
+                    or not commission.is_finite()
+                    or commission < prior_commission
+                    or state.currency != "RUB"
+                    or status not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "EXECUTED"}
+                    or (status != durable_status and not (status == "EXECUTED" and durable_status == "FILLED"))
+                    or durable_order.terminal_at is None
+                    or (lots == 0 and amount != 0)
+                    or (lots > 0 and amount <= 0)
+                ):
+                    valid = False
+                    break
+                updates.append((reservation, state, False))
+        if valid:
+            for reservation, state, broker_unknown in updates:
+                lots = int(reservation.payload.get("executed_lots", 0)) if broker_unknown else state.executed_lots
+                amount = (
+                    Decimal(str(reservation.payload.get("executed_amount", "0")))
+                    if broker_unknown
+                    else state.executed_amount
+                )
+                commission = (
+                    Decimal(str(reservation.payload.get("executed_commission", "0")))
+                    if broker_unknown
+                    else state.executed_commission
+                )
+                reservation.state = SubmitReservationState.SETTLED.value
+                reservation.reserved_cash = Decimal(0)
+                reservation.reserved_position_units = Decimal(0)
+                reservation.updated_at = result.captured_at
+                reservation.payload = {
+                    **reservation.payload,
+                    "settlement_reason": "AGE_POLICY",
+                    "broker_outcome_unknown": broker_unknown,
+                    "last_reconciled_order_state": "UNKNOWN" if broker_unknown else state.status,
+                    "anchor_reconciliation_id": str(result.reconciliation_id),
+                    "anchor_executed_lots": lots,
+                    "executed_lots": lots,
+                    "executed_amount": str(amount),
+                    "executed_commission": str(commission),
+                }
+            return result.model_copy(update={"can_arm": True, "unresolved_reservation_count": 0})
+        reasons = list(result.reasons)
+        if SubmitDenialReason.DATA_UNKNOWN not in reasons:
+            reasons.append(SubmitDenialReason.DATA_UNKNOWN)
+        return result.model_copy(
+            update={
+                "status": ReconciliationStatus.DATA_UNKNOWN,
+                "can_arm": False,
+                "unresolved_reservation_count": len(reservations),
+                "reasons": tuple(reasons),
+            }
+        )
+
     def get_submit_context(self, broker_id: str, automation_id: str, instrument_uid: str) -> AdmissionSubmitContext:
         with self._factory() as session:
             broker = session.get(UserBrokerModel, broker_id)
@@ -1526,7 +2074,12 @@ class TradingAdmissionRepository:
         with self._factory() as session:
             broker = session.get(UserBrokerModel, broker_id)
             admission = session.get(TradingAccountAdmissionModel, broker_id)
-            if broker is None or broker.external_account_id is None or admission is None:
+            if (
+                broker is None
+                or not self._environment_matches(broker)
+                or broker.external_account_id is None
+                or admission is None
+            ):
                 raise ValueError("Trading admission has not been registered for this account.")
             baseline_model = (
                 session.get(TradingAdmissionBaselineModel, admission.baseline_id)
@@ -1597,6 +2150,7 @@ class TradingAdmissionRepository:
             if (
                 broker is None
                 or broker.environment != "PROD"
+                or not self._environment_matches(broker)
                 or broker.state != "ACTIVE"
                 or broker.archived_at is not None
                 or broker.external_account_id is None
@@ -1619,7 +2173,12 @@ class TradingAdmissionRepository:
         with self._factory.begin() as session:
             broker = session.get(UserBrokerModel, broker_id, with_for_update=True)
             admission = session.get(TradingAccountAdmissionModel, broker_id, with_for_update=True)
-            if broker is None or admission is None or admission.revision != request.expected_revision:
+            if (
+                broker is None
+                or not self._environment_matches(broker)
+                or admission is None
+                or admission.revision != request.expected_revision
+            ):
                 raise AdmissionConflictError("Admission revision changed before arm.")
             owner = session.get(WorkerRuntimeInstanceModel, admission.owner_runtime_instance_id)
             baseline = session.get(TradingAdmissionBaselineModel, str(request.baseline_id))
@@ -1709,7 +2268,8 @@ class TradingAdmissionRepository:
             old_owner = session.get(WorkerRuntimeInstanceModel, str(request.old_runtime_instance_id))
             candidate = session.get(WorkerRuntimeInstanceModel, str(request.candidate_runtime_instance_id))
             if (
-                old_owner is None
+                not self._environment_matches(broker)
+                or old_owner is None
                 or candidate is None
                 or admission.owner_runtime_instance_id != old_owner.runtime_instance_id
                 or admission.owner_generation != request.old_generation
@@ -1767,7 +2327,11 @@ class TradingAdmissionRepository:
         with self._factory.begin() as session:
             broker = session.get(UserBrokerModel, broker_id, with_for_update=True)
             admission = session.get(TradingAccountAdmissionModel, broker_id, with_for_update=True)
-            if broker is None or admission is None or admission.revision != request.expected_revision:
+            if (
+                not self._environment_matches(broker)
+                or admission is None
+                or admission.revision != request.expected_revision
+            ):
                 raise AdmissionConflictError("Admission revision changed before revoke.")
             admission.revision += 1
             admission.admission_status = AdmissionStatus.DISARMED.value

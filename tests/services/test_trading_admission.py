@@ -20,6 +20,7 @@ from moex_sentinel.services.trading_admission_ports import (
 )
 from moex_sentinel.storage.database import create_database_engine, create_session_factory
 from moex_sentinel.storage.models import Base, TradingAutomationModel
+from moex_sentinel.storage.models.order_facts import BrokerOrderEventModel
 from moex_sentinel.storage.models.trading_admission import (
     TradingAccountAdmissionModel,
     TradingAdmissionEventModel,
@@ -27,6 +28,7 @@ from moex_sentinel.storage.models.trading_admission import (
     TradingSubmitReservationModel,
     WorkerRuntimeInstanceModel,
 )
+from moex_sentinel.storage.models.trading_observability import AutomationEventModel
 from moex_sentinel.storage.models.user_brokers import UserBrokerModel
 from moex_sentinel.storage.repositories.trading_admission import (
     AdmissionConflictError,
@@ -38,6 +40,7 @@ from sentinel_contracts.trading_admission import (
     AdmissionBaseline,
     AdmissionLimits,
     AdmissionStatus,
+    ArmRequest,
     OwnerStoppedRequest,
     PendingRuntimeCandidate,
     ReconciliationPositionAnchor,
@@ -52,7 +55,14 @@ from sentinel_contracts.trading_admission import (
     SubmitPermit,
     UpdateLimitsRequest,
 )
-from tests.storage.trading_facts_helpers import automation_model, instrument_model, user_broker_model
+from tests.storage.trading_facts_helpers import (
+    automation_model,
+    decision_model,
+    instrument_model,
+    order_model,
+    position_cycle_model,
+    user_broker_model,
+)
 
 NOW = datetime(2026, 10, 9, 12, tzinfo=UTC)
 BROKER_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -122,6 +132,340 @@ def test_trade_first_registration_never_invents_an_owner_generation(admission_se
     assert result.lease_expires_at is None
 
 
+@pytest.mark.parametrize(
+    ("unknown_reason", "position_units", "expected_status", "expected_reservation_state"),
+    [
+        ("REQUEST_NOT_FOUND", Decimal(0), ReconciliationStatus.ACCOUNT_ONLY, "SETTLED"),
+        ("REQUEST_LOOKUP_UNSUPPORTED", Decimal(0), ReconciliationStatus.DATA_UNKNOWN, "UNKNOWN"),
+        ("REQUEST_NOT_FOUND", Decimal(10), ReconciliationStatus.DATA_UNKNOWN, "UNKNOWN"),
+    ],
+)
+def test_account_reconcile_settles_only_exact_age_policy_unknown_with_matching_ledger(
+    core_engine, unknown_reason, position_units, expected_status, expected_reservation_state
+):
+    factory = create_session_factory(core_engine)
+    broker_id = str(BROKER_ID)
+    key = str(uuid4())
+    created_at = NOW - timedelta(hours=25)
+    expired_at = NOW
+    captured_at = NOW
+    with factory.begin() as session:
+        broker = user_broker_model(broker_id, "synthetic-account")
+        broker.environment = "PROD"
+        instrument = instrument_model("age-instrument", broker_id)
+        instrument.external_instrument_id = "age-uid"
+        automation = automation_model("age-automation", user_broker_id=broker_id, instrument_id=instrument.id)
+        cycle = position_cycle_model("age-cycle")
+        cycle.user_broker_id = broker_id
+        cycle.automation_id = automation.id
+        cycle.instrument_id = instrument.id
+        session.add(broker)
+        session.flush()
+        session.add(instrument)
+        session.flush()
+        session.add(automation)
+        session.flush()
+        session.add(cycle)
+        session.flush()
+        decision = decision_model(
+            "age-decision", user_broker_id=broker_id, automation_id=automation.id, instrument_id=instrument.id
+        )
+        decision.position_cycle_id = cycle.id
+        session.add(decision)
+        session.flush()
+        order = order_model(
+            "age-order",
+            decision_id=decision.id,
+            user_broker_id=broker_id,
+            automation_id=automation.id,
+            instrument_id=instrument.id,
+            idempotency_key=key,
+        )
+        order.position_cycle_id = cycle.id
+        order.state = "FAILED"
+        order.created_at = created_at
+        order.updated_at = captured_at
+        session.add(order)
+        session.flush()
+        session.add(
+            BrokerOrderEventModel(
+                id="age-event",
+                fact_id="age-event-fact",
+                user_broker_id=broker_id,
+                automation_id=automation.id,
+                broker_order_id=order.id,
+                from_state="ACCEPTED",
+                to_state="FAILED",
+                safe_reason="ORDER_AGE_LIMIT_EXCEEDED",
+                safe_message="Order exceeded 24-hour processing limit",
+                occurred_at=expired_at,
+                created_at=captured_at,
+            )
+        )
+        reservation = TradingSubmitReservationModel(
+            reservation_id=str(uuid4()),
+            user_broker_id=broker_id,
+            automation_id=automation.id,
+            idempotency_key=key,
+            request_fingerprint="f" * 64,
+            state="UNKNOWN",
+            runtime_instance_id=str(RUNTIME_A),
+            generation=1,
+            configuration_fingerprint="a" * 64,
+            permit_id=None,
+            side="BUY",
+            instrument_uid="age-uid",
+            quantity_lots=1,
+            limit_price=Decimal("10"),
+            requested_amount=Decimal("100"),
+            reserved_cash=Decimal("101"),
+            reserved_position_units=Decimal(0),
+            payload={
+                "_age_policy": {
+                    "version": 1,
+                    "expired_at": expired_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                }
+            },
+            created_at=created_at,
+            updated_at=captured_at,
+        )
+        session.add(reservation)
+        session.add(
+            TradingAccountAdmissionModel(
+                user_broker_id=broker_id,
+                revision=1,
+                admission_status="DISARMED",
+                recovery_only=False,
+            )
+        )
+        session.flush()
+        result = ReconciliationResult(
+            reconciliation_id=uuid4(),
+            broker_id=BROKER_ID,
+            account_id="synthetic-account",
+            scope="ACCOUNT",
+            owner_runtime_instance_id=RUNTIME_A,
+            owner_generation=1,
+            configuration_fingerprint="a" * 64,
+            status=ReconciliationStatus.ACCOUNT_ONLY,
+            canary_uid=None,
+            captured_at=captured_at,
+            valid_until=captured_at + timedelta(seconds=20),
+            can_arm=True,
+            position_anchor_units=None,
+            active_ordinary_order_count=0,
+            active_stop_order_count=0,
+            unresolved_reservation_count=1,
+            reasons=(),
+            risk_snapshot_id=uuid4(),
+            position_anchors=(
+                ReconciliationPositionAnchor(instrument_uid="age-uid", quantity_units=position_units, lot_size=10),
+            ),
+        )
+        state = AdmissionOrderState(
+            request_id=key,
+            broker_order_id=None,
+            instrument_uid=None,
+            side=None,
+            requested_lots=None,
+            executed_lots=None,
+            executed_amount=None,
+            executed_commission=None,
+            currency=None,
+            status="UNKNOWN",
+            attributable=False,
+            unknown_reason=unknown_reason,
+        )
+        admission = session.get(TradingAccountAdmissionModel, broker_id)
+        reconciled = TradingAdmissionRepository._reconcile_submit_reservations(
+            session, admission, result, order_states=(state,)
+        )
+        assert reconciled.status is expected_status
+        session.flush()
+        assert reservation.state == expected_reservation_state
+        if expected_reservation_state == "SETTLED":
+            assert reservation.reserved_cash == reservation.reserved_position_units == 0
+            assert reservation.payload["settlement_reason"] == "AGE_POLICY"
+            assert reservation.payload["broker_outcome_unknown"] is True
+            assert reservation.payload["last_reconciled_order_state"] == "UNKNOWN"
+            assert reservation.payload["_age_policy"]["version"] == 1
+
+
+def test_verified_late_fill_delta_matches_next_submit_position_projection():
+    anchor_id = str(uuid4())
+    settled = AdmissionReservationRecord(
+        idempotency_key="age-order",
+        state="SETTLED",
+        side="BUY",
+        instrument_uid="late-fill-uid",
+        requested_amount=Decimal("1000"),
+        reserved_cash=Decimal(0),
+        reserved_position_units=Decimal(0),
+        quantity_lots=1,
+        runtime_instance_id=str(RUNTIME_A),
+        generation=1,
+        anchor_reconciliation_id=anchor_id,
+        anchor_executed_lots=0,
+        executed_lots=1,
+        executed_amount=Decimal("1000"),
+        executed_commission=Decimal("1"),
+    )
+    active = AdmissionReservationRecord(
+        idempotency_key="next-order",
+        state="IN_FLIGHT",
+        side="BUY",
+        instrument_uid="late-fill-uid",
+        requested_amount=Decimal("1000"),
+        reserved_cash=Decimal("1001"),
+        reserved_position_units=Decimal(0),
+        quantity_lots=1,
+        runtime_instance_id=str(RUNTIME_A),
+        generation=1,
+        anchor_reconciliation_id=anchor_id,
+        anchor_executed_lots=0,
+        executed_lots=0,
+        executed_amount=Decimal(0),
+        executed_commission=Decimal(0),
+    )
+    reconciliation = ReconciliationResult(
+        reconciliation_id=UUID(anchor_id),
+        broker_id=BROKER_ID,
+        account_id="synthetic-account",
+        scope="ACCOUNT",
+        owner_runtime_instance_id=RUNTIME_A,
+        owner_generation=1,
+        configuration_fingerprint="a" * 64,
+        status=ReconciliationStatus.ACCOUNT_ONLY,
+        canary_uid=None,
+        captured_at=NOW,
+        valid_until=NOW + timedelta(seconds=20),
+        can_arm=True,
+        position_anchor_units=None,
+        active_ordinary_order_count=1,
+        active_stop_order_count=0,
+        unresolved_reservation_count=1,
+        reasons=(),
+        risk_snapshot_id=uuid4(),
+        position_anchors=(
+            ReconciliationPositionAnchor(
+                instrument_uid="late-fill-uid",
+                quantity_units=Decimal(0),
+                lot_size=10,
+            ),
+        ),
+    )
+    context = SimpleNamespace(reservations=(settled, active), reconciliation=reconciliation)
+    order_state = AdmissionOrderState(
+        request_id="next-order",
+        broker_order_id="next-broker-order",
+        instrument_uid="late-fill-uid",
+        side=OrderSide.BUY,
+        requested_lots=1,
+        executed_lots=0,
+        executed_amount=Decimal(0),
+        executed_commission=Decimal(0),
+        currency="RUB",
+        status="NEW",
+        attributable=True,
+        unknown_reason=None,
+    )
+    snapshot = SimpleNamespace(
+        order_states=(order_state,),
+        ordinary_orders=(
+            AdmissionOrder(
+                broker_order_id="next-broker-order",
+                instrument_uid="late-fill-uid",
+                request_id="next-order",
+                status="NEW",
+                side=OrderSide.BUY,
+                quantity_lots=1,
+            ),
+        ),
+    )
+
+    projection = TradingAdmissionService._project_submit_reservations(
+        context,
+        snapshot,
+        {"late-fill-uid": (Decimal(10), NOW)},
+        {
+            "late-fill-uid": AdmissionInstrument(
+                "late-fill-uid", "SHARE", "RUB", 10, Decimal("0.01"), True, Decimal(100), NOW
+            )
+        },
+    )
+
+    assert isinstance(projection, tuple)
+    assert projection[0] == settled
+    assert projection[1].state == "BROKER_ACTIVE"
+
+
+@pytest.mark.parametrize(
+    ("hold_reason", "event_expected_revision", "automation_revision", "should_resume"),
+    [
+        (
+            "Uncertain broker intent could not be reconciled unambiguously",
+            1,
+            2,
+            True,
+        ),
+        ("Invalid worker session", 1, 2, False),
+        (
+            "Uncertain broker intent could not be reconciled unambiguously",
+            1,
+            3,
+            False,
+        ),
+    ],
+)
+def test_automatic_resume_requires_exact_worker_technical_hold_and_current_revision(
+    core_engine, hold_reason, event_expected_revision, automation_revision, should_resume
+):
+    factory = create_session_factory(core_engine)
+    broker_id = str(BROKER_ID)
+    automation_id = "technical-hold-automation"
+    with factory.begin() as session:
+        session.add(user_broker_model(broker_id, "synthetic-account"))
+        session.flush()
+        session.add(instrument_model("technical-hold-instrument", broker_id))
+        session.flush()
+        automation = automation_model(
+            automation_id,
+            user_broker_id=broker_id,
+            instrument_id="technical-hold-instrument",
+            state="HOLD",
+        )
+        automation.suspended_from_state = "IN_WORK"
+        automation.hold_reason = hold_reason
+        automation.revision = automation_revision
+        session.add(automation)
+        session.flush()
+        session.add(
+            AutomationEventModel(
+                event_id=str(uuid4()),
+                automation_id=automation_id,
+                user_broker_id=broker_id,
+                sequence_number=1,
+                expected_revision=event_expected_revision,
+                fact_kind="AUTOMATION_STATE_CHANGED",
+                safe_message=hold_reason,
+                payload={
+                    "state": "HOLD",
+                    "suspended_from_state": "IN_WORK",
+                    "hold_reason": hold_reason,
+                },
+                occurred_at=NOW,
+                received_at=NOW,
+            )
+        )
+    with factory.begin() as session:
+        TradingAdmissionRepository._request_worker_technical_resume(session, broker_id, now=NOW)
+    with factory() as session:
+        current = session.get(TradingAutomationModel, automation_id)
+        assert current.state == "HOLD"
+        assert current.revision == automation_revision
+        assert current.resume_requested is should_resume
+
+
 def test_pending_runtime_lookup_is_read_only_and_scoped(admission_service):
     admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
     pending = admission_service.register_runtime(request(RUNTIME_B, access_mode="TRADE"), SECRET_B)
@@ -170,11 +514,98 @@ def test_submit_context_rejects_automation_for_another_instrument(admission_serv
                 instrument_id=unrelated.id,
             )
         )
-
-    with pytest.raises(ValueError, match="automation instrument"):
+    with pytest.raises(ValueError, match="automation instrument does not match"):
         admission_service._repository.get_submit_context(
             str(BROKER_ID), "00000000-0000-4000-8000-000000000004", "canary-uid"
         )
+
+
+def test_test_environment_repository_cannot_update_prod_admission(admission_service, core_engine):
+    factory = create_session_factory(core_engine)
+    with factory.begin() as session:
+        session.add(
+            TradingAccountAdmissionModel(
+                user_broker_id=str(BROKER_ID),
+                revision=1,
+                admission_status="DISARMED",
+                recovery_only=False,
+            )
+        )
+    repository = TradingAdmissionRepository(factory, application_environment="TEST")
+    request = UpdateLimitsRequest(
+        expected_revision=1,
+        limits=AdmissionLimits(
+            currency="RUB",
+            max_order_notional=Decimal("1000"),
+            exposure_scope="ACCOUNT_GROSS",
+            max_exposure=Decimal("5000"),
+            max_outstanding_orders=3,
+            max_daily_loss=Decimal("250"),
+        ),
+    )
+
+    with pytest.raises(AdmissionConflictError):
+        repository.update_limits(str(BROKER_ID), request, actor="test-operator", now=NOW)
+
+    with factory() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        assert admission is not None
+        assert admission.revision == 1
+        assert admission.limits is None
+
+
+def test_expects_trading_uses_work_intent_and_bound_trade_owner_without_lease_gate(admission_service, core_engine):
+    admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
+    factory = create_session_factory(core_engine)
+    with factory.begin() as session:
+        owner = session.get(WorkerRuntimeInstanceModel, str(RUNTIME_A))
+        assert owner is not None
+        owner.access_mode = "TRADE"
+        owner.strategy_enabled = True
+        owner.lease_expires_at = NOW
+        other_broker_id = "00000000-0000-4000-8000-000000000099"
+        other_broker = user_broker_model(other_broker_id, "another-selected-account")
+        other_broker.environment = "PROD"
+        other_broker.fqdn = "invest-public-api.tbank.ru:443"
+        session.add(other_broker)
+        session.flush()
+        other_instrument = instrument_model("other-account-instrument", other_broker_id)
+        session.add(other_instrument)
+        session.flush()
+        session.add(
+            automation_model(
+                "00000000-0000-4000-8000-000000000098",
+                user_broker_id=other_broker_id,
+                instrument_id=other_instrument.id,
+                state="IN_WORK",
+            )
+        )
+    service = TradingAdmissionService(
+        TradingAdmissionRepository(factory, application_environment="PROD"), clock=lambda: NOW
+    )
+
+    assert not service.expects_trading(BROKER_ID)
+    assert not service.expects_trading(UUID("00000000-0000-4000-8000-000000000099"))
+
+    with factory.begin() as session:
+        instrument = instrument_model("expected-work-instrument", str(BROKER_ID))
+        session.add(instrument)
+        session.flush()
+        session.add(
+            automation_model(
+                "00000000-0000-4000-8000-000000000004",
+                user_broker_id=str(BROKER_ID),
+                instrument_id=instrument.id,
+                state="IN_WORK",
+            )
+        )
+    assert service.expects_trading(BROKER_ID)
+
+    with factory.begin() as session:
+        automation = session.get(TradingAutomationModel, "00000000-0000-4000-8000-000000000004")
+        assert automation is not None
+        automation.state = "HOLD"
+    assert not service.expects_trading(BROKER_ID)
 
 
 def test_unresolved_reservations_are_checked_by_fresh_submit_settlement_not_view_gate():
@@ -542,6 +973,111 @@ def test_daily_preparation_accepts_baseline_but_skips_canary_in_recovery(admissi
     assert duplicate.reason is None
     assert risk.calls == [None]
     assert admission_service.view(str(BROKER_ID)).revision == revision
+
+
+def test_daily_preparation_recovers_technical_hold_without_unresolved_reservations(admission_service, core_engine):
+    admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
+    with admission_service._repository._factory.begin() as session:
+        owner = session.get(WorkerRuntimeInstanceModel, str(RUNTIME_A))
+        owner.access_mode = "TRADE"
+        owner.strategy_enabled = True
+        broker = session.get(UserBrokerModel, str(BROKER_ID))
+        broker.fqdn = "invest-public-api.tbank.ru:443"
+        fingerprint = broker_configuration_fingerprint(
+            account_id="synthetic-account",
+            access_mode="TRADE",
+            adapter_code="t_invest",
+            broker_id=str(BROKER_ID),
+            environment="PROD",
+            target=broker.fqdn,
+            token="synthetic-token",  # noqa: S106 - deterministic test credential.
+        )
+        session.get(TradingAccountAdmissionModel, str(BROKER_ID)).configuration_fingerprint = fingerprint
+    with admission_service._repository._factory.begin() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        admission.recovery_only = True
+        admission.recovery_runtime_instance_id = str(RUNTIME_A)
+        automation = automation_model(
+            "cancelled-technical-hold",
+            user_broker_id=str(BROKER_ID),
+            instrument_id="technical-hold-instrument",
+            state="HOLD",
+        )
+        automation.revision = 2
+        automation.suspended_from_state = "IN_WORK"
+        automation.hold_reason = "Uncertain broker intent could not be reconciled unambiguously"
+        session.add(instrument_model("technical-hold-instrument", str(BROKER_ID)))
+        session.flush()
+        session.add(automation)
+        session.flush()
+        session.add(
+            AutomationEventModel(
+                event_id=str(uuid4()),
+                automation_id=automation.id,
+                user_broker_id=str(BROKER_ID),
+                sequence_number=1,
+                expected_revision=1,
+                fact_kind="AUTOMATION_STATE_CHANGED",
+                safe_message=automation.hold_reason,
+                payload={
+                    "state": "HOLD",
+                    "suspended_from_state": "IN_WORK",
+                    "hold_reason": automation.hold_reason,
+                },
+                occurred_at=NOW,
+                received_at=NOW,
+            )
+        )
+
+    class CompleteRisk:
+        async def collect(self, _connection, **_kwargs):
+            return AdmissionRiskSnapshot(
+                snapshot_id=str(uuid4()),
+                account_id="synthetic-account",
+                capture_started_at=NOW - timedelta(seconds=2),
+                captured_at=NOW - timedelta(seconds=1),
+                valid_until=NOW + timedelta(seconds=20),
+                equity=Decimal("100000"),
+                equity_currency="RUB",
+                money=Decimal("100000"),
+                money_currency="RUB",
+                blocked_cash=Decimal(0),
+                blocked_cash_currency="RUB",
+                money_loaded=True,
+                positions=(),
+                ordinary_orders=(),
+                stop_orders=(),
+                order_states=(),
+                operations=(),
+                operations_complete=True,
+                operations_through=NOW - timedelta(seconds=1),
+                instrument=None,
+            )
+
+    admission_service._risk = CompleteRisk()
+    admission_service._connection_resolver = lambda _broker_id: BrokerConnection(
+        broker_id=str(BROKER_ID),
+        adapter_code="t_invest",
+        target="invest-public-api.tbank.ru:443",
+        token="synthetic-token",  # noqa: S106 - deterministic test credential.
+        is_test=False,
+        environment="PROD",
+        access_mode="TRADE",
+        account_id="synthetic-account",
+        configuration_fingerprint=fingerprint,
+    )
+
+    result = asyncio.run(admission_service.prepare_daily(str(BROKER_ID)))
+
+    assert result.reason is None
+    view = admission_service.view(str(BROKER_ID))
+    assert view.recovery_only is False
+    with admission_service._repository._factory() as session:
+        current = session.get(TradingAutomationModel, "cancelled-technical-hold")
+        assert current.state == "HOLD"
+        assert current.resume_requested is True
+        assert current.revision == 2
+        assert session.query(TradingSubmitReservationModel).count() == 0
 
 
 def test_expired_owner_lease_cannot_be_renewed_and_does_not_create_sticky_stop(admission_service, core_engine):
@@ -1335,7 +1871,8 @@ def test_submit_permit_is_consumed_once_and_reconciles_fill_before_next_request(
     assert next_day_view.arm_revision is None
 
 
-def test_closed_uid_anchor_survives_later_account_grants(admission_service, core_engine):
+@pytest.mark.parametrize(("filled_lots", "filled_units"), [(0, 0), (1, 10)])
+def test_closed_uid_anchor_survives_later_account_grants(admission_service, core_engine, filled_lots, filled_units):
     owner = admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
     repository = admission_service._repository
     factory = create_session_factory(core_engine)
@@ -1434,11 +1971,16 @@ def test_closed_uid_anchor_survives_later_account_grants(admission_service, core
         def __init__(self):
             self.states = {}
             self.instrument_requests = []
+            self.position_units = {}
 
         async def collect(self, _connection, *, instrument_uid, request_ids=(), instrument_uids=(), **_kwargs):
             self.instrument_requests.append(tuple(instrument_uids))
             captured = NOW + timedelta(milliseconds=500)
-            all_uids = sorted(set(instrument_uids) | {instrument_uid})
+            all_uids = sorted(
+                set(instrument_uids)
+                | {uid for uid, quantity_units in self.position_units.items() if quantity_units > 0}
+                | {instrument_uid}
+            )
             instruments = tuple(
                 AdmissionInstrument(uid, "SHARE", "RUB", 10, Decimal("0.01"), True, Decimal("10"), captured)
                 for uid in all_uids
@@ -1456,7 +1998,19 @@ def test_closed_uid_anchor_survives_later_account_grants(admission_service, core
                 blocked_cash=Decimal(0),
                 blocked_cash_currency="RUB",
                 money_loaded=True,
-                positions=(),
+                positions=tuple(
+                    AdmissionPosition(
+                        instrument_uid=uid,
+                        quantity_units=Decimal(quantity_units),
+                        blocked_units=Decimal(0),
+                        mark_price=Decimal("10"),
+                        currency="RUB",
+                        lot_size=10,
+                        mark_captured_at=captured,
+                    )
+                    for uid, quantity_units in self.position_units.items()
+                    if quantity_units > 0
+                ),
                 ordinary_orders=(),
                 stop_orders=(),
                 order_states=tuple(self.states[key] for key in request_ids if key in self.states),
@@ -1516,14 +2070,15 @@ def test_closed_uid_anchor_survives_later_account_grants(admission_service, core
         instrument_uid="uid-a",
         side=OrderSide.BUY,
         requested_lots=1,
-        executed_lots=0,
-        executed_amount=Decimal(0),
-        executed_commission=Decimal(0),
+        executed_lots=filled_lots,
+        executed_amount=Decimal("100") if filled_lots else Decimal(0),
+        executed_commission=Decimal("1") if filled_lots else Decimal(0),
         currency="RUB",
-        status="CANCELLED",
+        status="FILLED" if filled_lots else "CANCELLED",
         attributable=True,
         unknown_reason=None,
     )
+    risk.position_units["uid-a"] = filled_units
     permit_b = asyncio.run(submit("uid-b", "000000000422"))
     assert isinstance(permit_b, SubmitPermit)
     with factory() as session:
@@ -1557,7 +2112,86 @@ def test_closed_uid_anchor_survives_later_account_grants(admission_service, core
         admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
         current = session.get(TradingReconciliationModel, admission.reconciliation_id)
         anchors = ReconciliationResult.model_validate(current.payload).position_anchors
-    assert any(anchor.instrument_uid == "uid-a" and anchor.quantity_units == 0 for anchor in anchors)
+    assert any(anchor.instrument_uid == "uid-a" and anchor.quantity_units == filled_units for anchor in anchors)
+
+    with factory.begin() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        settled = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == str(permit_c.idempotency_key)
+            )
+        )
+        terminal_c = AdmissionOrderState(
+            request_id=str(permit_c.idempotency_key),
+            broker_order_id="broker-c",
+            instrument_uid="uid-c",
+            side=OrderSide.BUY,
+            requested_lots=1,
+            executed_lots=0,
+            executed_amount=Decimal(0),
+            executed_commission=Decimal(0),
+            currency="RUB",
+            status="CANCELLED",
+            attributable=True,
+            unknown_reason=None,
+        )
+        assert repository._apply_submit_settlement(
+            session,
+            str(BROKER_ID),
+            admission,
+            (
+                ReconciliationPositionAnchor(instrument_uid="uid-a", quantity_units=Decimal(filled_units), lot_size=10),
+                ReconciliationPositionAnchor(instrument_uid="uid-b", quantity_units=Decimal(0), lot_size=10),
+                ReconciliationPositionAnchor(instrument_uid="uid-c", quantity_units=Decimal(0), lot_size=10),
+            ),
+            (terminal_c,),
+            now=NOW + timedelta(seconds=1),
+        )
+        assert settled.state == "SETTLED"
+        assert settled.reserved_cash == settled.reserved_position_units == 0
+
+    risk.position_units["uid-a"] = 0
+    rotation = ReconciliationResult(
+        reconciliation_id=UUID("00000000-0000-4000-8000-000000000424"),
+        broker_id=BROKER_ID,
+        account_id="synthetic-account",
+        scope="ACCOUNT",
+        owner_runtime_instance_id=RUNTIME_A,
+        owner_generation=owner.generation,
+        configuration_fingerprint=fingerprint,
+        status=ReconciliationStatus.ACCOUNT_ONLY,
+        captured_at=NOW + timedelta(seconds=1),
+        valid_until=NOW + timedelta(seconds=20),
+        can_arm=True,
+        position_anchor_units=None,
+        position_anchors=(),
+        active_ordinary_order_count=0,
+        active_stop_order_count=0,
+        unresolved_reservation_count=0,
+        reasons=(),
+        risk_snapshot_id=UUID("00000000-0000-4000-8000-000000000425"),
+    )
+    view = repository.get_view(str(BROKER_ID), now=NOW + timedelta(seconds=1))
+    repository.save_reconciliation(rotation, expected_revision=view.revision, now=NOW + timedelta(seconds=1))
+    armed = admission_service.arm(
+        str(BROKER_ID),
+        ArmRequest(
+            expected_revision=view.revision + 1,
+            runtime_instance_id=RUNTIME_A,
+            baseline_id=baseline.baseline_id,
+            reconciliation_id=rotation.reconciliation_id,
+            limits=configured.limits,
+            configuration_fingerprint=fingerprint,
+            expires_at=NOW + timedelta(seconds=15),
+        ),
+        actor="synthetic-operator",
+    )
+    revision = armed.revision
+    risk.instrument_requests.clear()
+    post_rotation_permit = asyncio.run(submit("uid-c", "000000000426"))
+
+    assert isinstance(post_rotation_permit, SubmitPermit), post_rotation_permit
+    assert risk.instrument_requests[-1] == ()
 
 
 def test_automatic_reconciliation_rolls_back_when_reservation_settlement_is_unsafe(admission_service, core_engine):
@@ -1751,3 +2385,204 @@ def test_account_reconciliation_with_unresolved_reservations_is_rejected_without
         assert admission.reconciliation_id is None
         assert reservation.state == "UNKNOWN"
         assert session.get(TradingReconciliationModel, "00000000-0000-4000-8000-000000000304") is None
+
+
+def _seed_account_anchor(factory, *, reconciliation_id, owner, fingerprint, positions):
+    result = ReconciliationResult(
+        reconciliation_id=reconciliation_id,
+        broker_id=BROKER_ID,
+        account_id="synthetic-account",
+        scope="ACCOUNT",
+        owner_runtime_instance_id=RUNTIME_A,
+        owner_generation=owner.generation,
+        configuration_fingerprint=fingerprint,
+        status=ReconciliationStatus.ACCOUNT_ONLY,
+        canary_uid=None,
+        captured_at=NOW,
+        valid_until=NOW + timedelta(seconds=30),
+        can_arm=True,
+        position_anchor_units=None,
+        position_anchors=positions,
+        active_ordinary_order_count=0,
+        active_stop_order_count=0,
+        unresolved_reservation_count=0,
+        reasons=(),
+        risk_snapshot_id=None,
+    )
+    with factory.begin() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        admission.reconciliation_id = str(reconciliation_id)
+        admission.configuration_fingerprint = fingerprint
+        session.add(
+            TradingReconciliationModel(
+                reconciliation_id=str(reconciliation_id),
+                user_broker_id=str(BROKER_ID),
+                account_id="synthetic-account",
+                scope="ACCOUNT",
+                owner_runtime_instance_id=str(RUNTIME_A),
+                owner_generation=owner.generation,
+                configuration_fingerprint=fingerprint,
+                status=ReconciliationStatus.ACCOUNT_ONLY.value,
+                canary_uid=None,
+                captured_at=NOW,
+                valid_until=NOW + timedelta(seconds=30),
+                can_arm=True,
+                position_anchor_units=None,
+                active_ordinary_order_count=0,
+                active_stop_order_count=0,
+                unresolved_reservation_count=0,
+                reasons=[],
+                risk_snapshot_id=None,
+                payload=result.model_dump(mode="json"),
+            )
+        )
+
+
+@pytest.mark.parametrize(("executed_lots", "expected"), [(1, True), (2, False)])
+def test_submit_settlement_ignores_settled_closed_uid_already_in_account_anchor(
+    admission_service, core_engine, executed_lots, expected
+):
+    owner = admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
+    factory = create_session_factory(core_engine)
+    fingerprint = "f" * 64
+    reconciliation_id = UUID("00000000-0000-4000-8000-000000000401")
+    _seed_account_anchor(
+        factory,
+        reconciliation_id=reconciliation_id,
+        owner=owner,
+        fingerprint=fingerprint,
+        positions=(ReconciliationPositionAnchor(instrument_uid="uid-b", quantity_units=Decimal(10), lot_size=10),),
+    )
+    reservation_id = "00000000-0000-4000-8000-000000000402"
+    key = "00000000-0000-4000-8000-000000000403"
+    with factory.begin() as session:
+        session.add(
+            TradingSubmitReservationModel(
+                reservation_id=reservation_id,
+                user_broker_id=str(BROKER_ID),
+                automation_id="00000000-0000-4000-8000-000000000404",
+                idempotency_key=key,
+                request_fingerprint="a" * 64,
+                state="SETTLED",
+                runtime_instance_id=str(RUNTIME_A),
+                generation=owner.generation,
+                configuration_fingerprint=fingerprint,
+                permit_id=None,
+                side="BUY",
+                instrument_uid="uid-a",
+                quantity_lots=1,
+                limit_price=Decimal(10),
+                requested_amount=Decimal(100),
+                reserved_cash=Decimal(0),
+                reserved_position_units=Decimal(0),
+                payload={
+                    "anchor_reconciliation_id": str(reconciliation_id),
+                    "anchor_executed_lots": executed_lots,
+                    "executed_lots": executed_lots,
+                    "executed_amount": "100",
+                    "executed_commission": "1",
+                    "last_reconciled_order_state": "FILLED",
+                },
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+    repository = admission_service._repository
+    with factory.begin() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        settled_before = session.get(TradingSubmitReservationModel, reservation_id)
+        facts_before = dict(settled_before.payload)
+        result = repository._apply_submit_settlement(
+            session,
+            str(BROKER_ID),
+            admission,
+            (ReconciliationPositionAnchor(instrument_uid="uid-b", quantity_units=Decimal(10), lot_size=10),),
+            (),
+            now=NOW,
+        )
+        assert result is expected
+        assert settled_before.state == "SETTLED"
+        assert settled_before.reserved_cash == settled_before.reserved_position_units == 0
+        assert settled_before.payload == facts_before
+
+
+def test_submit_settlement_rejects_unresolved_reservation_from_stale_account_anchor(admission_service, core_engine):
+    owner = admission_service.register_runtime(request(RUNTIME_A), SECRET_A)
+    factory = create_session_factory(core_engine)
+    fingerprint = "f" * 64
+    reconciliation_id = UUID("00000000-0000-4000-8000-000000000411")
+    old_anchor_id = "00000000-0000-4000-8000-000000000412"
+    _seed_account_anchor(
+        factory,
+        reconciliation_id=reconciliation_id,
+        owner=owner,
+        fingerprint=fingerprint,
+        positions=(ReconciliationPositionAnchor(instrument_uid="uid-b", quantity_units=Decimal(10), lot_size=10),),
+    )
+    reservation_id = "00000000-0000-4000-8000-000000000413"
+    key = "00000000-0000-4000-8000-000000000414"
+    with factory.begin() as session:
+        session.add(
+            TradingSubmitReservationModel(
+                reservation_id=reservation_id,
+                user_broker_id=str(BROKER_ID),
+                automation_id="00000000-0000-4000-8000-000000000415",
+                idempotency_key=key,
+                request_fingerprint="b" * 64,
+                state="IN_FLIGHT",
+                runtime_instance_id=str(RUNTIME_A),
+                generation=owner.generation,
+                configuration_fingerprint=fingerprint,
+                permit_id=None,
+                side="BUY",
+                instrument_uid="uid-b",
+                quantity_lots=1,
+                limit_price=Decimal(10),
+                requested_amount=Decimal(100),
+                reserved_cash=Decimal(101),
+                reserved_position_units=Decimal(0),
+                payload={
+                    "anchor_reconciliation_id": old_anchor_id,
+                    "anchor_executed_lots": 0,
+                    "executed_lots": 0,
+                    "executed_amount": "0",
+                    "executed_commission": "0",
+                    "original_reserved_cash": "101",
+                },
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+    repository = admission_service._repository
+    state = AdmissionOrderState(
+        request_id=key,
+        broker_order_id="stale-anchor-order",
+        instrument_uid="uid-b",
+        side=OrderSide.BUY,
+        requested_lots=1,
+        executed_lots=0,
+        executed_amount=Decimal(0),
+        executed_commission=Decimal(0),
+        currency="RUB",
+        status="NEW",
+        attributable=True,
+        unknown_reason=None,
+    )
+    with factory.begin() as session:
+        admission = session.get(TradingAccountAdmissionModel, str(BROKER_ID))
+        reservation = session.get(TradingSubmitReservationModel, reservation_id)
+        result = repository._apply_submit_settlement(
+            session,
+            str(BROKER_ID),
+            admission,
+            (ReconciliationPositionAnchor(instrument_uid="uid-b", quantity_units=Decimal(10), lot_size=10),),
+            (state,),
+            now=NOW,
+        )
+        assert not result
+        assert reservation.state == "UNKNOWN"
+        assert reservation.reserved_cash == Decimal(101)
+        assert reservation.idempotency_key == key
+        assert reservation.payload["anchor_reconciliation_id"] == old_anchor_id

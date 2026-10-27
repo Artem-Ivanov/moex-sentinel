@@ -8,12 +8,16 @@ from threading import Event, Thread, current_thread
 from uuid import UUID
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from sentinel_contracts.automation_lifecycle import InvalidAutomationTransition
 from sentinel_contracts.broker_execution import BrokerOrderState, OrderSide
-from sentinel_contracts.business_audit import BusinessAuditEvent, BusinessAuditLevel, BusinessAuditStage
+from sentinel_contracts.business_audit import (
+    BusinessAuditEvent,
+    BusinessAuditLevel,
+    BusinessAuditStage,
+)
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_admission import (
     PreRpcAbortProof,
@@ -21,6 +25,7 @@ from sentinel_contracts.trading_admission import (
     submit_request_fingerprint,
 )
 from sentinel_contracts.trading_facts import BrokerPositionBootstrap, FactKind
+from tests.trading_automaton.command_factory import command as command_factory
 from tests.trading_automaton.command_factory import decision_item
 from tests.trading_automaton.storage.worker_storage_helpers import (
     AUDIT_ID,
@@ -35,7 +40,10 @@ from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
 from trading_automaton.services.order_dispatch import OrderDispatchService
 from trading_automaton.services.order_tracking import OrderTrackingService
-from trading_automaton.storage.database import create_worker_engine, initialize_worker_schema
+from trading_automaton.storage.database import (
+    create_worker_engine,
+    initialize_worker_schema,
+)
 from trading_automaton.storage.fact_outbox import FactOutboxWriter
 from trading_automaton.storage.models import (
     Base,
@@ -46,10 +54,17 @@ from trading_automaton.storage.models import (
     TradeDecisionModel,
     TradeLotModel,
 )
-from trading_automaton.storage.repository import ExecutionFinalization, IntentBatchItem, LocalAutomationRepository
+from trading_automaton.storage.repository import (
+    ExecutionFinalization,
+    IntentBatchItem,
+    LocalAutomationRepository,
+    LocalIntentRecord,
+)
 
 
-def test_cache_round_trip_uses_strategy_free_baseline_command(worker_repository_factory) -> None:
+def test_cache_round_trip_uses_strategy_free_baseline_command(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
 
@@ -61,7 +76,137 @@ def test_cache_round_trip_uses_strategy_free_baseline_command(worker_repository_
     assert restored[0].currency == "RUB"
 
 
-def test_settings_refresh_preserves_pending_fact_envelope_and_execution_revision(worker_repository_factory) -> None:
+def test_command_sync_projection_uses_broker_scope_and_counts_own_pending_facts(
+    worker_repository_factory,
+) -> None:
+    repo, _factory = worker_repository_factory()
+    command_value = baseline_command()
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+
+    projection = repo.command_sync_diagnostics(
+        str(command_value.broker_id),
+        claimed_count=0,
+        grouped_automation_ids={str(command_value.automation_id)},
+        captured_at=NOW,
+    )
+
+    assert projection.observation == "OBSERVED"
+    assert projection.complete is True
+    assert projection.cached_count == projection.monitored_count == projection.grouped_count == 1
+    assert projection.rows[0].state is AutomationState.IN_WORK
+    assert projection.rows[0].active_intent_state == "DISPATCH_PENDING"
+    assert projection.rows[0].pending_fact_count == 2
+    assert projection.rows[0].failed_fact_count == 0
+    assert projection.rows[0].grouped is True
+    assert projection.rows[0].exclusion_reason is None
+
+
+def test_command_sync_projection_includes_closed_cache_without_active_intent(
+    worker_repository_factory,
+) -> None:
+    repo, _factory = worker_repository_factory()
+    command_value = baseline_command()
+    repo.cache_command(command_value)
+    with _factory.begin() as session:
+        session.get_one(CachedAutomationModel, str(command_value.automation_id)).state = AutomationState.CLOSED
+
+    projection = repo.command_sync_diagnostics(
+        str(command_value.broker_id),
+        claimed_count=0,
+        grouped_automation_ids=set(),
+        captured_at=NOW,
+    )
+
+    assert projection.complete is True
+    assert projection.cached_count == 1
+    assert projection.monitored_count == projection.grouped_count == 0
+    assert projection.rows[0].state is AutomationState.CLOSED
+    assert projection.rows[0].monitored is False
+    assert projection.rows[0].exclusion_reason == "CLOSED_WITHOUT_ACTIVE_INTENT"
+
+
+def test_command_sync_projection_marks_unscoped_cache_unknown_and_bounds_rows(
+    worker_repository_factory,
+) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    repo.cache_command(command_value)
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, str(command_value.automation_id))
+        cached.broker_id = None
+
+    projection = repo.command_sync_diagnostics(
+        str(command_value.broker_id),
+        claimed_count=0,
+        grouped_automation_ids=set(),
+        captured_at=NOW,
+    )
+
+    assert projection.observation == "UNKNOWN"
+    assert projection.reason == "UNSCOPED_CACHE"
+    assert projection.complete is False
+    assert projection.cached_count is None
+    assert projection.rows == ()
+
+
+def test_command_sync_projection_truncates_at_one_hundred_rows(
+    worker_repository_factory,
+) -> None:
+    repo, _factory = worker_repository_factory()
+    for index in range(101):
+        repo.cache_command(command_factory(automation=f"bounded-{index}"))
+    broker_id = str(command_factory().broker_id)
+
+    projection = repo.command_sync_diagnostics(
+        broker_id,
+        claimed_count=0,
+        grouped_automation_ids=set(),
+        captured_at=NOW,
+    )
+
+    assert projection.observation == "OBSERVED"
+    assert projection.cached_count == 101
+    assert projection.truncated is True
+    assert projection.complete is False
+    assert len(projection.rows) == 100
+
+
+def test_command_sync_projection_keeps_held_active_intent_and_fact_outbox_visible(
+    worker_repository_factory,
+) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    repo.cache_command(command_value)
+    intent_id = repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW).intents[0].idempotency_key
+    repo.update_intent(intent_id, state="UNCERTAIN", occurred_at=NOW)
+    repo.hold_active("Uncertain order", str(command_value.automation_id))
+    with factory.begin() as session:
+        fact = session.scalar(
+            select(FactOutboxModel).where(FactOutboxModel.automation_id == str(command_value.automation_id))
+        )
+        fact.delivery_state = "FAILED"
+
+    projection = repo.command_sync_diagnostics(
+        str(command_value.broker_id),
+        claimed_count=0,
+        grouped_automation_ids={str(command_value.automation_id)},
+        captured_at=NOW,
+    )
+
+    row = projection.rows[0]
+    assert row.state is AutomationState.HOLD
+    assert row.active_intent_state == "UNCERTAIN"
+    assert row.active_intent_terminal_present is False
+    assert row.pending_fact_count > 0
+    assert row.failed_fact_count == 1
+    assert row.monitored is True
+    assert row.grouped is True
+
+
+def test_settings_refresh_preserves_pending_fact_envelope_and_execution_revision(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
@@ -106,7 +251,9 @@ def test_cached_order_quota_survives_worker_database_restart(tmp_path) -> None:
     assert restored.order_quota_percent == Decimal("12.5")
 
 
-def test_decision_batch_emits_typed_decision_and_order_facts(worker_repository_factory) -> None:
+def test_decision_batch_emits_typed_decision_and_order_facts(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
@@ -124,7 +271,9 @@ def test_decision_batch_emits_typed_decision_and_order_facts(worker_repository_f
     assert facts[1].payload["decision_id"] == facts[0].payload["decision_id"]
 
 
-def test_order_state_fact_preserves_recorded_order_intent_snapshot(worker_repository_factory) -> None:
+def test_order_state_fact_preserves_recorded_order_intent_snapshot(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
@@ -167,7 +316,9 @@ def test_order_state_fact_preserves_recorded_order_intent_snapshot(worker_reposi
             assert changed[field] == recorded[field]
 
 
-def test_pre_rpc_abort_proof_is_atomic_with_cancel_fact(worker_repository_factory) -> None:
+def test_pre_rpc_abort_proof_is_atomic_with_cancel_fact(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     value = baseline_command()
     repo.cache_command(value)
@@ -200,7 +351,9 @@ def test_pre_rpc_abort_proof_is_atomic_with_cancel_fact(worker_repository_factor
     assert len(proof_facts) == 1
 
 
-def test_duplicate_pre_rpc_proof_update_is_idempotent_and_rejects_changed_result(worker_repository_factory) -> None:
+def test_duplicate_pre_rpc_proof_update_is_idempotent_and_rejects_changed_result(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     value = baseline_command()
     repo.cache_command(value)
@@ -272,7 +425,9 @@ def test_duplicate_pre_rpc_proof_update_is_idempotent_and_rejects_changed_result
         assert repo.ready_fact_outbox(20, now=NOW + timedelta(seconds=6), deadline_ms=0) == before_retry
 
 
-def test_pre_rpc_abort_proof_outbox_survives_sqlite_restart_and_retry(tmp_path: Path) -> None:
+def test_pre_rpc_abort_proof_outbox_survives_sqlite_restart_and_retry(
+    tmp_path: Path,
+) -> None:
     database_url = f"sqlite:///{tmp_path / 'proof-replay.db'}"
     engine = create_worker_engine(database_url)
     Base.metadata.create_all(engine)
@@ -324,7 +479,9 @@ def test_pre_rpc_abort_proof_outbox_survives_sqlite_restart_and_retry(tmp_path: 
     reopened_engine.dispose()
 
 
-def test_pre_rpc_zero_fill_cancel_replay_survives_sqlite_restart(tmp_path: Path) -> None:
+def test_pre_rpc_zero_fill_cancel_replay_survives_sqlite_restart(
+    tmp_path: Path,
+) -> None:
     database_url = f"sqlite:///{tmp_path / 'pre-rpc-finalization-replay.db'}"
     engine = create_worker_engine(database_url)
     Base.metadata.create_all(engine)
@@ -517,12 +674,19 @@ def test_test_terminal_without_execution_facts_does_not_block_next_intent(
     reopened_engine.dispose()
 
 
-def test_test_filled_intent_is_active_until_execution_facts_are_committed(worker_repository_factory) -> None:
+def test_test_filled_intent_is_active_until_execution_facts_are_committed(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     value = baseline_command()
     repo.cache_command(value)
     repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
-    repo.update_intent(INTENT_ID, state="FILLED", occurred_at=NOW + timedelta(seconds=1), executed_lots=1)
+    repo.update_intent(
+        INTENT_ID,
+        state="FILLED",
+        occurred_at=NOW + timedelta(seconds=1),
+        executed_lots=1,
+    )
 
     pending = repo.get_active_intent(str(value.automation_id))
     assert pending is not None
@@ -533,7 +697,9 @@ def test_test_filled_intent_is_active_until_execution_facts_are_committed(worker
     assert repo.get_active_intent(str(value.automation_id)) is None
 
 
-def test_stale_nonterminal_update_cannot_regress_finalized_filled_intent(worker_repository_factory) -> None:
+def test_stale_nonterminal_update_cannot_regress_finalized_filled_intent(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     value = baseline_command()
     repo.cache_command(value)
@@ -558,7 +724,9 @@ def test_stale_nonterminal_update_cannot_regress_finalized_filled_intent(worker_
     assert after == before
 
 
-def test_active_buy_reservation_uses_cached_command_currency(worker_repository_factory) -> None:
+def test_active_buy_reservation_uses_cached_command_currency(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     repo.cache_command(command_value)
@@ -570,7 +738,192 @@ def test_active_buy_reservation_uses_cached_command_currency(worker_repository_f
     assert reservation.amount == Decimal("1001")
 
 
-def test_terminal_buy_is_idempotent_and_emits_restart_safe_execution_graph(worker_repository_factory) -> None:
+def test_age_policy_marks_old_intent_failed_without_terminal_proof_and_keeps_it_for_recovery(
+    worker_repository_factory,
+) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    expired_at = NOW + timedelta(hours=24, milliseconds=2)
+
+    aged = repo.expire_intent_by_age(INTENT_ID, expired_at=expired_at)
+
+    assert aged is not None
+    assert aged.state == "FAILED"
+    assert aged.terminal_at is None
+    assert aged.idempotency_key == INTENT_ID
+    assert aged.strategy_snapshot["_age_policy"] == {
+        "version": 1,
+        "expired_at": expired_at.isoformat(timespec="milliseconds"),
+    }
+    assert repo.get_active_intent(str(value.automation_id)) is None
+    assert repo.has_active_intents() is False
+    assert repo.list_active_buy_intent_reservations() == ()
+    assert repo.list_policy_expired_unconfirmed(
+        (aged.automation_id,),
+        now=expired_at + timedelta(seconds=1),
+    ) == (aged,)
+    event = repo.ready_fact_outbox(10, now=expired_at + timedelta(seconds=1), deadline_ms=0)[-1]
+    assert event.payload["from_state"] == "DISPATCH_PENDING"
+    assert event.payload["to_state"] == "FAILED"
+    assert event.payload["terminal_at"] is None
+    assert event.payload["safe_reason"] == "ORDER_AGE_LIMIT_EXCEEDED"
+
+
+def test_age_policy_does_not_expire_intent_at_exactly_24_hours(worker_repository_factory) -> None:
+    repo, _factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+
+    assert repo.expire_intent_by_age(INTENT_ID, expired_at=NOW + timedelta(hours=24)) is None
+    assert repo.get_active_intent(str(value.automation_id)).state == "DISPATCH_PENDING"
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {},
+        {"_age_policy": {"version": 2, "expired_at": "2026-08-14T12:00:00.002+00:00"}},
+        {"_age_policy": {"version": 1}},
+    ],
+)
+def test_failed_without_valid_age_policy_marker_stays_active(
+    worker_repository_factory,
+    snapshot,
+) -> None:
+    repo, factory = worker_repository_factory()
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    with factory.begin() as session:
+        intent = session.get_one(LocalIntentModel, INTENT_ID)
+        intent.state = "FAILED"
+        intent.strategy_snapshot = snapshot
+
+    active = repo.get_active_intent(str(value.automation_id))
+    assert active is not None
+    assert active.state == "FAILED"
+    assert repo.has_active_intents() is True
+
+
+def test_policy_expired_recovery_batches_are_scoped_and_keyset_fair(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
+    automation_ids = tuple(str(UUID(int=5_000 + index)) for index in range(101))
+    other_broker_ids = tuple(str(UUID(int=6_000 + index)) for index in range(100))
+    expired_at = NOW
+    with factory.begin() as session:
+        for index, automation_id in enumerate((*other_broker_ids, *automation_ids)):
+            age_hours = 40 if index < len(other_broker_ids) else 25
+            created_at = NOW - timedelta(hours=age_hours) + timedelta(milliseconds=index)
+            session.add(
+                LocalIntentModel(
+                    idempotency_key=str(UUID(int=7_000 + index)),
+                    fact_execution_id=None,
+                    position_cycle_id=None,
+                    automation_id=automation_id,
+                    kind="BUY_MORE",
+                    side="BUY",
+                    state="FAILED",
+                    quantity_lots=1,
+                    limit_price=Decimal("10"),
+                    broker_order_id=None,
+                    requested_amount=Decimal("10"),
+                    executed_amount=Decimal("0"),
+                    estimated_commission=Decimal("0"),
+                    executed_commission=Decimal("0"),
+                    executed_lots=0,
+                    executed_price=Decimal("0"),
+                    execution_currency="RUB",
+                    executed_at=None,
+                    dispatch_started_at=None,
+                    broker_responded_at=None,
+                    terminal_at=None,
+                    execution_facts_emitted_at=None,
+                    strategy_snapshot={
+                        "_age_policy": {
+                            "version": 1,
+                            "expired_at": expired_at.isoformat(timespec="milliseconds"),
+                        }
+                    },
+                    created_at=created_at,
+                    updated_at=expired_at,
+                )
+            )
+
+    first = repo.list_policy_expired_unconfirmed(automation_ids, now=expired_at, limit=100)
+    second = repo.list_policy_expired_unconfirmed(
+        automation_ids,
+        now=expired_at,
+        limit=100,
+        after=(first[-1].created_at, first[-1].idempotency_key),
+    )
+
+    assert len(first) == 100
+    assert len(second) == 1
+    assert {item.automation_id for item in (*first, *second)} == set(automation_ids)
+    assert second[0].automation_id == automation_ids[-1]
+
+
+def test_age_expiry_waits_for_terminal_finalization(tmp_path: Path) -> None:
+    engine = create_worker_engine(f"sqlite:///{tmp_path / 'age-finalize-race.sqlite'}")
+    Base.metadata.create_all(engine)
+    repo = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = baseline_command()
+    repo.cache_command(value)
+    repo.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    finalizing, continue_finalization, expiry_started, expiry_done = Event(), Event(), Event(), Event()
+    finalization_errors: list[BaseException] = []
+    expiry_results: list[LocalIntentRecord | None] = []
+
+    def pause_finalization_flush(session, _context, _instances):
+        if any(isinstance(item, LocalIntentModel) and item.state == "FILLED" for item in session.dirty):
+            finalizing.set()
+            if not continue_finalization.wait(timeout=5):
+                raise TimeoutError("Test did not release terminal finalization")
+
+    def finalize() -> None:
+        try:
+            repo.finalize_execution(filled_buy())
+        except BaseException as error:
+            finalization_errors.append(error)
+
+    def expire() -> None:
+        expiry_started.set()
+        try:
+            expiry_results.append(repo.expire_intent_by_age(INTENT_ID, expired_at=NOW + timedelta(hours=25)))
+        finally:
+            expiry_done.set()
+
+    event.listen(Session, "before_flush", pause_finalization_flush)
+    finalization_thread = Thread(target=finalize, name="terminal-finalization")
+    expiry_thread = Thread(target=expire, name="age-expiry")
+    try:
+        finalization_thread.start()
+        assert finalizing.wait(timeout=5)
+        expiry_thread.start()
+        assert expiry_started.wait(timeout=5)
+        assert expiry_done.wait(timeout=0.1) is False
+        continue_finalization.set()
+        finalization_thread.join(timeout=5)
+        expiry_thread.join(timeout=5)
+    finally:
+        continue_finalization.set()
+        event.remove(Session, "before_flush", pause_finalization_flush)
+        engine.dispose()
+
+    assert not finalization_thread.is_alive()
+    assert not expiry_thread.is_alive()
+    assert finalization_errors == []
+    assert expiry_results == [None]
+    assert repo.get_latest_intent(str(value.automation_id)).state == "FILLED"
+    assert repo.get_latest_intent(str(value.automation_id)).terminal_at is not None
+
+
+def test_terminal_buy_is_idempotent_and_emits_restart_safe_execution_graph(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -673,7 +1026,9 @@ def test_decision_fact_sequence_uses_terminal_facts_committed_after_stale_cache_
         assert sequences == list(range(1, len(sequences) + 1))
 
 
-def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger(worker_repository_factory) -> None:
+def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -750,7 +1105,9 @@ def test_reconciled_terminal_sell_emits_facts_without_double_applying_ledger(wor
         )
 
 
-def test_audit_is_journaled_once_and_delivered_only_as_typed_fact(worker_repository_factory) -> None:
+def test_audit_is_journaled_once_and_delivered_only_as_typed_fact(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -779,7 +1136,9 @@ def test_audit_is_journaled_once_and_delivered_only_as_typed_fact(worker_reposit
         assert session.scalar(select(func.count()).select_from(BusinessAuditEventModel)) == 1
 
 
-def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows(worker_repository_factory) -> None:
+def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -800,7 +1159,9 @@ def test_ack_removes_only_fact_outbox_and_preserves_recovery_rows(worker_reposit
         assert session.scalar(select(func.count()).select_from(TradeLotModel)) == 1
 
 
-def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime(worker_repository_factory) -> None:
+def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -814,7 +1175,9 @@ def test_hold_is_a_typed_state_fact_and_excludes_automation_from_active_runtime(
     assert [fact.fact_kind for fact in facts] == [FactKind.AUTOMATION_STATE_CHANGED.value]
 
 
-def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged(worker_repository_factory) -> None:
+def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command().model_copy(update={"state": AutomationState.HOLD})
     automation_id = str(command_value.automation_id)
@@ -834,7 +1197,9 @@ def test_invalid_worker_resume_keeps_state_revision_and_outbox_unchanged(worker_
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_repeated_worker_state_is_a_noop_without_revision_or_fact(worker_repository_factory) -> None:
+def test_repeated_worker_state_is_a_noop_without_revision_or_fact(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -853,7 +1218,9 @@ def test_repeated_worker_state_is_a_noop_without_revision_or_fact(worker_reposit
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_worker_hold_requires_a_nonblank_reason_before_outbox_write(worker_repository_factory) -> None:
+def test_worker_hold_requires_a_nonblank_reason_before_outbox_write(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -960,7 +1327,9 @@ def test_stale_worker_state_proposal_cannot_overwrite_authoritative_closed(
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact(worker_repository_factory) -> None:
+def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact(
+    worker_repository_factory,
+) -> None:
     repo, factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -986,7 +1355,492 @@ def test_manual_resume_accepts_core_state_and_discards_failed_hold_fact(worker_r
         assert session.scalar(select(func.count()).select_from(FactOutboxModel)) == 0
 
 
-def test_rejected_stale_fact_does_not_replace_authoritative_closed_state(worker_repository_factory) -> None:
+def test_technical_recovery_resume_requires_matching_hold_command_and_empty_outbox(
+    worker_repository_factory,
+) -> None:
+    repo, factory = worker_repository_factory()
+    held = baseline_command().model_copy(update={"state": AutomationState.HOLD, "resume_requested": True})
+    automation_id = str(held.automation_id)
+    repo.cache_command(held)
+
+    resumed = repo.consume_recovery_resume(held, occurred_at=NOW)
+
+    assert resumed is not None
+    assert resumed.state is AutomationState.IN_QUEUE
+    assert resumed.revision == held.revision + 1
+    assert resumed.last_sequence_number == held.last_sequence_number + 1
+    assert resumed.resume_requested is True
+    assert repo.get_state(automation_id).state == AutomationState.IN_QUEUE.value
+    with factory() as session:
+        facts = session.scalars(select(FactOutboxModel)).all()
+        assert len(facts) == 1
+        fact = facts[0]
+        assert fact.event_id
+        assert fact.sequence_number == held.last_sequence_number + 1
+        assert fact.expected_revision == held.revision
+        assert fact.fact_kind == FactKind.AUTOMATION_STATE_CHANGED.value
+        assert fact.payload == {
+            "state": "IN_QUEUE",
+            "suspended_from_state": None,
+            "hold_reason": None,
+            "closed_at": None,
+        }
+        assert fact.safe_message == "Automation resumed after technical recovery"
+        event_id = fact.event_id
+
+    assert repo.consume_recovery_resume(held, occurred_at=NOW) is None
+    with factory() as session:
+        assert [fact.event_id for fact in session.scalars(select(FactOutboxModel)).all()] == [event_id]
+
+
+def test_technical_recovery_resume_refuses_pending_outbox_and_stale_or_user_hold(
+    worker_repository_factory,
+) -> None:
+    repo, _factory = worker_repository_factory()
+    active = baseline_command()
+    automation_id = str(active.automation_id)
+    repo.cache_command(active)
+    repo.transition_state(
+        automation_id=automation_id,
+        state=AutomationState.HOLD.value,
+        safe_message="Technical hold",
+        occurred_at=NOW,
+    )
+    held = active.model_copy(
+        update={
+            "state": AutomationState.HOLD,
+            "revision": active.revision + 1,
+            "last_sequence_number": active.last_sequence_number + 1,
+            "resume_requested": True,
+        }
+    )
+
+    assert repo.consume_recovery_resume(held, occurred_at=NOW) is None
+    assert repo.consume_recovery_resume(held.model_copy(update={"resume_requested": False}), occurred_at=NOW) is None
+    assert repo.consume_recovery_resume(
+        held.model_copy(update={"revision": held.revision + 1}), occurred_at=NOW
+    ) is None
+    assert repo.get_state(automation_id).state == AutomationState.HOLD.value
+
+
+def test_stale_recovery_request_is_remembered_until_financial_outbox_is_drained(
+    worker_repository_factory,
+) -> None:
+    repo, factory = worker_repository_factory()
+    active = baseline_command()
+    automation_id = str(active.automation_id)
+    repo.cache_command(active)
+    repo.transition_state(
+        automation_id=automation_id,
+        state=AutomationState.HOLD.value,
+        safe_message="Technical hold",
+        occurred_at=NOW,
+    )
+    stale_core_command = active.model_copy(
+        update={"state": AutomationState.HOLD, "resume_requested": True}
+    )
+
+    assert repo.consume_recovery_resume(stale_core_command, occurred_at=NOW) is None
+    assert repo.get_state(automation_id).state == AutomationState.HOLD.value
+    with factory() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        assert cached.resume_requested is True
+        assert session.scalar(
+            select(func.count()).select_from(FactOutboxModel).where(
+                FactOutboxModel.automation_id == automation_id
+            )
+        ) == 1
+
+
+@pytest.mark.parametrize(
+    ("scenario", "accepted_sequence", "include_control"),
+    [
+        ("pending_fill_user_hold", 0, False),
+        ("queued_resume_late_fill_user_hold", 0, True),
+        ("lost_ack_resume_user_hold", 1, True),
+    ],
+)
+def test_cancelled_recovery_resume_rebases_only_unaccepted_financial_suffix(
+    worker_repository_factory,
+    scenario: str,
+    accepted_sequence: int,
+    include_control: bool,
+) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    automation_id = str(command_value.automation_id)
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    repo.finalize_execution(filled_buy())
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        cached.state = AutomationState.HOLD.value
+        cached.resume_requested = True
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert len(rows) >= 5
+        financial_facts = [(row.event_id, row.payload, row.fact_kind) for row in rows]
+        if scenario != "pending_fill_user_hold":
+            cached.state = AutomationState.IN_WORK.value
+            cached.revision = command_value.revision + 1
+        if include_control:
+            # Place the control before the financial graph with a gap-free sequence.
+            for row in reversed(rows):
+                session.execute(
+                    update(FactOutboxModel)
+                    .where(FactOutboxModel.event_id == row.event_id)
+                    .values(sequence_number=row.sequence_number + 1)
+                    .execution_options(synchronize_session=False)
+                )
+            session.flush()
+            session.expire_all()
+            rows = session.scalars(
+                select(FactOutboxModel)
+                .where(FactOutboxModel.automation_id == automation_id)
+                .order_by(FactOutboxModel.sequence_number)
+            ).all()
+            for row in rows[1:]:
+                row.expected_revision = command_value.revision + 1
+            session.add(
+                FactOutboxModel(
+                    event_id=str(UUID(int=8_000)),
+                    user_broker_id=str(command_value.user_broker_id),
+                    automation_id=automation_id,
+                    sequence_number=1,
+                    expected_revision=command_value.revision,
+                    fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                    payload={
+                        "state": "IN_QUEUE",
+                        "suspended_from_state": None,
+                        "hold_reason": None,
+                        "closed_at": None,
+                    },
+                    safe_message="Automation resumed after technical recovery",
+                    occurred_at=NOW,
+                    delivery_state="PENDING",
+                    retry_count=0,
+                    next_retry_at=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            cached.last_sequence_number += 1
+        else:
+            cached.state = AutomationState.HOLD.value
+
+    handled = repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=accepted_sequence,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    )
+
+    assert handled is True, scenario
+    with factory() as session:
+        facts = session.scalars(
+            select(FactOutboxModel).where(FactOutboxModel.automation_id == automation_id)
+        ).all()
+        assert [(fact.event_id, fact.payload, fact.fact_kind) for fact in facts] == financial_facts
+        assert [fact.sequence_number for fact in facts] == list(
+            range(accepted_sequence + 1, accepted_sequence + len(financial_facts) + 1)
+        )
+        assert all(fact.expected_revision == 7 and fact.delivery_state == "PENDING" for fact in facts)
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        assert cached.state == AutomationState.HOLD.value
+        assert cached.revision == 7
+        assert cached.last_sequence_number == accepted_sequence + len(financial_facts)
+        assert cached.resume_requested is False
+
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=accepted_sequence,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is True
+
+
+def test_cancelled_recovery_resume_fails_closed_on_unknown_state_suffix(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command().model_copy(
+        update={"state": AutomationState.HOLD, "resume_requested": True}
+    )
+    automation_id = str(command_value.automation_id)
+    repo.cache_command(command_value)
+    with factory.begin() as session:
+        session.add(
+            FactOutboxModel(
+                event_id=str(UUID(int=8_101)),
+                user_broker_id=str(command_value.user_broker_id),
+                automation_id=automation_id,
+                sequence_number=1,
+                expected_revision=command_value.revision,
+                fact_kind=FactKind.AUTOMATION_STATE_CHANGED.value,
+                payload={"state": "CLOSED"},
+                safe_message="Unrelated state fact",
+                occurred_at=NOW,
+                delivery_state="PENDING",
+                retry_count=0,
+                next_retry_at=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=0,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is False
+    with factory() as session:
+        row = session.get_one(FactOutboxModel, str(UUID(int=8_101)))
+        assert row.sequence_number == 1
+        assert row.delivery_state == "PENDING"
+
+
+def test_recovery_rebase_resequences_real_financial_graph_with_reverse_event_ids(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    automation_id = str(command_value.automation_id)
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    repo.finalize_execution(filled_buy())
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        cached.state = AutomationState.HOLD.value
+        cached.resume_requested = True
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert len(rows) >= 5
+        original = [(row.event_id, row.payload, row.fact_kind) for row in rows]
+        reversed_ids = [str(UUID(int=90_000 - index)) for index in range(len(rows))]
+        for row, event_id in zip(rows, reversed_ids, strict=True):
+            row.event_id = event_id
+
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=0,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is True
+
+    with factory() as session:
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert [(row.payload, row.fact_kind) for row in rows] == [
+            (payload, kind) for _event_id, payload, kind in original
+        ]
+        assert [row.event_id for row in rows] == reversed_ids
+        assert [row.sequence_number for row in rows] == list(range(1, len(original) + 1))
+        assert all(row.delivery_state == "PENDING" and row.expected_revision == 7 for row in rows)
+
+
+def test_revision_conflict_can_rebase_only_unclaimed_financial_suffix(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    automation_id = str(command_value.automation_id)
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        cached.state = AutomationState.HOLD.value
+        cached.resume_requested = False
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        original = [(row.event_id, row.payload, row.fact_kind) for row in rows]
+
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=0,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is True
+    with factory() as session:
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert [(row.event_id, row.payload, row.fact_kind) for row in rows] == original
+        assert rows[0].expected_revision == 7
+
+    # Another explicit user HOLD can supersede the status before any fact is ACKed.
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=8,
+        last_sequence_number=0,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is True
+    with factory() as session:
+        rows = session.scalars(
+            select(FactOutboxModel)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert [(row.event_id, row.payload, row.fact_kind) for row in rows] == original
+        assert {row.expected_revision for row in rows} == {8}
+
+
+def test_revision_conflict_financial_rebase_fails_closed_on_unknown_boundary(worker_repository_factory) -> None:
+    repo, factory = worker_repository_factory()
+    command_value = baseline_command()
+    automation_id = str(command_value.automation_id)
+    repo.cache_command(command_value)
+    repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        cached.state = AutomationState.HOLD.value
+        cached.resume_requested = False
+
+    assert repo.reconcile_recovery_resume_outbox(
+        automation_id,
+        state=AutomationState.HOLD,
+        revision=7,
+        last_sequence_number=100,
+        resume_requested=False,
+        user_broker_id=str(command_value.user_broker_id),
+        allow_financial_rebase=True,
+    ) is False
+    with factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(FactOutboxModel).where(
+                FactOutboxModel.automation_id == automation_id
+            )
+        ) == 2
+
+
+@pytest.mark.parametrize("operation", ["resume_consume", "outbox_rebase"])
+def test_recovery_write_lock_serializes_concurrent_audit_append(tmp_path: Path, operation: str) -> None:
+    engine = create_worker_engine(f"sqlite:///{tmp_path / 'recovery-audit-race.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW))
+    audit_repo = LocalAutomationRepository(factory, fact_writer=FactOutboxWriter(clock=lambda: NOW))
+    command_value = baseline_command()
+    automation_id = str(command_value.automation_id)
+    if operation == "resume_consume":
+        command_value = command_value.model_copy(
+            update={"state": AutomationState.HOLD, "resume_requested": True}
+        )
+        repo.cache_command(command_value)
+    else:
+        repo.cache_command(command_value)
+        repo.save_decision_batch((decision_item(command_value),), occurred_at=NOW)
+        with factory.begin() as session:
+            cached = session.get_one(CachedAutomationModel, automation_id)
+            cached.state = AutomationState.HOLD.value
+            cached.resume_requested = True
+
+    selected = Event()
+    resume_rebase = Event()
+    audit_done = Event()
+    errors: list[BaseException] = []
+
+    def pause_after_rebase_select(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if current_thread().name == "recovery-rebase" and statement.lstrip().upper().startswith("SELECT"):
+            selected.set()
+            assert resume_rebase.wait(timeout=5)
+
+    audit = BusinessAuditEvent(
+        event_id=str(UUID(int=78_001)),
+        process_id=AUDIT_PROCESS_ID,
+        parent_process_id=None,
+        automation_id=automation_id,
+        broker_id=str(command_value.broker_id),
+        account_id=command_value.account_id,
+        instrument_id=command_value.external_instrument_id,
+        level=BusinessAuditLevel.INFO,
+        stage=BusinessAuditStage.WORKER_RECOVERY_COMPLETED,
+        message="Concurrent audit append",
+        data={},
+        occurred_at=NOW + timedelta(seconds=2),
+        critical=False,
+    )
+
+    def rebase():
+        try:
+            if operation == "resume_consume":
+                repo.consume_recovery_resume(command_value, occurred_at=NOW)
+            else:
+                repo.reconcile_recovery_resume_outbox(
+                    automation_id,
+                    state=AutomationState.HOLD,
+                    revision=7,
+                    last_sequence_number=0,
+                    resume_requested=False,
+                    user_broker_id=str(command_value.user_broker_id),
+                    allow_financial_rebase=True,
+                )
+        except BaseException as error:
+            errors.append(error)
+
+    def append_audit():
+        try:
+            audit_repo.append_audit_events([audit])
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            audit_done.set()
+
+    event.listen(engine, "after_cursor_execute", pause_after_rebase_select)
+    rebase_thread = Thread(target=rebase, name="recovery-rebase")
+    audit_thread = Thread(target=append_audit, name="concurrent-audit")
+    try:
+        rebase_thread.start()
+        assert selected.wait(timeout=5)
+        audit_thread.start()
+        assert audit_done.wait(timeout=0.1) is False
+        resume_rebase.set()
+        rebase_thread.join(timeout=5)
+        audit_thread.join(timeout=5)
+    finally:
+        resume_rebase.set()
+        event.remove(engine, "after_cursor_execute", pause_after_rebase_select)
+        engine.dispose()
+
+    assert errors == []
+    with factory() as session:
+        sequences = session.scalars(
+            select(FactOutboxModel.sequence_number)
+            .where(FactOutboxModel.automation_id == automation_id)
+            .order_by(FactOutboxModel.sequence_number)
+        ).all()
+        assert sequences == list(range(1, len(sequences) + 1))
+
+
+def test_rejected_stale_fact_does_not_replace_authoritative_closed_state(
+    worker_repository_factory,
+) -> None:
     repo, _factory = worker_repository_factory()
     command_value = baseline_command()
     automation_id = str(command_value.automation_id)
@@ -1181,7 +2035,12 @@ def test_hold_transaction_started_first_prevents_stale_decision_intent(tmp_path)
     repo = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
     value = baseline_command()
     repo.cache_command(value)
-    hold_written, release_hold, admission_started, cached_loaded = Event(), Event(), Event(), Event()
+    hold_written, release_hold, admission_started, cached_loaded = (
+        Event(),
+        Event(),
+        Event(),
+        Event(),
+    )
     errors, results = [], []
 
     def pause_hold_commit(session):

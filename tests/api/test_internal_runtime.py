@@ -18,9 +18,12 @@ def test_internal_runtime_matches_captured_public_configuration(monkeypatch, tmp
     with TestClient(application) as client:
         response = client.get("/internal/runtime")
         assert response.status_code == 200
-        assert (
-            response.json() == client.get("/api/runtime").json() == {"environment": "TEST", "access_mode": "READ_ONLY"}
-        )
+        assert response.json() == {
+            "environment": "TEST",
+            "access_mode": "READ_ONLY",
+            "execution_diagnostics": "v1",
+        }
+        assert client.get("/api/runtime").json() == {"environment": "TEST", "access_mode": "READ_ONLY"}
 
 
 @pytest.mark.parametrize("state", [UserBrokerState.ACTIVE, UserBrokerState.DISABLED])

@@ -1,0 +1,104 @@
+........................................................................ [  2%]
+........................................................................ [  4%]
+........................................................................ [  7%]
+........................................................................ [  9%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 17%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+.............................................ss.........E............... [ 24%]
+........................................................................ [ 27%]
+........................................................................ [ 29%]
+........................................................................ [ 32%]
+........................................................................ [ 34%]
+........................................................................ [ 37%]
+........................................................................ [ 39%]
+........................................................................ [ 42%]
+........................................................................ [ 44%]
+........................................................................ [ 47%]
+........................................................................ [ 49%]
+........................................................................ [ 52%]
+........................................................................ [ 54%]
+........................................................................ [ 57%]
+........................................................................ [ 59%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 69%]
+........................................................................ [ 71%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 81%]
+........................................................................ [ 84%]
+........................................................................ [ 86%]
+........................................................................ [ 89%]
+........................................................................ [ 91%]
+........................................................................ [ 94%]
+........................................................................ [ 96%]
+........................................................................ [ 99%]
+......................                                                   [100%]
+==================================== ERRORS ====================================
+_ ERROR at setup of test_prod_http_decision_is_durable_and_acknowledged_with_actual_fill _
+tests/integration/postgresql/test_prod_decision_pipeline.py:328: in prod_test_database
+    assert isolated_postgresql_database_url.database == "sentinel_prod_completeness_test"
+E   AssertionError: assert 'sentinel_recovery_test' == 'sentinel_pro...leteness_test'
+E     
+E     - sentinel_prod_completeness_test
+E     + sentinel_recovery_test
+---------------------------- Captured stderr setup -----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 0001_baseline, Create the complete clean Core schema.
+INFO  [alembic.runtime.migration] Running upgrade 0001_baseline -> 0002_portfolio_snapshot_runs, Replace account summaries with run-grouped portfolio snapshots.
+INFO  [alembic.runtime.migration] Running upgrade 0002_portfolio_snapshot_runs -> 0003_user_broker_archive, Archive broker settings without deleting their immutable scopes or history.
+INFO  [alembic.runtime.migration] Running upgrade 0003_user_broker_archive -> 0004_trading_admission, Create durable worker ownership and production trading admission records.
+INFO  [alembic.runtime.migration] Running upgrade 0004_trading_admission -> 0005_order_quota_percent, Add a nullable per-automation order quota percentage.
+INFO  [alembic.runtime.migration] Running upgrade 0005_order_quota_percent -> 0006_strict_state_invariants, Reject incomplete bootstrap snapshots and incompatible runtime ownership.
+INFO  [alembic.runtime.migration] Running upgrade 0006_strict_state_invariants -> 0007_portfolio_run_index, Index exact run lookups without changing snapshot data or existing indexes.
+=============================== warnings summary ===============================
+<string>:10
+<string>:10
+  <string>:10: DeprecationWarning: GetCandlesRequest.figi is deprecated
+
+<string>:6
+<string>:6
+  <string>:6: DeprecationWarning: GetOrderBookRequest.figi is deprecated
+
+<string>:5
+<string>:5
+  <string>:5: DeprecationWarning: GetTradingStatusRequest.figi is deprecated
+
+<string>:8
+<string>:8
+  <string>:8: DeprecationWarning: GetLastTradesRequest.figi is deprecated
+
+<string>:20
+<string>:20
+<string>:20
+<string>:20
+  <string>:20: DeprecationWarning: PostStopOrderRequest.figi is deprecated
+
+<string>:14
+<string>:14
+<string>:14
+<string>:14
+  <string>:14: DeprecationWarning: PostOrderRequest.figi is deprecated
+
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/services/test_trading_admission.py::test_same_runtime_registration_is_idempotent_without_lease_resurrection
+tests/services/test_trading_admission.py::test_same_runtime_registration_is_idempotent_without_lease_resurrection
+tests/services/test_trading_admission.py::test_expired_owner_lease_cannot_be_renewed_and_does_not_create_sticky_stop
+tests/services/test_trading_admission.py::test_expired_owner_lease_cannot_be_renewed_and_does_not_create_sticky_stop
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/sqlalchemy/engine/default.py:952: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+    cursor.execute(statement, parameters)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [2] tests/integration/postgresql/test_paired_restore.py:105: pg_dump required for restore rehearsal
+ERROR tests/integration/postgresql/test_prod_decision_pipeline.py::test_prod_http_decision_is_durable_and_acknowledged_with_actual_fill
+2899 passed, 2 skipped, 21 warnings, 1 error in 444.13s (0:07:24)

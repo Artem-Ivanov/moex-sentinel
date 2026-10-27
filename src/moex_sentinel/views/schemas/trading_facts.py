@@ -23,6 +23,7 @@ class ClaimAutomationCommandsResponseSchema(StrictFactSchema):
 
 class AutomationStatusesRequestSchema(StrictFactSchema):
     automation_ids: list[UUID]
+    commission_intent_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
 
 class PublishFactsRequestSchema(StrictFactSchema):

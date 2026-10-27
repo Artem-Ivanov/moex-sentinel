@@ -150,7 +150,7 @@ async function action(operation: (id: string) => Promise<Automation>): Promise<v
             <td>{{ item.bootstrap_pending ? '—' : item.quantity_lots }}</td>
             <td>{{ item.bootstrap_pending ? '—' : `${item.average_price} ${item.currency}` }}</td>
             <td>{{ item.bootstrap_pending ? '—' : `${item.invested_amount} ${item.currency}` }}</td>
-            <td>{{ item.bootstrap_pending ? '—' : `${item.net_pnl} ${item.currency}` }}</td>
+            <td>{{ item.bootstrap_pending ? '—' : `${item.net_pnl} ${item.currency}` }}<p v-if="!item.bootstrap_pending && item.financial_status === 'INCOMPLETE'" class="hint">Сверка комиссий не завершена</p><p v-else-if="!item.bootstrap_pending && item.financial_status === 'UNKNOWN'" class="hint">Комиссии требуют сверки</p></td>
             <td>{{ item.bootstrap_pending ? '—' : `${item.actual_commissions} ${item.currency}` }}</td>
           </tr>
         </tbody>

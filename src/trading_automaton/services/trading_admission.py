@@ -33,6 +33,9 @@ def _bounded_milliseconds(seconds: float) -> int:
 
 
 class TradingAdmissionCorePort(Protocol):
+    @property
+    def runtime_generation(self) -> int | None: ...
+
     def trading_admission(self, broker_id: str) -> AdmissionView: ...
     def authorize_submit(self, request: SubmitAuthorizationRequest) -> SubmitAuthorizationResult: ...
     def submit_attempt(
@@ -89,6 +92,24 @@ class TradingAdmissionService:
         if not view.effective_can_submit and view.effective_denial_reasons != (SubmitDenialReason.BASELINE_REQUIRED,):
             return view.effective_denial_reasons[0] if view.effective_denial_reasons else SubmitDenialReason.DISARMED
         return view
+
+    async def validate_cancel(self) -> bool:
+        """Allow risk-reducing cancel only while this runtime owns a live account lease."""
+        try:
+            view = await asyncio.to_thread(self._core.trading_admission, str(self.broker_id))
+            runtime_generation = self._core.runtime_generation
+        except Exception:
+            return False
+        now = floor_utc_millisecond(self._now())
+        return (
+            view.broker_id == self.broker_id
+            and view.account_id == self.account_id
+            and view.owner_runtime_instance_id == self.runtime_instance_id
+            and view.owner_generation is not None
+            and view.owner_generation == runtime_generation
+            and view.lease_expires_at is not None
+            and view.lease_expires_at > now
+        )
 
     async def authorize_submit(self, request: DispatchRequest) -> SubmitGate:
         if (

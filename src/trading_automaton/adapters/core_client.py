@@ -57,6 +57,7 @@ class CoreClient:
         self._strategy_enabled = strategy_enabled
         self._registration: RuntimeRegistrationResult | None = None
         self._owner_expired = False
+        self._execution_diagnostics_supported = False
 
     def validate_runtime(self) -> None:
         if self._application_environment is None and self._access_mode is None:
@@ -71,6 +72,7 @@ class CoreClient:
             raise ValueError("Worker/Core environment mismatch")
         if configuration.get("access_mode") != self._access_mode:
             raise ValueError("Worker/Core access mode mismatch")
+        self._execution_diagnostics_supported = configuration.get("execution_diagnostics") == "v1"
 
     def claim_commands(self, worker_id: str, limit: int) -> list[AutomationCommand]:
         self.validate_runtime()
@@ -83,13 +85,24 @@ class CoreClient:
         )
         return [AutomationCommand.model_validate(item) for item in response.json()["commands"]]
 
-    def automation_statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult:
+    def automation_statuses(
+        self,
+        automation_ids: list[UUID],
+        commission_order_ids: list[UUID] | None = None,
+    ) -> AutomationStatusesResult:
         self.validate_runtime()
         self._require_runtime_owner()
         response = self._request(
             "POST",
             "/internal/automation-statuses",
-            json={"automation_ids": [str(item) for item in automation_ids]},
+            json={
+                "automation_ids": [str(item) for item in automation_ids],
+                **(
+                    {}
+                    if commission_order_ids is None
+                    else {"commission_intent_ids": [str(item) for item in commission_order_ids]}
+                ),
+            },
             headers=self._headers(),
         )
         return AutomationStatusesResult.model_validate(response.json())
@@ -109,13 +122,18 @@ class CoreClient:
     def heartbeat(self, worker_id: str, occurred_at: datetime, diagnostics: WorkerDiagnostics | None = None) -> None:
         self.validate_runtime()
         self.renew_admission()
+        worker_diagnostics = None
+        if diagnostics is not None:
+            worker_diagnostics = diagnostics.model_dump(mode="json")
+            if not self._execution_diagnostics_supported:
+                worker_diagnostics.pop("execution_diagnostics", None)
         self._request(
             "POST",
             "/internal/automaton/heartbeats",
             json={
                 "worker_id": worker_id,
                 "occurred_at": _json_value(occurred_at),
-                **({"worker_diagnostics": diagnostics.model_dump(mode="json")} if diagnostics is not None else {}),
+                **({"worker_diagnostics": worker_diagnostics} if worker_diagnostics is not None else {}),
                 **(
                     {
                         "runtime_version": {
@@ -176,6 +194,13 @@ class CoreClient:
     @property
     def runtime_instance_id(self) -> UUID:
         return self._instance_id
+
+    @property
+    def runtime_generation(self) -> int | None:
+        registration = self._registration
+        if registration is None or registration.registration_status.value != "OWNER":
+            return None
+        return registration.generation
 
     def register_runtime(self, request: RuntimeRegistrationRequest) -> RuntimeRegistrationResult:
         if self._owner_expired:

@@ -1,0 +1,320 @@
+"""Aggregation of read-only portfolio data across enabled brokers."""
+
+import asyncio
+from collections.abc import Callable, Coroutine
+from decimal import Decimal
+from functools import partial
+from typing import Any, Protocol
+
+from moex_sentinel.domain.instrument_catalog import UserBrokerCatalogInstrument
+from moex_sentinel.domain.portfolio import (
+    BrokerAccount,
+    BrokerAccountSnapshot,
+    BrokerAccountsView,
+    BrokerOperation,
+    BrokerOperationsView,
+    BrokerPosition,
+    BrokerPositionsView,
+    BrokerReadError,
+    ExternalOperation,
+    ExternalPosition,
+    Money,
+)
+from moex_sentinel.domain.user_brokers import UserBroker
+from moex_sentinel.services.environment import EnvironmentMismatchError, EnvironmentStatePort
+from moex_sentinel.services.portfolio_ports import PortfolioPort
+from moex_sentinel.services.ports import UserBrokerReadPort
+from moex_sentinel.services.sync_execution import run_sync
+from sentinel_contracts.broker_errors import BrokerOperationError
+
+AdapterFactory = Callable[[UserBroker], PortfolioPort]
+
+
+class InstrumentCatalogLookupPort(Protocol):
+    def get(self, user_broker_id: str, instrument_id: str) -> UserBrokerCatalogInstrument: ...
+
+    def find_by_external_instrument_id(
+        self,
+        user_broker_id: str,
+        external_instrument_id: str,
+    ) -> UserBrokerCatalogInstrument | None: ...
+
+
+NON_TRADING_OPERATION_TYPES = frozenset(
+    {
+        "OPERATION_TYPE_INPUT",
+        "OPERATION_TYPE_OUTPUT",
+        "OPERATION_TYPE_INPUT_SECURITIES",
+        "OPERATION_TYPE_OUTPUT_SECURITIES",
+        "OPERATION_TYPE_INPUT_SWIFT",
+        "OPERATION_TYPE_OUTPUT_SWIFT",
+        "OPERATION_TYPE_INPUT_ACQUIRING",
+        "OPERATION_TYPE_OUTPUT_ACQUIRING",
+        "OPERATION_TYPE_INP_MULTI",
+        "OPERATION_TYPE_OUT_MULTI",
+    }
+)
+POSITION_TRADE_TYPES = frozenset({"BUY", "SELL", "OPERATION_TYPE_BUY", "OPERATION_TYPE_SELL"})
+EXECUTED_OPERATION_STATES = frozenset({"EXECUTED", "OPERATION_STATE_EXECUTED"})
+
+
+class PortfolioAggregationService:
+    def __init__(
+        self,
+        brokers: UserBrokerReadPort,
+        adapter_factory: AdapterFactory,
+        environment: EnvironmentStatePort | None = None,
+        instruments: InstrumentCatalogLookupPort | None = None,
+    ) -> None:
+        self._brokers = brokers
+        self._adapter_factory = adapter_factory
+        self._environment = environment
+        self._instruments = instruments
+
+    async def view_all_accounts(self) -> BrokerAccountsView:
+        return self._accounts_view(await self._for_enabled_brokers(self._read_accounts))
+
+    async def view_broker_accounts(self, broker_id: str) -> BrokerAccountsView:
+        broker = await run_sync(partial(self._account_broker, broker_id))
+        return self._accounts_view((await self._read_accounts(broker),))
+
+    def _account_broker(self, broker_id: str) -> UserBroker:
+        broker = self._brokers.get(broker_id)
+        if broker.is_test is not self._active_test():
+            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        return broker
+
+    def _accounts_view(
+        self,
+        results: tuple[tuple[tuple[BrokerAccountSnapshot, ...], tuple[BrokerReadError, ...]], ...],
+    ) -> BrokerAccountsView:
+        accounts = tuple(item for batch, _ in results for item in batch)
+        errors = tuple(error for _, batch_errors in results for error in batch_errors)
+        return BrokerAccountsView(
+            accounts,
+            self._sum_money(item.portfolio.total_amount for item in accounts),
+            self._sum_money(item.portfolio.free_cash for item in accounts),
+            errors,
+        )
+
+    async def view_positions(self) -> BrokerPositionsView:
+        results = await self._for_enabled_brokers(self._read_positions)
+        return BrokerPositionsView(
+            tuple(item for batch, _ in results for item in batch),
+            tuple(error for _, errors in results for error in errors),
+        )
+
+    async def view_operations(self, limit: int) -> BrokerOperationsView:
+        async def read(
+            broker: UserBroker,
+        ) -> tuple[tuple[BrokerOperation, ...], tuple[BrokerReadError, ...]]:
+            return await self._read_operations(broker, limit)
+
+        results = await self._for_enabled_brokers(read)
+        items = tuple(item for batch, _ in results for item in batch)
+        return BrokerOperationsView(
+            tuple(sorted(items, key=lambda item: item.operation.occurred_at, reverse=True)[:limit]),
+            tuple(error for _, errors in results for error in errors),
+        )
+
+    async def view_position_operations(
+        self,
+        broker_id: str,
+        account_id: str,
+        instrument_id: str,
+        limit: int,
+    ) -> BrokerOperationsView:
+        """Resolve a broker-scoped internal catalog ID before reading executed position trades."""
+        broker, instrument = await run_sync(partial(self._position_scope, broker_id, account_id, instrument_id))
+        try:
+            page = await self._adapter_factory(broker).get_operations(
+                account_id, None, limit, instrument.external_instrument_id
+            )
+        except (BrokerOperationError, ValueError) as error:
+            return BrokerOperationsView((), (self._error(broker, account_id, error),))
+        items = tuple(
+            BrokerOperation(broker.id, broker.display_name, item)
+            for item in page.items
+            if item.operation_type in POSITION_TRADE_TYPES and item.state in EXECUTED_OPERATION_STATES
+        )
+        return BrokerOperationsView(
+            tuple(sorted(items, key=lambda item: item.operation.occurred_at, reverse=True)),
+            (),
+        )
+
+    def _position_scope(self, broker_id: str, account_id: str, instrument_id: str):
+        broker = self._brokers.get(broker_id)
+        if not broker.enabled:
+            raise ValueError("Подключение брокера отключено.")
+        if broker.is_test is not self._active_test():
+            raise EnvironmentMismatchError("Broker belongs to inactive environment.")
+        if self._instruments is None:
+            raise ValueError("Position operations require an instrument catalog.")
+        if broker.account_id and account_id != broker.account_id:
+            raise ValueError("UserBroker account does not match selected scope.")
+        instrument = self._instruments.get(broker_id, instrument_id)
+        return broker, instrument
+
+    async def _for_enabled_brokers(
+        self,
+        reader: Callable[[UserBroker], Coroutine[Any, Any, tuple[tuple[Any, ...], tuple[BrokerReadError, ...]]]],
+    ) -> tuple[tuple[tuple[Any, ...], tuple[BrokerReadError, ...]], ...]:
+        brokers = await run_sync(self._enabled_brokers)
+        return tuple(await asyncio.gather(*(reader(broker) for broker in brokers)))
+
+    def _enabled_brokers(self) -> tuple[UserBroker, ...]:
+        active_test = self._active_test()
+        return tuple(broker for broker in self._brokers.list() if broker.enabled and broker.is_test is active_test)
+
+    def _active_test(self) -> bool:
+        return self._environment is None or self._environment.view().active_environment == "TEST"
+
+    @staticmethod
+    def _missing_selected_account_error(
+        broker: UserBroker, accounts: tuple[BrokerAccount, ...]
+    ) -> BrokerReadError | None:
+        if not broker.account_id or any(account.account_id == broker.account_id for account in accounts):
+            return None
+        return BrokerReadError(
+            broker_id=broker.id,
+            broker_name=broker.display_name,
+            account_id=broker.account_id,
+            code="BROKER_ACCOUNT_NOT_FOUND",
+            message="Выбранный счёт не найден на площадке.",
+        )
+
+    async def _read_accounts(
+        self, broker: UserBroker
+    ) -> tuple[tuple[BrokerAccountSnapshot, ...], tuple[BrokerReadError, ...]]:
+        try:
+            adapter = self._adapter_factory(broker)
+            accounts = await adapter.list_accounts()
+        except (BrokerOperationError, ValueError) as error:
+            return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
+
+        snapshots: list[BrokerAccountSnapshot] = []
+        errors: list[BrokerReadError] = []
+        for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
+            try:
+                portfolio = await adapter.get_portfolio(account.account_id)
+                snapshots.append(BrokerAccountSnapshot(broker.id, broker.display_name, account, portfolio))
+            except BrokerOperationError as error:
+                errors.append(self._error(broker, account.account_id, error))
+        return tuple(snapshots), tuple(errors)
+
+    async def _read_positions(
+        self, broker: UserBroker
+    ) -> tuple[tuple[BrokerPosition, ...], tuple[BrokerReadError, ...]]:
+        try:
+            adapter = self._adapter_factory(broker)
+            accounts = await adapter.list_accounts()
+        except (BrokerOperationError, ValueError) as error:
+            return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
+
+        items: list[BrokerPosition] = []
+        errors: list[BrokerReadError] = []
+        for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
+            try:
+                positions = await adapter.get_positions(account.account_id)
+                items.extend(
+                    BrokerPosition(broker.id, broker.display_name, item)
+                    for item in positions
+                    if self._is_open_instrument_position(item)
+                )
+            except BrokerOperationError as error:
+                errors.append(self._error(broker, account.account_id, error))
+        return tuple(items), tuple(errors)
+
+    async def _read_operations(
+        self, broker: UserBroker, limit: int
+    ) -> tuple[tuple[BrokerOperation, ...], tuple[BrokerReadError, ...]]:
+        try:
+            adapter = self._adapter_factory(broker)
+            accounts = await adapter.list_accounts()
+        except (BrokerOperationError, ValueError) as error:
+            return (), (self._error(broker, None, error),)
+
+        if error := self._missing_selected_account_error(broker, accounts):
+            return (), (error,)
+
+        items: list[BrokerOperation] = []
+        errors: list[BrokerReadError] = []
+        instruments: dict[str, UserBrokerCatalogInstrument | None] = {}
+        for account in accounts:
+            if broker.account_id and account.account_id != broker.account_id:
+                continue
+            try:
+                page = await adapter.get_operations(account.account_id, None, limit)
+                items.extend(await run_sync(partial(self._operation_items, broker, page.items, instruments)))
+            except BrokerOperationError as error:
+                errors.append(self._error(broker, account.account_id, error))
+        return tuple(items), tuple(errors)
+
+    def _operation_items(self, broker, operations, instruments):
+        return tuple(
+            BrokerOperation(broker.id, broker.display_name, self._with_ticker(broker.id, item, instruments))
+            for item in operations
+            if item.operation_type not in NON_TRADING_OPERATION_TYPES
+        )
+
+    def _with_ticker(
+        self,
+        broker_id: str,
+        operation: ExternalOperation,
+        instruments: dict[str, UserBrokerCatalogInstrument | None],
+    ) -> ExternalOperation:
+        """Reuse successful and missing lookups only within this broker's operations read."""
+        if self._instruments is None or not operation.instrument_id:
+            return operation
+        if operation.instrument_id not in instruments:
+            instruments[operation.instrument_id] = self._instruments.find_by_external_instrument_id(
+                broker_id, operation.instrument_id
+            )
+        instrument = instruments[operation.instrument_id]
+        if instrument is None:
+            return operation
+        return operation.model_copy(update={"ticker": instrument.ticker})
+
+    @staticmethod
+    def _sum_money(values: Any) -> tuple[Money, ...]:
+        totals: dict[str, Decimal] = {}
+        for value in values:
+            if value is not None:
+                totals[value.currency] = totals.get(value.currency, Decimal()) + value.amount
+        return tuple(Money(amount, currency) for currency, amount in sorted(totals.items()))
+
+    @staticmethod
+    def _is_open_instrument_position(position: ExternalPosition) -> bool:
+        return bool(position.instrument_id.strip() and position.ticker.strip() and position.quantity_lots != 0)
+
+    @staticmethod
+    def _error(
+        broker: UserBroker,
+        account_id: str | None,
+        error: BrokerOperationError | ValueError,
+    ) -> BrokerReadError:
+        if isinstance(error, BrokerOperationError):
+            return BrokerReadError(
+                broker_id=broker.id,
+                broker_name=broker.display_name,
+                account_id=account_id,
+                code=error.code,
+                message=str(error),
+            )
+        return BrokerReadError(
+            broker_id=broker.id,
+            broker_name=broker.display_name,
+            account_id=account_id,
+            code="BROKER_CONFIGURATION",
+            message=str(error),
+        )

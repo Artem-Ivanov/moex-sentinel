@@ -4,6 +4,8 @@ from enum import Enum
 
 from sentinel_contracts.trading import AutomationState
 
+TECHNICAL_RECOVERY_RESUME_MESSAGE = "Automation resumed after technical recovery"
+
 
 class TransitionOrigin(str, Enum):
     USER_COMMAND = "USER_COMMAND"
@@ -41,8 +43,15 @@ def validate_automation_transition(
     *,
     origin: TransitionOrigin,
     bootstrap: bool = False,
+    recovery_resume: bool = False,
 ) -> bool:
     """Return whether state changes; bootstrap must be verified by the caller."""
+    if recovery_resume and not (
+        origin is TransitionOrigin.WORKER_FACT
+        and current is AutomationState.HOLD
+        and target is AutomationState.IN_QUEUE
+    ):
+        raise InvalidAutomationTransition("Recovery resume only permits a Worker HOLD to IN_QUEUE transition.")
     if current is target:
         return False
     transitions = _USER_TRANSITIONS if origin is TransitionOrigin.USER_COMMAND else _WORKER_TRANSITIONS
@@ -51,6 +60,11 @@ def validate_automation_transition(
         and bootstrap
         and current is AutomationState.HOLD
         and target is AutomationState.IN_WORK
+    ) or (
+        origin is TransitionOrigin.WORKER_FACT
+        and recovery_resume
+        and current is AutomationState.HOLD
+        and target is AutomationState.IN_QUEUE
     ):
         return True
     raise InvalidAutomationTransition(f"{origin.value} cannot transition {current.value} to {target.value}.")

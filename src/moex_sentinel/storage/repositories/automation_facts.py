@@ -13,6 +13,7 @@ from moex_sentinel.domain.trading_facts import (
 )
 from moex_sentinel.storage.models.automation_facts import TradingAutomationModel
 from moex_sentinel.storage.models.reference_data import BrokerInstrumentModel
+from moex_sentinel.storage.models.trading_observability import AutomationEventModel
 from moex_sentinel.storage.repositories.trading_facts_support import flush_or_translate, require_scoped_reference
 from sentinel_contracts.trading import AutomationState
 
@@ -78,6 +79,32 @@ class AutomationFactsRepository:
             raise TradingFactPersistenceError(TradingFactErrorCode.NOT_FOUND, entity_type="automation")
         return _automation_value(model)
 
+    def has_current_worker_technical_hold(
+        self,
+        user_broker_id: str,
+        automation_id: str,
+        *,
+        revision: int,
+        hold_reason: str,
+    ) -> bool:
+        event = self._session.scalar(
+            select(AutomationEventModel)
+            .where(
+                AutomationEventModel.user_broker_id == user_broker_id,
+                AutomationEventModel.automation_id == automation_id,
+                AutomationEventModel.fact_kind == "AUTOMATION_STATE_CHANGED",
+            )
+            .order_by(AutomationEventModel.sequence_number.desc())
+            .limit(1)
+        )
+        return bool(
+            event is not None
+            and event.expected_revision + 1 == revision
+            and event.payload.get("state") == AutomationState.HOLD.value
+            and event.payload.get("suspended_from_state") == AutomationState.IN_WORK.value
+            and event.payload.get("hold_reason") == hold_reason
+        )
+
     def compare_and_set_state(
         self,
         user_broker_id: str,
@@ -99,6 +126,7 @@ class AutomationFactsRepository:
                 state=state.value,
                 hold_reason=hold_reason,
                 closed_at=closed_at,
+                resume_requested=False,
                 revision=expected_revision + 1,
             )
             .returning(TradingAutomationModel.id)
@@ -135,6 +163,7 @@ class AutomationFactsRepository:
                 suspended_from_state=suspended_from_state.value if suspended_from_state else None,
                 hold_reason=hold_reason,
                 closed_at=closed_at,
+                resume_requested=False,
                 revision=expected_revision + 1,
                 last_sequence_number=sequence_number,
             )

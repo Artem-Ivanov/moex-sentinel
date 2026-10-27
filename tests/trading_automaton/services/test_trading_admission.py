@@ -27,10 +27,11 @@ FINGERPRINT = "a" * 64
 
 
 class Core:
-    def __init__(self, view=None, error=None, authorization=None):
+    def __init__(self, view=None, error=None, authorization=None, runtime_generation=2):
         self.view = view
         self.error = error
         self.authorization = authorization
+        self.runtime_generation = runtime_generation
 
     def trading_admission(self, broker_id):
         if self.error is not None:
@@ -111,6 +112,50 @@ def test_prepare_requires_current_owner_and_technical_readiness(current, uid, ex
 def test_core_failure_prevents_intent_preparation():
     result = asyncio.run(service(Core(error=TimeoutError())).prepare("uid-1"))
     assert result.value == "CORE_UNAVAILABLE"
+
+
+def test_validate_cancel_requires_fresh_current_owner_and_lease_without_arm_or_limits():
+    disarmed = view(
+        admission_status=AdmissionStatus.DISARMED,
+        arm_revision=None,
+        arm_expires_at=None,
+        limits=None,
+        effective_can_submit=False,
+        effective_denial_reasons=(SubmitDenialReason.DISARMED,),
+    )
+
+    result = asyncio.run(service(Core(disarmed)).validate_cancel())
+
+    assert result is True
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        view(owner_runtime_instance_id=uuid4()),
+        view(owner_generation=None),
+        view(owner_generation=1),
+        view(lease_expires_at=NOW),
+        view(account_id="other-account"),
+        view(broker_id=uuid4()),
+    ],
+)
+def test_validate_cancel_fails_closed_without_current_scope_and_live_owner(current):
+    result = asyncio.run(service(Core(current)).validate_cancel())
+
+    assert result is False
+
+
+def test_validate_cancel_fails_closed_when_core_is_unavailable():
+    result = asyncio.run(service(Core(error=TimeoutError())).validate_cancel())
+
+    assert result is False
+
+
+def test_validate_cancel_fails_closed_without_acknowledged_current_generation():
+    result = asyncio.run(service(Core(view(), runtime_generation=None)).validate_cancel())
+
+    assert result is False
 
 
 def test_prepare_accepts_any_automation_uid_without_arm_or_canary_binding():

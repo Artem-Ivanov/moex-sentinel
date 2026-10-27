@@ -1,0 +1,272 @@
+"""Dispatch a persisted broker intent without including broker response in SLA."""
+
+import asyncio
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Protocol
+
+from sentinel_contracts.broker_errors import BrokerOperationError
+from sentinel_contracts.broker_execution import BrokerOrderState, BrokerPosition, BrokerRecoveryOperation
+from sentinel_contracts.business_audit import BusinessAuditStage
+from sentinel_contracts.time import floor_utc_millisecond
+from trading_automaton.domain.dtos import DispatchRequest
+from trading_automaton.domain.ports import IntentUpdatePort, OrderStageAuditPort
+
+
+class DispatchBrokerPort(Protocol):
+    async def dispatch_limit_order(self, request: DispatchRequest) -> BrokerOrderState: ...
+
+    async def find_by_idempotency_key(self, account_id: str, idempotency_key: str) -> BrokerOrderState | None: ...
+
+    async def inspect_position(self, account_id: str, instrument_id: str) -> BrokerPosition | None: ...
+
+    async def inspect_recent_operations(
+        self, account_id: str, instrument_id: str, limit: int
+    ) -> tuple[BrokerRecoveryOperation, ...]: ...
+
+
+class DispatchRepositoryPort(IntentUpdatePort, Protocol):
+    def hold_active(self, reason: str, automation_id: str | None = None) -> None: ...
+
+
+class OrderDispatchService:
+    """Dispatch durable intents and reconcile ambiguous failures without repeating submission."""
+
+    def __init__(
+        self,
+        repository: DispatchRepositoryPort,
+        broker: DispatchBrokerPort,
+        *,
+        now: Callable[[], datetime],
+        access_mode: str = "READ_ONLY",
+        account_id: str = "",
+        audit: OrderStageAuditPort | None = None,
+    ) -> None:
+        if access_mode not in {"READ_ONLY", "TRADE"}:
+            raise ValueError("Invalid broker access mode")
+        self._access_mode = access_mode
+        self._account_id = account_id
+        self._repository = repository
+        self._broker = broker
+        self._now = now
+        self._audit = audit
+
+    async def dispatch(
+        self,
+        request: DispatchRequest,
+        started: "asyncio.Future[datetime]",
+    ) -> BrokerOrderState:
+        """Record submission, then return or reconcile its result; unresolved intents become UNCERTAIN."""
+        if self._access_mode != "TRADE":
+            raise ValueError("READ_ONLY forbids broker mutation")
+        if self._account_id and request.account_id != self._account_id:
+            raise ValueError("Broker account mismatch")
+        dispatched_at = self._now()
+        if self._market_expired(request) and request.configuration_fingerprint is None:
+            return self._cancel_expired(request, started)
+        if request.configuration_fingerprint is not None:
+            if request.market_valid_until is None:
+                raise ValueError("PROD submit requires a bounded market snapshot")
+            request = request.model_copy(
+                update={
+                    "submit_deadline": min(
+                        floor_utc_millisecond(dispatched_at + timedelta(seconds=1)),
+                        request.market_valid_until,
+                    )
+                }
+            )
+        self._repository.update_intent(
+            request.idempotency_key,
+            state="SUBMITTING",
+            occurred_at=dispatched_at,
+            dispatch_started_at=dispatched_at,
+            process_id=request.process_id,
+        )
+        if not started.done():
+            started.set_result(dispatched_at)
+        if self._audit is not None and request.process_id is not None:
+            await asyncio.to_thread(
+                self._audit.record_order_stage,
+                stage=BusinessAuditStage.BROKER_ORDER_DISPATCH_STARTED,
+                process_id=request.process_id,
+                automation_id=request.automation_id,
+                broker_id=request.broker_id,
+                account_id=request.account_id,
+                instrument_id=request.instrument_id,
+                message="Broker order dispatch started",
+                side=request.side.value,
+                quantity_lots=request.quantity_lots,
+                limit_price=str(request.limit_price),
+            )
+        if self._market_expired(request) and request.configuration_fingerprint is None:
+            return self._cancel_expired(request, started)
+        try:
+            response = await self._broker.dispatch_limit_order(request)
+            self._require_response_request_id(response, request.idempotency_key)
+            responded_at = self._now()
+            self._repository.update_intent(
+                request.idempotency_key,
+                state=response.status,
+                occurred_at=responded_at,
+                broker_order_id=response.broker_order_id or None,
+                broker_responded_at=(responded_at if response.broker_order_id else None),
+                process_id=request.process_id,
+                **(
+                    {
+                        "requested_amount": response.requested_amount,
+                        "estimated_commission": response.estimated_commission,
+                        "pre_rpc_abort_proof": response.pre_rpc_abort_proof,
+                    }
+                    if response.pre_rpc_abort_proof is not None
+                    else {}
+                ),
+            )
+            if self._audit is not None and request.process_id is not None:
+                denial_reason = None if response.submit_denial_reason is None else response.submit_denial_reason.value
+                abort_reason = None if response.pre_rpc_abort_proof is None else response.pre_rpc_abort_proof.reason
+                await asyncio.to_thread(
+                    self._audit.record_order_stage,
+                    stage=BusinessAuditStage.BROKER_ORDER_DISPATCH_RESULT,
+                    process_id=request.process_id,
+                    automation_id=request.automation_id,
+                    broker_id=request.broker_id,
+                    account_id=request.account_id,
+                    instrument_id=request.instrument_id,
+                    message="Broker order dispatch completed",
+                    broker_order_state=response.status,
+                    broker_order_id=response.broker_order_id,
+                    submit_denial_reason=denial_reason,
+                    pre_rpc_abort_reason=abort_reason,
+                    submit_authorization_elapsed_ms=response.submit_authorization_elapsed_ms,
+                    permit_remaining_ms=response.permit_remaining_ms,
+                )
+            return response
+        except Exception as error:
+            # Submission may have reached the broker even when local persistence fails.
+            # Reconcile every ambiguous result; only declared port errors carry safe text.
+            broker_error_code = error.code if isinstance(error, BrokerOperationError) else None
+            broker_error_details = (
+                str(error) if isinstance(error, BrokerOperationError) else "Unexpected dispatch failure"
+            )
+            if request.configuration_fingerprint is not None:
+                reconciled = await asyncio.gather(
+                    self._broker.find_by_idempotency_key(request.account_id, request.idempotency_key),
+                    return_exceptions=True,
+                )
+                reconciled, position, operations = reconciled[0], None, ()
+            else:
+                reconciled, position, operations = await asyncio.gather(
+                    self._broker.find_by_idempotency_key(request.account_id, request.idempotency_key),
+                    self._broker.inspect_position(request.account_id, request.instrument_id),
+                    self._broker.inspect_recent_operations(request.account_id, request.instrument_id, 20),
+                    return_exceptions=True,
+                )
+            if isinstance(reconciled, BrokerOrderState) and reconciled.idempotency_key == request.idempotency_key:
+                responded_at = self._now()
+                self._repository.update_intent(
+                    request.idempotency_key,
+                    state=reconciled.status,
+                    occurred_at=responded_at,
+                    broker_order_id=reconciled.broker_order_id,
+                    broker_responded_at=responded_at,
+                    process_id=request.process_id,
+                )
+                if self._audit is not None and request.process_id is not None:
+                    await asyncio.to_thread(
+                        self._audit.record_order_stage,
+                        stage=BusinessAuditStage.BROKER_ORDER_DISPATCH_RESULT,
+                        process_id=request.process_id,
+                        automation_id=request.automation_id,
+                        broker_id=request.broker_id,
+                        account_id=request.account_id,
+                        instrument_id=request.instrument_id,
+                        message="Broker order reconciled after dispatch failure",
+                        broker_order_state=reconciled.status,
+                        broker_order_id=reconciled.broker_order_id,
+                        exception_type=type(error).__name__,
+                        broker_error_code=broker_error_code,
+                        broker_error_details=broker_error_details,
+                        position_snapshot=(
+                            None
+                            if isinstance(position, BaseException) or position is None
+                            else position.model_dump(mode="json")
+                        ),
+                        recent_operations=(
+                            []
+                            if isinstance(operations, BaseException)
+                            else [operation.model_dump(mode="json") for operation in operations]
+                        ),
+                    )
+                return reconciled
+            self._repository.update_intent(
+                request.idempotency_key,
+                state="UNCERTAIN",
+                occurred_at=self._now(),
+                process_id=request.process_id,
+            )
+            if request.configuration_fingerprint is not None:
+                self._repository.hold_active(
+                    "PROD broker submit outcome is uncertain",
+                    request.automation_id,
+                )
+            if self._audit is not None and request.process_id is not None:
+                await asyncio.to_thread(
+                    self._audit.record_order_stage,
+                    stage=BusinessAuditStage.TRADING_STEP_FAILED,
+                    process_id=request.process_id,
+                    automation_id=request.automation_id,
+                    broker_id=request.broker_id,
+                    account_id=request.account_id,
+                    instrument_id=request.instrument_id,
+                    message="Broker order dispatch failed",
+                    critical=True,
+                    broker_order_state="UNCERTAIN",
+                    exception_type=type(error).__name__,
+                    broker_error_code=broker_error_code,
+                    broker_error_details=broker_error_details,
+                    reconciliation_error=(type(reconciled).__name__ if isinstance(reconciled, Exception) else None),
+                    position_snapshot=(
+                        None
+                        if isinstance(position, BaseException) or position is None
+                        else position.model_dump(mode="json")
+                    ),
+                    recent_operations=(
+                        []
+                        if isinstance(operations, BaseException)
+                        else [operation.model_dump(mode="json") for operation in operations]
+                    ),
+                )
+            raise
+
+    def _market_expired(self, request: DispatchRequest) -> bool:
+        return request.market_valid_until is not None and self._now() > request.market_valid_until
+
+    @staticmethod
+    def _require_response_request_id(response: BrokerOrderState, expected: str) -> None:
+        if response.idempotency_key != expected:
+            raise ValueError("Broker response request ID does not match the submitted intent.")
+
+    def _cancel_expired(self, request: DispatchRequest, started: asyncio.Future[datetime]) -> BrokerOrderState:
+        occurred_at = self._now()
+        self._repository.update_intent(
+            request.idempotency_key,
+            state="CANCELLED",
+            occurred_at=occurred_at,
+            process_id=request.process_id,
+        )
+        if not started.done():
+            started.set_result(occurred_at)
+        # Tracking finalizes this local cancellation with zero fills and releases reservations.
+        return BrokerOrderState(
+            broker_order_id="",
+            idempotency_key=request.idempotency_key,
+            status="CANCELLED",
+            requested_lots=request.quantity_lots,
+            executed_lots=0,
+            requested_amount=request.limit_price * request.quantity_lots * request.lot_size,
+            executed_amount=Decimal(),
+            estimated_commission=Decimal(),
+            executed_commission=Decimal(),
+            currency=request.reservation_currency,
+        )

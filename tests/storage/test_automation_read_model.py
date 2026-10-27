@@ -12,6 +12,7 @@ from moex_sentinel.services.automations import AutomationService
 from moex_sentinel.services.environment import PinnedEnvironment
 from moex_sentinel.storage.database import create_database_engine
 from moex_sentinel.storage.models import Base
+from moex_sentinel.storage.models.automation_facts import TradingAutomationModel
 from moex_sentinel.storage.repositories import RecordNotFoundError
 from moex_sentinel.storage.repositories.automations import AutomationRepository
 from moex_sentinel.storage.repositories.user_brokers import UserBrokerRepository
@@ -93,6 +94,23 @@ def seed_automations(factory: sessionmaker[Session], count: int = 50) -> list[st
 
 
 class TestAutomationReadModel:
+    def test_test_environment_keeps_raw_financial_projection_complete(self, read_model_factory):
+        ids = seed_automations(read_model_factory, 1)
+        cycle = position_cycle_model("test-cycle")
+        cycle.user_broker_id = "broker-0"
+        cycle.automation_id = ids[0]
+        cycle.instrument_id = "instrument-000"
+        cycle.net_pnl = Decimal("2.5")
+        cycle.accumulated_commissions = Decimal("0.03")
+        with read_model_factory.begin() as session:
+            session.add(cycle)
+
+        record = AutomationRepository(read_model_factory).get(ids[0])
+
+        assert record.financial_status == "COMPLETE"
+        assert record.net_pnl == Decimal("2.5")
+        assert record.actual_commissions == Decimal("0.03")
+
     @pytest.mark.parametrize(
         ("method", "count"), [(method, count) for method in ("get_many", "list_active") for count in (0, 1, 50)]
     )
@@ -102,16 +120,25 @@ class TestAutomationReadModel:
         with capture_statements(read_model_engine) as statements:
             result = repository.get_many(ids) if method == "get_many" else repository.list_active()
         assert [value.id for value in result] == ids
-        assert statements == ([] if method == "get_many" and count == 0 else ["SELECT"])
+        expected = [] if method == "get_many" and count == 0 else ["SELECT"]
+        if count == 50:
+            expected.append("SELECT")  # One batched financial projection for PROD cycles.
+        assert statements == expected
 
     @pytest.mark.parametrize("method", ["get_many", "list_active"])
     def test_full_dto_matches_existing_single_record_projection(self, read_model_factory, method):
         ids = seed_automations(read_model_factory)
+        with read_model_factory.begin() as session:
+            held = session.get(TradingAutomationModel, ids[0])
+            assert held is not None
+            held.hold_reason = "BOOTSTRAPPING"
         repository = AutomationRepository(read_model_factory)
         expected = [repository.get(automation_id) for automation_id in ids]
         result = repository.get_many(list(reversed(ids))) if method == "get_many" else repository.list_active()
         assert result == expected
         assert result[0].bootstrap_pending is True
+        assert result[0].hold_reason == "BOOTSTRAPPING"
+        assert result[1].hold_reason is None
         assert result[0].quantity_lots == 0
         assert result[1].quantity_lots == 2
         assert (
@@ -155,7 +182,10 @@ class TestAutomationReadModel:
         with capture_statements(read_model_engine) as statements:
             result = service.get_many(ids) if method == "get_many" else service.list_active()
         assert [value.id for value in result] == [item for index, item in enumerate(ids) if index % 2 == 0]
-        assert statements == ["SELECT", "SELECT"]
+        expected = ["SELECT", "SELECT"]
+        if count == 50:
+            expected.append("SELECT")  # One batched projection for visible PROD cycles.
+        assert statements == expected
 
     @pytest.mark.parametrize(("method", "ids"), [("get_many", []), ("get_many", ["absent"]), ("list_active", None)])
     def test_empty_service_result_avoids_broker_query(self, read_model_factory, read_model_engine, method, ids):

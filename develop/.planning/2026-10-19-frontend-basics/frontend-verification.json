@@ -1,0 +1,17 @@
+{
+  "status": "PASS",
+  "vue_sfc_compiled": 3,
+  "vue_counter_parent_child_clicks": "PASS",
+  "vue_child_props_and_emit": "PASS",
+  "tsx_syntax_blocks": 4,
+  "react_runtime_tested": false,
+  "full_react_typecheck": false,
+  "mocked_fetch_cases": [
+    "success",
+    "empty",
+    "http_error",
+    "network_error",
+    "json_error",
+    "abort_suppressed"
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "baseline": "current dirty F1 candidate before Core rework",
+  "source_candidate": "develop/reports/fees-diagnostics-20261027/f1-review-candidate-2.json",
+  "files": [
+    {
+      "path": "src/moex_sentinel/storage/repositories/automations.py",
+      "exists": true,
+      "sha256": "6394a774bac0df0bd0be189480be0c0a463f61e9f61d1307d00ddd01aabb87ec",
+      "bytes": 19379
+    },
+    {
+      "path": "src/moex_sentinel/domain/repository_records.py",
+      "exists": true,
+      "sha256": "15163384f9fe66c97da8fa07926e047b29477af2971c255b42943044df1f9908",
+      "bytes": 2860
+    },
+    {
+      "path": "src/moex_sentinel/views/schemas/automations.py",
+      "exists": true,
+      "sha256": "77a9dfe93c5e10461ff4eaeb4213cc95bae537277a5a73572e6de5dd417144df",
+      "bytes": 7993
+    },
+    {
+      "path": "src/moex_sentinel/storage/repositories/automation_commands.py",
+      "exists": true,
+      "sha256": "782d3e200e57f5450db476477a63b6890675df62e3e85c3ef29651bc20dd8295",
+      "bytes": 9790
+    },
+    {
+      "path": "src/moex_sentinel/views/internal_trading_facts.py",
+      "exists": true,
+      "sha256": "75a7cdd548a009158bc27953b09de0727ecb51ab0ae6bb4d16540cb11b532479",
+      "bytes": 2771
+    },
+    {
+      "path": "src/moex_sentinel/views/schemas/trading_facts.py",
+      "exists": true,
+      "sha256": "760a95b4ca21942ffe540fdca61d9d37e4fe04c9a2d98f3e516ff05226bf5c2a",
+      "bytes": 880
+    },
+    {
+      "path": "src/sentinel_contracts/trading_facts.py",
+      "exists": true,
+      "sha256": "32a364db2639e8d2804b229f54cc3b2fc4d3681c362ad48d7b9ef986b0f2c5bb",
+      "bytes": 14626
+    },
+    {
+      "path": "src/moex_sentinel/storage/repositories/order_facts.py",
+      "exists": true,
+      "sha256": "d25b4ae7bc5c4a770beaba48405e72d70d674a88ed422787ca796dead124a86a",
+      "bytes": 26866
+    },
+    {
+      "path": "src/moex_sentinel/usecases/execution_diagnostics.py",
+      "exists": true,
+      "sha256": "eb99f8e01d79d7c2dddadeae93f12c925b061d983b82c1a68e7e3379286c3e53",
+      "bytes": 4891
+    },
+    {
+      "path": "src/moex_sentinel/domain/execution_diagnostics.py",
+      "exists": true,
+      "sha256": "8a2dc74b2b66a66455b74c799665785087c12615288cbb2e1598fd81eb56dc5e",
+      "bytes": 851
+    },
+    {
+      "path": "src/moex_sentinel/views/schemas/execution_diagnostics.py",
+      "exists": true,
+      "sha256": "8e14d56a3d134812cdb112ed5757ad38ba23d692c945de612a685c44c2cf28c1",
+      "bytes": 1952
+    },
+    {
+      "path": "tests/storage/test_automation_read_model.py",
+      "exists": true,
+      "sha256": "1cfdf45fcf4da9ed9998c9a900d75546d7796dd0886238e22b879e25248e7569",
+      "bytes": 11138
+    },
+    {
+      "path": "tests/storage/test_execution_commissions.py",
+      "exists": true,
+      "sha256": "12452b3101db0eab4211afe83147887cef3121a80b416ae6b836899f722db677",
+      "bytes": 9644
+    },
+    {
+      "path": "tests/storage/test_automation_command_repository.py",
+      "exists": true,
+      "sha256": "ab291eb1ed5eac30a6d11e1989ab045c66e16dc86f7ae0b8edfac3ca44018b94",
+      "bytes": 6215
+    },
+    {
+      "path": "tests/storage/test_execution_diagnostics.py",
+      "exists": true,
+      "sha256": "a8bbef23fdd7d1fbba2b12330bde9b9599337c9dc981db5b0341352387958553",
+      "bytes": 10147
+    },
+    {
+      "path": "tests/api/test_trading_fact_ingress_contract.py",
+      "exists": true,
+      "sha256": "03afc578faefc8a29249abad1402c6bba592ca8dd46582b9eabd2b9fea4afa99",
+      "bytes": 8490
+    },
+    {
+      "path": "tests/api/test_execution_diagnostics.py",
+      "exists": true,
+      "sha256": "9282ccb8d29f67bf4ec097f2d65ee98c72dfa8767e0f1af8360184fcbdbfbeb9",
+      "bytes": 4540
+    },
+    {
+      "path": "tests/contracts/test_trading_facts_contract.py",
+      "exists": true,
+      "sha256": "e1216c1e0672456615194b9910454269a9130aa9d83522c6d323283752e73214",
+      "bytes": 8377
+    }
+  ]
+}

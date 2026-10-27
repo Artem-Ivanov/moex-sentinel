@@ -21,10 +21,12 @@ from sentinel_contracts.trading_facts import AutomationCommand
 from tests.trading_automaton.command_factory import command as baseline_command
 from tests.trading_automaton.command_factory import decision_item
 from tests.trading_automaton.storage.worker_storage_helpers import filled_buy
+from trading_automaton.adapters.tinvest_broker_session import _order_state
 from trading_automaton.domain.dtos import DispatchRequest
 from trading_automaton.services.account_cash_reservation import AccountCashReservationService
 from trading_automaton.services.active_intent_gate import ActiveIntentGateService
 from trading_automaton.services.business_audit import BusinessAuditService
+from trading_automaton.services.order_lifecycle import intent_deadline
 from trading_automaton.services.order_tracking import OrderTrackingService
 from trading_automaton.services.uncertain_intent_reconciliation import (
     UncertainIntentReconciliationService,
@@ -68,6 +70,12 @@ class Repository:
     def get_active_intent(self, automation_id):
         return self.active_intent
 
+    def expire_intent_by_age(self, intent_id, *, expired_at):
+        return None
+
+    def list_policy_expired_unconfirmed(self, automation_ids, *, now, limit=100, after=None):
+        return ()
+
     def list_open_lots(self, automation_id):
         return [SimpleNamespace(remaining_lots=self.ledger_lots)]
 
@@ -86,12 +94,19 @@ class Broker:
         self.operations = operations
         self.position_lots = position_lots
         self.exact_state = exact_state
+        self.state_calls = []
+        self.cancel_calls = []
+        self.followup_states = []
 
     async def get_order_state(self, account_id, broker_order_id):
-        return self.exact_state
+        self.state_calls.append((account_id, broker_order_id))
+        return self.followup_states.pop(0) if self.followup_states else self.exact_state
+
+    async def cancel_order(self, account_id, broker_order_id):
+        self.cancel_calls.append((account_id, broker_order_id))
 
     async def find_by_idempotency_key(self, account_id, idempotency_key):
-        return None
+        return self.exact_state
 
     async def inspect_position(self, account_id, instrument_id):
         if self.position_lots is None:
@@ -105,9 +120,169 @@ class Broker:
 class Cash:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.releases: list[str] = []
 
     async def complete(self, intent_id: str, state: str) -> None:
         self.calls.append((intent_id, state))
+
+    async def release(self, intent_id: str) -> None:
+        self.releases.append(intent_id)
+
+
+def test_age_expired_unknown_intent_is_not_resubmitted_or_held() -> None:
+    value = intent()
+    value.state = "ACCEPTED"
+    value.created_at = NOW - timedelta(hours=24, milliseconds=1)
+    value.terminal_at = None
+    value.strategy_snapshot = {}
+
+    class AgingRepository(Repository):
+        def expire_intent_by_age(self, intent_id, *, expired_at):
+            assert intent_id == value.idempotency_key
+            self.active_intent.state = "FAILED"
+            self.active_intent.strategy_snapshot = {
+                "_age_policy": {"version": 1, "expired_at": expired_at.isoformat(timespec="milliseconds")}
+            }
+            return self.active_intent
+
+    class MissingOrderBroker(Broker):
+        def __init__(self):
+            super().__init__((), exact_state=None)
+            self.lookups = []
+
+        async def find_by_idempotency_key(self, account_id, idempotency_key):
+            self.lookups.append((account_id, idempotency_key))
+
+        async def submit_order(self, *_args, **_kwargs):
+            raise AssertionError("Age-expired intent must never be resubmitted")
+
+    repository = AgingRepository(ledger_lots=0)
+    repository.active_intent = value
+    broker = MissingOrderBroker()
+    cash = Cash()
+    gate = ActiveIntentGateService()
+    gate.activate(value.automation_id, value.idempotency_key)
+    assert gate.claim_tracking(value.idempotency_key)
+    recovery = UncertainIntentReconciliationService(
+        repository,
+        broker,
+        now=lambda: NOW,
+        environment="PROD",
+        cash=cash,
+        active_intents=gate,
+    )
+
+    result = asyncio.run(recovery.reconcile((command(),)))
+
+    assert result.unresolved == 1
+    assert repository.active_intent.state == "FAILED"
+    assert repository.active_intent.terminal_at is None
+    assert repository.holds == []
+    assert repository.updates == []
+    assert broker.lookups == [(command().account_id, value.idempotency_key)]
+    assert cash.releases == [value.idempotency_key]
+    assert gate.has_active_intent(value.automation_id) is False
+    assert gate.is_tracked(value.idempotency_key) is True
+
+
+def test_aged_background_late_fill_does_not_clear_new_active_intent() -> None:
+    automation_id = str(command().automation_id)
+    old_intent = intent()
+    old_intent.idempotency_key = "aged-old"
+    old_intent.state = "FAILED"
+    old_intent.created_at = NOW - timedelta(hours=25)
+    old_intent.terminal_at = None
+    old_intent.strategy_snapshot = {
+        "_age_policy": {
+            "version": 1,
+            "expired_at": NOW.isoformat(timespec="milliseconds"),
+        }
+    }
+    new_intent = intent()
+    new_intent.idempotency_key = "new-active"
+    new_intent.state = "ACCEPTED"
+    new_intent.created_at = NOW
+
+    class ConcurrentRepository(Repository):
+        def __init__(self):
+            super().__init__(ledger_lots=5)
+            self.active_intent = new_intent
+
+        def list_policy_expired_unconfirmed(self, automation_ids, *, now, limit=100, after=None):
+            assert limit > 0
+            assert str(command().automation_id) in automation_ids
+            return (old_intent,)
+
+    repository = ConcurrentRepository()
+    late_fill = filled_order_state().model_copy(update={"idempotency_key": old_intent.idempotency_key})
+    broker = Broker((), exact_state=late_fill)
+    gate = ActiveIntentGateService()
+    gate.activate(automation_id, new_intent.idempotency_key)
+    assert gate.claim_tracking(old_intent.idempotency_key)
+    assert gate.claim_tracking(new_intent.idempotency_key)
+    recovery = UncertainIntentReconciliationService(
+        repository,
+        broker,
+        now=lambda: NOW,
+        environment="PROD",
+        active_intents=gate,
+    )
+
+    result = asyncio.run(recovery.reconcile((command(),)))
+
+    assert result.resolved == 1
+    assert [item[0].intent_id for item in repository.finalizations] == [old_intent.idempotency_key]
+    assert gate.has_active_intent(automation_id) is True
+    assert gate.is_tracked(new_intent.idempotency_key) is True
+    assert repository.holds == []
+
+
+def test_age_recovery_service_advances_scoped_cursor_between_batches() -> None:
+    automation_id = str(command().automation_id)
+    created_at = NOW - timedelta(hours=25)
+    first_batch = tuple(
+        SimpleNamespace(
+            idempotency_key=f"old-{index:03}",
+            automation_id=automation_id,
+            created_at=created_at + timedelta(milliseconds=index),
+        )
+        for index in range(100)
+    )
+    last_item = SimpleNamespace(
+        idempotency_key="old-100",
+        automation_id=automation_id,
+        created_at=created_at + timedelta(milliseconds=100),
+    )
+
+    class CursorRepository(Repository):
+        def __init__(self):
+            super().__init__(ledger_lots=0)
+            self.calls = []
+
+        def list_policy_expired_unconfirmed(self, automation_ids, *, now, limit=100, after=None):
+            self.calls.append((automation_ids, now, limit, after))
+            return first_batch if after is None else (last_item,)
+
+    repository = CursorRepository()
+    service = UncertainIntentReconciliationService(repository, Broker(()), now=lambda: NOW, environment="PROD")
+    processed = []
+
+    async def record_batch(_command, *, intent_override=None):
+        if intent_override is not None:
+            processed.append(intent_override.idempotency_key)
+        return "SKIPPED"
+
+    service._reconcile_one = record_batch
+
+    asyncio.run(service.reconcile((command(),)))
+    asyncio.run(service.reconcile((command(),)))
+
+    assert repository.calls[0][0] == (automation_id,)
+    assert repository.calls[1][0] == (automation_id,)
+    assert repository.calls[0][2] == repository.calls[1][2] == 100
+    assert repository.calls[0][3] is None
+    assert repository.calls[1][3] == (first_batch[-1].created_at, first_batch[-1].idempotency_key)
+    assert processed == [item.idempotency_key for item in (*first_batch, last_item)]
 
 
 def sell_operation(*, operation_id: str = "operation") -> BrokerRecoveryOperation:
@@ -163,6 +338,451 @@ def test_exact_operation_resolves_uncertain_without_double_applying_ledger() -> 
     assert repository.finalizations[0][1] is True
     assert cash.calls == [("intent", "FILLED")]
     assert repository.holds == []
+
+
+def test_expired_known_nonterminal_order_is_cancelled_and_status_confirmed_without_portfolio():
+    class PortfolioUnavailableBroker(Broker):
+        async def inspect_position(self, account_id, instrument_id):
+            raise AssertionError("Zero-fill cancellation must not require the portfolio endpoint")
+
+    class Admission:
+        def __init__(self):
+            self.cancel_checks = 0
+
+        async def submit_attempt(self, *args, **kwargs):
+            return SimpleNamespace(proven_not_granted=False)
+
+        async def validate_cancel(self):
+            self.cancel_checks += 1
+            return True
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = SimpleNamespace(
+            **{
+                **vars(intent()),
+                "state": "ACCEPTED",
+                "dispatch_started_at": NOW - timedelta(seconds=10),
+                "strategy_snapshot": {
+                    "order_ttl_seconds": 10,
+                    "admission_origin": {
+                        "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                        "generation": 1,
+                        "revision": 1,
+                        "configuration_fingerprint": "a" * 64,
+                    },
+                },
+            }
+        )
+        assert intent_deadline(repository.active_intent, now=NOW) == NOW
+        accepted = BrokerOrderState(
+            "broker-order",
+            "intent",
+            "ACCEPTED",
+            1,
+            0,
+            Decimal("100"),
+            Decimal(),
+            Decimal("0.1"),
+            Decimal(),
+            "RUB",
+        )
+        cancelled = accepted.model_copy(update={"status": "CANCELLED"})
+        broker = PortfolioUnavailableBroker((), position_lots=None, exact_state=accepted)
+        broker.followup_states = [cancelled]
+        admission = Admission()
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=admission,
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, result, admission
+
+    repository, broker, result, admission = asyncio.run(scenario())
+
+    assert broker.state_calls == [(command().account_id, "broker-order")]
+    assert admission.cancel_checks == 1
+    assert broker.cancel_calls == [(command().account_id, "broker-order")]
+    assert result.resolved == 1
+    assert repository.finalizations[0][0].state == "CANCELLED"
+
+
+def test_fresh_nonterminal_prod_order_remains_active_until_its_persisted_deadline():
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = SimpleNamespace(
+            **{
+                **vars(intent()),
+                "state": "ACCEPTED",
+                "dispatch_started_at": NOW - timedelta(seconds=9),
+                "strategy_snapshot": {"order_ttl_seconds": 10},
+            }
+        )
+        state = BrokerOrderState(
+            "broker-order",
+            "intent",
+            "ACCEPTED",
+            1,
+            0,
+            Decimal("100"),
+            Decimal(),
+            Decimal("0.1"),
+            Decimal(),
+            "RUB",
+        )
+        broker = Broker((), exact_state=state)
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            access_mode="TRADE",
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, result
+
+    repository, broker, result = asyncio.run(scenario())
+
+    assert result.resolved == result.unresolved == 0
+    assert broker.cancel_calls == []
+    assert repository.holds == []
+    assert repository.updates == []
+
+
+def test_restart_preserves_deadline_from_dispatch_timestamp_and_intent_snapshot(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'durable-order-deadline.db'}"
+    engine = create_worker_engine(database_url)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repository = LocalAutomationRepository(factory, environment="PROD")
+    value = command()
+    repository.cache_command(value)
+    item = decision_item(value).model_copy(
+        update={"strategy_snapshot": {**decision_item(value).strategy_snapshot, "order_ttl_seconds": 10}}
+    )
+    intent_id = repository.save_decision_batch((item,), occurred_at=NOW).intents[0].idempotency_key
+    started_at = NOW + timedelta(seconds=1)
+    repository.update_intent(
+        intent_id,
+        state="SUBMITTING",
+        occurred_at=started_at,
+        dispatch_started_at=started_at,
+    )
+    ttl = repository.get_active_intent(str(value.automation_id)).strategy_snapshot["order_ttl_seconds"]
+    engine.dispose()
+
+    reopened_engine = create_worker_engine(database_url)
+    reopened = LocalAutomationRepository(sessionmaker(reopened_engine, expire_on_commit=False), environment="PROD")
+    restored = reopened.get_active_intent(str(value.automation_id))
+
+    assert restored.dispatch_started_at == started_at
+    assert intent_deadline(restored, now=started_at + timedelta(seconds=ttl + 30)) == started_at + timedelta(
+        seconds=ttl
+    )
+    reopened_engine.dispose()
+
+
+def test_cancel_confirmation_finalizes_actual_partial_fill_and_commission():
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = SimpleNamespace(
+            **{
+                **vars(intent()),
+                "state": "PARTIALLY_FILLED",
+                "dispatch_started_at": NOW - timedelta(seconds=10),
+                "strategy_snapshot": {
+                    "order_ttl_seconds": 10,
+                    "admission_origin": {
+                        "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                        "generation": 1,
+                        "revision": 1,
+                        "configuration_fingerprint": "a" * 64,
+                    },
+                },
+            }
+        )
+        accepted = BrokerOrderState(
+            "broker-order",
+            "intent",
+            "PARTIALLY_FILLED",
+            2,
+            0,
+            Decimal("200"),
+            Decimal(),
+            Decimal("0.2"),
+            Decimal(),
+            "RUB",
+        )
+        cancelled = accepted.model_copy(
+            update={
+                "status": "CANCELLED",
+                "executed_lots": 1,
+                "executed_amount": Decimal("101"),
+                "executed_commission": Decimal("0.25"),
+                "executed_price": Decimal("101"),
+                "executed_at": NOW,
+            }
+        )
+        broker = Broker((), position_lots="4", exact_state=accepted)
+        broker.followup_states = [cancelled]
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, result
+
+    repository, broker, result = asyncio.run(scenario())
+
+    finalization = repository.finalizations[0][0]
+    assert result.resolved == 1
+    assert broker.cancel_calls == [(command().account_id, "broker-order")]
+    assert finalization.state == "CANCELLED"
+    assert finalization.executed_lots == 1
+    assert finalization.executed_price == Decimal("101")
+    assert finalization.executed_commission == Decimal("0.25")
+
+
+def test_recovery_skips_intent_owned_by_live_tracking_watcher():
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        broker = Broker((), exact_state=filled_order_state())
+        gate = ActiveIntentGateService()
+        assert gate.claim_tracking("intent")
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            active_intents=gate,
+        )
+
+        result = await service.reconcile((command(),))
+        return broker, result
+
+    broker, result = asyncio.run(scenario())
+
+    assert result.resolved == 0
+    assert broker.state_calls == []
+
+
+def test_legacy_nonterminal_order_without_snapshot_ttl_is_held_without_env_fallback():
+    class Admission:
+        async def submit_attempt(self, *args, **kwargs):
+            return SimpleNamespace(proven_not_granted=False)
+
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = SimpleNamespace(
+            **{
+                **vars(intent()),
+                "state": "ACCEPTED",
+                "dispatch_started_at": NOW - timedelta(days=1),
+                "strategy_snapshot": {
+                    "admission_origin": {
+                        "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                        "generation": 1,
+                        "revision": 1,
+                        "configuration_fingerprint": "a" * 64,
+                    },
+                },
+            }
+        )
+        accepted = BrokerOrderState(
+            "broker-order",
+            "intent",
+            "ACCEPTED",
+            1,
+            0,
+            Decimal("100"),
+            Decimal(),
+            Decimal("0.1"),
+            Decimal(),
+            "RUB",
+        )
+        broker = Broker((), exact_state=accepted)
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+        )
+        result = await service.reconcile((command(),))
+        return repository, broker, result
+
+    repository, broker, result = asyncio.run(scenario())
+
+    assert result.unresolved == 1
+    assert broker.cancel_calls == []
+    assert repository.holds
+    assert repository.active_intent.state == "ACCEPTED"
+    assert repository.updates[-1][0] == "intent"
+    assert repository.updates[-1][1]["state"] == "UNCERTAIN"
+
+
+def test_unknown_sdk_status_is_not_cancelled_even_with_matching_order_identity():
+    class Admission:
+        async def submit_attempt(self, *args, **kwargs):
+            return SimpleNamespace(proven_not_granted=False)
+
+        async def validate_cancel(self):
+            return True
+
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        repository.active_intent = SimpleNamespace(
+            **{
+                **vars(intent()),
+                "state": "ACCEPTED",
+                "dispatch_started_at": NOW - timedelta(seconds=20),
+                "strategy_snapshot": {
+                    "order_ttl_seconds": 10,
+                    "admission_origin": {
+                        "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                        "generation": 1,
+                        "revision": 1,
+                        "configuration_fingerprint": "a" * 64,
+                    },
+                },
+            }
+        )
+        money = SimpleNamespace(units=100, nano=0, currency="rub")
+        unknown = _order_state(
+            SimpleNamespace(
+                order_id="broker-order",
+                order_request_id="intent",
+                execution_report_status="EXECUTION_REPORT_STATUS_UNSPECIFIED",
+                lots_requested=1,
+                lots_executed=0,
+                initial_order_price=money,
+                total_order_amount=SimpleNamespace(units=0, nano=0, currency="rub"),
+                initial_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+                executed_commission=SimpleNamespace(units=0, nano=0, currency="rub"),
+                executed_order_price=SimpleNamespace(units=0, nano=0, currency="rub"),
+            )
+        )
+        broker = Broker((), exact_state=unknown)
+        service = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: NOW,
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+        )
+        await service.reconcile((command(),))
+        return repository, broker
+
+    repository, broker = asyncio.run(scenario())
+
+    assert broker.cancel_calls == []
+    assert repository.updates[-1][1]["state"] == "UNCERTAIN"
+
+
+def test_unknown_cancel_outcome_persists_uncertain_then_finalizes_without_resume(tmp_path):
+    class Admission:
+        async def validate_cancel(self):
+            return True
+
+        async def submit_attempt(self, *args, **kwargs):
+            return SimpleNamespace(proven_not_granted=False)
+
+    value = command()
+    automation_id = str(value.automation_id)
+    database_url = f"sqlite:///{tmp_path / 'uncertain-cancel.db'}"
+    engine = create_worker_engine(database_url)
+    initialize_worker_schema(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    clock = [NOW]
+    repository = LocalAutomationRepository(
+        factory, fact_writer=FactOutboxWriter(clock=lambda: clock[0]), environment="PROD"
+    )
+    repository.cache_command(value)
+    item = decision_item(value).model_copy(
+        update={
+            "strategy_snapshot": {
+                "order_ttl_seconds": 10,
+                "admission_origin": {
+                    "runtime_instance_id": "00000000-0000-4000-8000-000000000099",
+                    "generation": 1,
+                    "revision": 1,
+                    "configuration_fingerprint": "a" * 64,
+                },
+            }
+        }
+    )
+    key = repository.save_decision_batch((item,), occurred_at=NOW).intents[0].idempotency_key
+    started_at = NOW - timedelta(seconds=10)
+    repository.update_intent(
+        key,
+        state="ACCEPTED",
+        occurred_at=NOW - timedelta(seconds=1),
+        dispatch_started_at=started_at,
+        broker_order_id="broker-order",
+    )
+    accepted = BrokerOrderState(
+        "broker-order", key, "ACCEPTED", 1, 0, Decimal("201"), Decimal(), Decimal("1"), Decimal(), "RUB"
+    )
+    broker = Broker((), position_lots=None, exact_state=accepted)
+    broker.followup_states = [accepted, accepted]
+
+    async def scenario():
+        cash = AccountCashReservationService()
+        await cash.restore(tuple(repository.list_active_buy_intent_reservations()))
+        reserved_before = await cash.reserved(value.account_id, "RUB")
+        recovery = UncertainIntentReconciliationService(
+            repository,
+            broker,
+            now=lambda: clock[0],
+            environment="PROD",
+            access_mode="TRADE",
+            admission=Admission(),
+            cash=cash,
+            sleep=lambda _delay: asyncio.sleep(0),
+            poll_limit=2,
+        )
+        first = await recovery.reconcile((value,))
+        retained = repository.get_active_intent(automation_id)
+        assert retained is not None
+        assert retained.state == "UNCERTAIN"
+        assert await cash.reserved(value.account_id, "RUB") == reserved_before
+        assert repository.get_state(automation_id).state == "HOLD"
+        clock[0] += timedelta(seconds=31)
+        broker.exact_state = accepted.model_copy(update={"status": "CANCELLED"})
+        second = await recovery.reconcile((value,))
+        assert second.resolved == 1
+        assert repository.get_active_intent(automation_id) is None
+        assert repository.get_state(automation_id).state == "HOLD"
+        assert await cash.reserved(value.account_id, "RUB") == 0
+        facts = repository.ready_fact_outbox(100, now=clock[0] + timedelta(seconds=1), deadline_ms=0)
+        repeated = await recovery.reconcile((value,))
+        assert repeated.resolved == repeated.unresolved == 0
+        assert repository.ready_fact_outbox(100, now=clock[0] + timedelta(seconds=1), deadline_ms=0) == facts
+        return first, broker, repository, facts
+
+    first, broker, repository, facts = asyncio.run(scenario())
+    assert first.unresolved == 1
+    assert broker.cancel_calls == [(value.account_id, "broker-order")]
+    assert repository.get_latest_intent(automation_id).state == "CANCELLED"
+    assert not any(fact.fact_kind == "TRADE_EXECUTION_RECORDED" for fact in facts)
+    engine.dispose()
 
 
 def test_exact_operation_applies_missing_sell_to_pre_execution_ledger() -> None:
@@ -367,7 +987,7 @@ def test_prod_restart_reconciles_retained_and_unfinalized_terminal_phases_by_req
 
         async def find_by_idempotency_key(self, account_id, idempotency_key):
             self.request_lookups += 1
-            return rejected_order_state()
+            return rejected_order_state().model_copy(update={"idempotency_key": idempotency_key})
 
         async def inspect_recent_operations(self, account_id, instrument_id, limit):
             self.operation_reads += 1
@@ -1094,7 +1714,6 @@ def test_recovery_matches_instrument_units_instead_of_lots(quantity_units):
 def test_known_open_ambiguous_result_holds_and_keeps_same_key_and_reservation(
     tmp_path, environment, state, observation
 ):
-
     class MissingBroker(Broker):
         keys = []
 
@@ -1138,7 +1757,8 @@ def test_known_open_ambiguous_result_holds_and_keeps_same_key_and_reservation(
 
     asyncio.run(scenario())
     assert broker.keys == [key]
-    assert repo.get_active_intent(str(value.automation_id)).state == state
+    expected_state = "FAILED" if state == "FAILED" else "UNCERTAIN"
+    assert repo.get_active_intent(str(value.automation_id)).state == expected_state
     assert repo.get_state(str(value.automation_id)).state == "HOLD"
     assert repo.list_open_lots(str(value.automation_id)) == []
     facts = repo.ready_fact_outbox(100, now=NOW + timedelta(seconds=1), deadline_ms=0)

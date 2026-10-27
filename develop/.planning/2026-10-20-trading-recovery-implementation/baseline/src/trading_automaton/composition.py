@@ -1,0 +1,519 @@
+"""Trading-worker dependency composition."""
+
+from collections.abc import Callable
+from contextlib import AsyncExitStack
+from datetime import datetime
+from math import isfinite
+from time import sleep
+from typing import Any, Protocol
+from uuid import UUID
+
+import httpx
+from sqlalchemy.orm import sessionmaker
+
+from sentinel_contracts.analytics import AdaptiveThresholds
+from sentinel_contracts.broker_execution import BrokerConnection
+from sentinel_contracts.time import utc_now_ms
+from sentinel_contracts.tinvest import resolve_tinvest_endpoint
+from sentinel_contracts.trading_facts import AutomationCommand, FactEnvelope
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics
+from trading_automaton.adapters.analytics_client import AnalyticsClient
+from trading_automaton.adapters.core_client import CoreClient
+from trading_automaton.adapters.tinvest_broker_session import BrokerSdkSession
+from trading_automaton.config import AutomatonSettings, StrategySettings
+from trading_automaton.domain.core_contracts import AutomationStatusesResult
+from trading_automaton.runtime.analytics_broker import (
+    AnalyticsBrokerRuntime,
+    AnalyticsPort,
+)
+from trading_automaton.runtime.streaming_coordinator import (
+    CoordinatorCorePort,
+    RuntimePort,
+    StreamingRuntimeCoordinator,
+)
+from trading_automaton.services.account_cash_reservation import (
+    AccountCashReservationService,
+)
+from trading_automaton.services.account_commission_profile import (
+    AccountCommissionProfileService,
+)
+from trading_automaton.services.active_intent_gate import ActiveIntentGateService
+from trading_automaton.services.analytics_frame import (
+    AnalyticsFrameService,
+    AnalyticsMetricsCache,
+)
+from trading_automaton.services.automation_lifecycle import (
+    WorkerAutomationLifecycleService,
+)
+from trading_automaton.services.batch_runtime import BatchTradingRuntimeService
+from trading_automaton.services.broker_rate_limit import BrokerRateLimitService
+from trading_automaton.services.broker_tick_preparation import (
+    BrokerTickPreparationService,
+)
+from trading_automaton.services.business_audit import BusinessAuditService
+from trading_automaton.services.decision import TradeDecisionService
+from trading_automaton.services.decision_context import DecisionContextService
+from trading_automaton.services.decision_materialization import (
+    DecisionMaterializerService,
+)
+from trading_automaton.services.fact_synchronization import FactSynchronizationService
+from trading_automaton.services.lot_ledger import LotLedgerService
+from trading_automaton.services.order_book_validation import OrderBookValidationService
+from trading_automaton.services.order_dispatch import OrderDispatchService
+from trading_automaton.services.order_tracking import OrderTrackingService
+from trading_automaton.services.persistence_failure import PersistenceFailureService
+from trading_automaton.services.portfolio_state_cache import PortfolioStateCacheService
+from trading_automaton.services.position_batch_scheduler import (
+    PositionBatchSchedulerService,
+)
+from trading_automaton.services.position_bootstrap import PositionBootstrapService
+from trading_automaton.services.position_consistency import PositionConsistencyService
+from trading_automaton.services.position_state_hydration import (
+    PositionStateCacheService,
+    PositionStateHydrationService,
+)
+from trading_automaton.services.recovery import RecoveryService
+from trading_automaton.services.streaming_batch_tick import StreamingBatchTickService
+from trading_automaton.services.streaming_cycle_transition import (
+    StreamingCycleTransitionService,
+)
+from trading_automaton.services.streaming_position_decision import (
+    StreamingPositionDecisionService,
+)
+from trading_automaton.services.trading_admission import TradingAdmissionService
+from trading_automaton.services.trading_cycle import TradingCycleService
+from trading_automaton.services.uncertain_intent_reconciliation import (
+    UncertainIntentReconciliationService,
+)
+from trading_automaton.storage.database import (
+    create_worker_engine,
+    initialize_worker_schema,
+)
+from trading_automaton.storage.repository import LocalAutomationRepository
+from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecase
+from trading_automaton.usecases.recover_worker_run import RecoverWorkerRunUsecase
+from trading_automaton.usecases.synchronize_runtime import (
+    CoordinatorSynchronizationPort,
+    SynchronizeTradingRuntimeUsecase,
+)
+
+
+class BrokerSessionClosePort(Protocol):
+    async def close(self) -> None: ...
+
+
+class OrderTrackingWaitPort(Protocol):
+    async def wait_all(self) -> None: ...
+
+
+class FactCoordinatorCoreAdapter:
+    """Expose baseline typed status through the coordinator projection."""
+
+    def __init__(self, core: CoreClient) -> None:
+        self._core = core
+
+    def automation_statuses(self, automation_ids: list[str]) -> AutomationStatusesResult:
+        result = self._core.automation_statuses([UUID(item) for item in automation_ids])
+        return AutomationStatusesResult(
+            automations={
+                str(status.automation_id): {
+                    "state": status.state.value,
+                    "revision": status.revision,
+                    "last_sequence_number": status.last_sequence_number,
+                    "settings_revision": status.settings_revision,
+                    "order_quota_percent": status.order_quota_percent,
+                }
+                for status in result.automations
+            },
+            missing_automation_ids=tuple(str(item) for item in result.missing_automation_ids),
+        )
+
+    def broker_connection(self, broker_id: str) -> BrokerConnection:
+        return self._core.broker_connection(broker_id)
+
+    def heartbeat(
+        self,
+        worker_id: str,
+        occurred_at: datetime,
+        diagnostics: WorkerDiagnostics | None = None,
+    ) -> None:
+        self._core.heartbeat(worker_id, occurred_at, diagnostics)
+
+
+class BrokerRuntimeBundle:
+    __slots__ = ("broker_id", "runtime", "session", "tracking")
+
+    def __init__(
+        self,
+        broker_id: str,
+        runtime: RuntimePort,
+        session: BrokerSessionClosePort,
+        tracking: OrderTrackingWaitPort,
+    ) -> None:
+        self.broker_id = broker_id
+        self.runtime = runtime
+        self.session = session
+        self.tracking = tracking
+
+    async def close(self) -> None:
+        try:
+            await self.runtime.close()
+            await self.tracking.wait_all()
+        except BaseException as primary_error:
+            try:
+                await self.session.close()
+            except BaseException as session_error:
+                raise primary_error from session_error
+            raise
+        else:
+            await self.session.close()
+
+
+async def build_broker_runtime(
+    connection: BrokerConnection,
+    repository: LocalAutomationRepository,
+    *,
+    strategy_settings: StrategySettings,
+    worker_access_mode: str = "READ_ONLY",
+    application_environment: str = "TEST",
+    now: Callable[[], datetime],
+    session_factory: Callable[[BrokerConnection], Any] | None = None,
+    tick_seconds: float = 1.0,
+    retry_limit: int = 5,
+    recovery_probe_seconds: float = 60.0,
+    account_snapshot_ttl_seconds: float = 60.0,
+    broker_request_timeout_seconds: float = 10.0,
+    analytics_http_timeout_seconds: float = 1.0,
+    analytics_url: str = "http://analytics:8001",
+    analytics_client: AnalyticsPort | None = None,
+    core_client: CoreClient | None = None,
+) -> BrokerRuntimeBundle:
+    """Assemble a broker bundle whose close releases Analytics and the started SDK session."""
+    if connection.environment != application_environment:
+        raise ValueError("Worker/Core environment mismatch")
+    resolve_tinvest_endpoint(connection.environment, connection.adapter_code, connection.target)
+    if worker_access_mode not in {"READ_ONLY", "TRADE"}:
+        raise ValueError("Invalid Worker broker access mode")
+    if worker_access_mode != connection.access_mode:
+        raise ValueError("Core/Worker access mode mismatch")
+    for name, value in (
+        ("recovery_probe_seconds", recovery_probe_seconds),
+        ("account_snapshot_ttl_seconds", account_snapshot_ttl_seconds),
+        ("broker_request_timeout_seconds", broker_request_timeout_seconds),
+        ("analytics_http_timeout_seconds", analytics_http_timeout_seconds),
+    ):
+        if not isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    admission = None
+    if connection.environment == "PROD" and worker_access_mode == "TRADE":
+        if core_client is None or connection.configuration_fingerprint is None:
+            raise ValueError("PROD TRADE requires authenticated Core admission and a broker configuration fingerprint")
+        admission = TradingAdmissionService(
+            core_client,
+            broker_id=UUID(connection.broker_id),
+            account_id=connection.account_id,
+            runtime_instance_id=core_client.runtime_instance_id,
+            configuration_fingerprint=connection.configuration_fingerprint,
+        )
+    if worker_access_mode == "READ_ONLY":
+        if strategy_settings.enabled:
+            raise ValueError("READ_ONLY requires strategy disabled")
+        if repository.has_active_intents():
+            raise ValueError(
+                "READ_ONLY cannot start with active intents; "
+                "preserve history and reconcile in the original trading contour"
+            )
+    session = (
+        session_factory(connection)
+        if session_factory is not None
+        else BrokerSdkSession(
+            connection.token,
+            connection.target,
+            environment=connection.environment,
+            access_mode=connection.access_mode,
+            account_id=connection.account_id,
+            broker_connection=connection if admission is not None else None,
+            submit_admission=admission,
+            snapshot_ttl_seconds=account_snapshot_ttl_seconds,
+            request_timeout_seconds=broker_request_timeout_seconds,
+        )
+    )
+    if admission is not None and (
+        not isinstance(session, BrokerSdkSession) or not session.is_bound_to(connection, admission)
+    ):
+        raise ValueError("PROD TRADE broker session must bind the validated Core connection and admission gate")
+    await session.start()
+    rollback = AsyncExitStack()
+    rollback.push_async_callback(session.close)
+    try:
+        portfolio = PortfolioStateCacheService()
+        metrics = AnalyticsMetricsCache()
+        commission_profiles = AccountCommissionProfileService(repository)
+        cash = AccountCashReservationService()
+        await cash.restore(repository.list_active_buy_intent_reservations(connection.broker_id))
+        position_states = PositionStateCacheService()
+        active_intents = ActiveIntentGateService()
+        ledger = LotLedgerService(repository)
+        business_audit = BusinessAuditService(repository, now=now)
+        hydration = PositionStateHydrationService(
+            repository,
+            portfolio,
+            position_states,
+            consistency=PositionConsistencyService(ledger, repository, now=now),
+            audit=business_audit,
+            now=now,
+            prepared_metrics=metrics,
+        )
+        order_books = OrderBookValidationService()
+        decider = StreamingPositionDecisionService(
+            commission_profiles,
+            cash=cash,
+            positions=portfolio,
+            contexts=DecisionContextService(strategy_settings),
+            decisions=TradeDecisionService(),
+        )
+        scheduler = PositionBatchSchedulerService(
+            decider,
+            rate_limit=BrokerRateLimitService(capacity=2, refill_per_second=2.0),
+            order_books=order_books,
+            active_intents=active_intents,
+        )
+        tracking = OrderTrackingService(
+            repository,
+            now=now,
+            broker_id=connection.broker_id,
+            commission_profiles=commission_profiles,
+            broker=session,
+            portfolio=portfolio,
+            audit=business_audit,
+            cash=cash,
+            active_intents=active_intents,
+            environment=application_environment,
+            access_mode=worker_access_mode,
+            admission=admission,
+            broker_request_timeout_seconds=broker_request_timeout_seconds,
+        )
+        dispatcher = OrderDispatchService(
+            repository,
+            session,
+            now=now,
+            audit=business_audit,
+            access_mode=worker_access_mode,
+            account_id=connection.account_id,
+        )
+        batch = BatchTradingRuntimeService(
+            repository,
+            dispatcher,
+            tracking,
+            now=now,
+            cash=cash,
+            active_intents=active_intents,
+            access_mode=worker_access_mode,
+            account_id=connection.account_id,
+        )
+        tick = StreamingBatchTickService(
+            scheduler,
+            position_states,
+            batch,
+            cash=cash,
+            cycles=StreamingCycleTransitionService(now=now, cycles=TradingCycleService(), order_books=order_books),
+            now=now,
+            audit=business_audit,
+            materializer=DecisionMaterializerService(settings=strategy_settings, admission=admission),
+            order_books=order_books,
+        )
+        preparation = BrokerTickPreparationService(
+            session,
+            portfolio,
+            None,
+            commission_profiles,
+            hydration,
+            position_bootstrap=PositionBootstrapService(repository),
+            strategy_settings=strategy_settings,
+            reconciliation=UncertainIntentReconciliationService(
+                repository,
+                session,
+                now=now,
+                audit=business_audit,
+                active_intents=active_intents,
+                cash=cash,
+                environment=application_environment,
+                access_mode=worker_access_mode,
+                admission=admission,
+                broker_request_timeout_seconds=broker_request_timeout_seconds,
+            ),
+            cash=cash,
+            now=now,
+        )
+        analytics = analytics_client or AnalyticsClient(
+            httpx.AsyncClient(base_url=analytics_url, timeout=analytics_http_timeout_seconds)
+        )
+        if analytics_client is None:
+            rollback.push_async_callback(analytics.close)
+        iteration = RunBrokerIterationUsecase(
+            AnalyticsFrameService(analytics, now=now, order_books=order_books),
+            tick,
+            preparation=preparation,
+            metrics=metrics,
+            source_id=connection.broker_id,
+            fallback=AdaptiveThresholds(
+                strategy_settings.averaging_step_percent,
+                strategy_settings.partial_take_profit_percent,
+                "STRATEGY",
+            ),
+            persistence_failure=PersistenceFailureService(repository),
+        )
+        runtime = AnalyticsBrokerRuntime(
+            analytics,
+            iteration,
+            tick_seconds=tick_seconds,
+            retry_limit=retry_limit,
+            recovery_probe_seconds=recovery_probe_seconds,
+            account_id=connection.account_id,
+        )
+        bundle = BrokerRuntimeBundle(connection.broker_id, runtime, session, tracking)
+        rollback.pop_all()
+        return bundle
+    except BaseException as primary_error:
+        try:
+            await rollback.aclose()
+        except BaseException as cleanup_error:
+            raise primary_error from cleanup_error
+        raise
+
+
+def build_worker_recovery(repository: LocalAutomationRepository, worker_id: str) -> RecoverWorkerRunUsecase:
+    """Compose startup recovery around the same durable repository used by the runtime."""
+    return RecoverWorkerRunUsecase(repository, RecoveryService(repository), worker_id=worker_id)
+
+
+def build_streaming_runtime(
+    settings: AutomatonSettings,
+    strategy_settings: StrategySettings,
+) -> tuple[
+    StreamingRuntimeCoordinator,
+    LocalAutomationRepository,
+    httpx.Client,
+]:
+    """Return the coordinator, repository and Core HTTP client.
+
+    The caller closes the coordinator, finishes its run marker and closes HTTP."""
+    if settings.broker_access_mode == "READ_ONLY" and strategy_settings.enabled:
+        raise ValueError("READ_ONLY requires strategy disabled")
+    engine = create_worker_engine(settings.database_url)
+    initialize_worker_schema(engine)
+    repository = LocalAutomationRepository(
+        sessionmaker(engine, expire_on_commit=False),
+        environment=settings.application_environment,
+    )
+    if settings.broker_access_mode == "READ_ONLY" and repository.has_active_intents():
+        engine.dispose()
+        raise ValueError(
+            "READ_ONLY cannot start with active intents; preserve history and reconcile in the original trading contour"
+        )
+    http = httpx.Client(base_url=settings.core_url, timeout=settings.core_http_timeout_seconds)
+    core = CoreClient(
+        http,
+        application_environment=settings.application_environment,
+        access_mode=settings.broker_access_mode,
+        worker_id=settings.worker_id,
+        broker_id=settings.internal_worker_broker_id,
+        worker_token=(
+            None if settings.internal_worker_token is None else settings.internal_worker_token.get_secret_value()
+        ),
+        strategy_enabled=strategy_settings.enabled,
+    )
+
+    def now() -> datetime:
+        return utc_now_ms()
+
+    def validate_commands(commands: list[AutomationCommand]) -> None:
+        for broker_id in {str(command.broker_id) for command in commands}:
+            if settings.internal_worker_broker_id is not None and broker_id != str(settings.internal_worker_broker_id):
+                raise ValueError("Worker command broker scope mismatch")
+            connection = core.broker_connection(broker_id)
+            if connection.environment != settings.application_environment:
+                raise ValueError("Worker/Core environment mismatch")
+            if connection.access_mode != settings.broker_access_mode:
+                raise ValueError("Worker/Core access mode mismatch")
+            if connection.account_id and any(
+                str(command.broker_id) == broker_id and command.account_id != connection.account_id
+                for command in commands
+            ):
+                raise ValueError("Broker command account mismatch")
+
+    def validate_facts(facts: list[FactEnvelope]) -> None:
+        scopes = {broker_id: core.broker_scope(broker_id) for broker_id in {str(fact.user_broker_id) for fact in facts}}
+        commands = {
+            automation_id: repository.get_cached_command(automation_id)
+            for automation_id in {str(fact.automation_id) for fact in facts}
+        }
+        for fact in facts:
+            broker_id = str(fact.user_broker_id)
+            scope = scopes[broker_id]
+            command = commands[str(fact.automation_id)]
+            if scope.broker_id != broker_id or str(command.user_broker_id) != broker_id:
+                raise ValueError("Fact delivery broker scope mismatch")
+            if scope.environment != settings.application_environment:
+                raise ValueError("Worker/Core environment mismatch")
+            if scope.account_id != command.account_id:
+                raise ValueError("Fact delivery account mismatch")
+
+    synchronization: CoordinatorSynchronizationPort = FactSynchronizationService(
+        repository,
+        core,
+        now=now,
+        sleep=sleep,
+        retry_limit=strategy_settings.core_retry_limit,
+        batch_size=settings.fact_outbox_batch_size,
+        deadline_ms=settings.fact_outbox_deadline_ms,
+        validate_commands=validate_commands,
+        validate_facts=validate_facts,
+    )
+    coordinator_core: CoordinatorCorePort = FactCoordinatorCoreAdapter(core)
+
+    async def builder(connection: BrokerConnection) -> BrokerRuntimeBundle:
+        return await build_broker_runtime(
+            connection,
+            repository,
+            strategy_settings=strategy_settings,
+            worker_access_mode=settings.broker_access_mode,
+            application_environment=settings.application_environment,
+            now=now,
+            tick_seconds=settings.iteration_seconds,
+            retry_limit=settings.sandbox_retry_limit,
+            recovery_probe_seconds=settings.broker_recovery_probe_seconds,
+            account_snapshot_ttl_seconds=settings.account_snapshot_ttl_seconds,
+            broker_request_timeout_seconds=settings.broker_request_timeout_seconds,
+            analytics_http_timeout_seconds=settings.analytics_http_timeout_seconds,
+            analytics_url=settings.analytics_url,
+            core_client=core,
+        )
+
+    iteration = SynchronizeTradingRuntimeUsecase(
+        repository,
+        synchronization,
+        coordinator_core,
+        WorkerAutomationLifecycleService(repository),
+        worker_id=settings.worker_id,
+        now=now,
+    )
+    runtime = StreamingRuntimeCoordinator(
+        iteration,
+        coordinator_core,
+        builder,
+        worker_id=settings.worker_id,
+        now=now,
+        heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
+        outbox_diagnostics=repository.outbox_diagnostics,
+        command_sync_diagnostics=lambda grouped_ids, claimed_count, publication_reason: (
+            repository.command_sync_diagnostics(
+                (None if settings.internal_worker_broker_id is None else str(settings.internal_worker_broker_id)),
+                claimed_count=claimed_count,
+                grouped_automation_ids=grouped_ids,
+                captured_at=now(),
+                publication_reason=publication_reason,
+            )
+        ),
+    )
+    return runtime, repository, http

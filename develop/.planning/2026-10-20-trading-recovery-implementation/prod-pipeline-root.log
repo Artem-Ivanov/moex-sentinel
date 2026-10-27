@@ -1,0 +1,36 @@
+.                                                                        [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /Users/mac/Documents/GIT/moex-sentinel/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+<string>:10
+<string>:10
+  <string>:10: DeprecationWarning: GetCandlesRequest.figi is deprecated
+
+<string>:6
+<string>:6
+  <string>:6: DeprecationWarning: GetOrderBookRequest.figi is deprecated
+
+<string>:5
+<string>:5
+  <string>:5: DeprecationWarning: GetTradingStatusRequest.figi is deprecated
+
+<string>:8
+<string>:8
+  <string>:8: DeprecationWarning: GetLastTradesRequest.figi is deprecated
+
+<string>:20
+<string>:20
+<string>:20
+<string>:20
+  <string>:20: DeprecationWarning: PostStopOrderRequest.figi is deprecated
+
+<string>:14
+<string>:14
+<string>:14
+<string>:14
+  <string>:14: DeprecationWarning: PostOrderRequest.figi is deprecated
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 17 warnings in 5.69s

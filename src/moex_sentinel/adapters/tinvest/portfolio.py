@@ -180,8 +180,15 @@ class TInvestPortfolioAdapter:
                 items=tuple(
                     ExternalOperation(
                         operation_id=item.id,
-                        account_id=item.broker_account_id or account_id,
                         operation_type=enum_name(item.type),
+                        account_id=(
+                            item.broker_account_id
+                            or (
+                                ""
+                                if enum_name(item.type).removeprefix("OPERATION_TYPE_") == "BROKER_FEE"
+                                else account_id
+                            )
+                        ),
                         state=enum_name(item.state),
                         occurred_at=item.date,
                         payment=money_to_domain(item.payment),
@@ -189,6 +196,7 @@ class TInvestPortfolioAdapter:
                         quantity=Decimal(item.quantity),
                         commission=money_to_domain(item.commission),
                         instrument_id=getattr(item, "instrument_uid", None) or None,
+                        parent_operation_id=getattr(item, "parent_operation_id", None) or None,
                     )
                     for item in response.items
                 ),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import ConfigDict, SkipValidation
 
 from moex_sentinel.domain.market_data import HistoricCandle
@@ -56,3 +58,20 @@ class TradingAutomationStatuses(PositionalModel):
         missing_automation_ids: tuple[str, ...],
     ) -> None:
         super().__init__(automations=automations, missing_automation_ids=missing_automation_ids)
+
+
+class DecisionReasonItem(PositionalModel):
+    event_id: str
+    occurred_at: datetime
+    decision: str | None
+    reason_code: str | None
+    historical: bool = False
+
+    model_config = ConfigDict(frozen=True)
+
+
+class DecisionReasonsSnapshot(PositionalModel):
+    captured_at: datetime
+    items: tuple[DecisionReasonItem, ...]
+
+    model_config = ConfigDict(frozen=True)

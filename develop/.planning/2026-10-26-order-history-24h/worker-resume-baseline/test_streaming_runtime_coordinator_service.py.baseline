@@ -1,0 +1,1323 @@
+import asyncio
+import logging
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from threading import Event
+from time import monotonic as system_monotonic
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
+
+from sentinel_contracts.broker_execution import BrokerConnection
+from sentinel_contracts.trading import AutomationState
+from sentinel_contracts.trading_facts import (
+    AutomationCommand,
+    AutomationStatus,
+    AutomationStatusesResult,
+    BrokerPositionBootstrap,
+)
+from sentinel_contracts.worker_diagnostics import BrokerRuntimeDiagnostics
+from tests.trading_automaton.command_factory import command as baseline_command
+from tests.trading_automaton.command_factory import decision_item
+from trading_automaton.composition import FactCoordinatorCoreAdapter
+from trading_automaton.config import StrategySettings
+from trading_automaton.domain.errors import CoreOperationError
+from trading_automaton.runtime.streaming_coordinator import (
+    LOGGER,
+    StreamingRuntimeCoordinator,
+)
+from trading_automaton.services.automation_lifecycle import (
+    WorkerAutomationLifecycleService,
+)
+from trading_automaton.services.position_bootstrap import PositionBootstrapService
+from trading_automaton.storage.models import Base, CachedAutomationModel, LocalIntentModel
+from trading_automaton.storage.repository import LocalAutomationRepository
+from trading_automaton.usecases.synchronize_runtime import (
+    SynchronizeTradingRuntimeUsecase,
+)
+
+NOW = datetime(2026, 8, 7, 12, tzinfo=UTC)
+
+
+def test_broker_diagnostics_aggregate_never_hides_a_blocked_bundle():
+    coordinator = StreamingRuntimeCoordinator(object(), object(), lambda _: None, worker_id="worker", now=lambda: NOW)
+    coordinator._bundles = {
+        "healthy": SimpleNamespace(
+            runtime=SimpleNamespace(
+                broker_runtime_diagnostics=lambda: BrokerRuntimeDiagnostics(
+                    status="RUNNING",
+                    decision_eligibility="READY",
+                    reason="DECISION_FRAME_AVAILABLE",
+                    last_started_at=NOW,
+                    last_finished_at=NOW,
+                    last_success_at=NOW,
+                )
+            )
+        ),
+        "blocked": SimpleNamespace(
+            runtime=SimpleNamespace(
+                broker_runtime_diagnostics=lambda: BrokerRuntimeDiagnostics(
+                    status="BLOCKED", reason="PERMANENT_BROKER_ERROR"
+                )
+            )
+        ),
+    }
+
+    value = coordinator._broker_runtime_diagnostics()
+
+    assert value.status == "BLOCKED"
+    assert value.decision_eligibility == "UNKNOWN"
+    assert value.reason == "PERMANENT_BROKER_ERROR"
+
+
+def test_broker_diagnostics_uses_one_coherent_bundle_timestamp_snapshot():
+    coordinator = StreamingRuntimeCoordinator(object(), object(), lambda _: None, worker_id="worker", now=lambda: NOW)
+    coordinator._bundles = {
+        "started-again": SimpleNamespace(
+            runtime=SimpleNamespace(
+                broker_runtime_diagnostics=lambda: BrokerRuntimeDiagnostics(
+                    status="RUNNING",
+                    reason="ITERATION_RUNNING",
+                    last_started_at=NOW + timedelta(seconds=11),
+                    last_finished_at=None,
+                    last_success_at=NOW + timedelta(seconds=10),
+                )
+            )
+        ),
+        "older-finish": SimpleNamespace(
+            runtime=SimpleNamespace(
+                broker_runtime_diagnostics=lambda: BrokerRuntimeDiagnostics(
+                    status="RUNNING",
+                    decision_eligibility="NOT_READY",
+                    reason="NO_DECISION_FRAME",
+                    last_started_at=NOW + timedelta(seconds=4),
+                    last_finished_at=NOW + timedelta(seconds=5),
+                    last_success_at=NOW + timedelta(seconds=5),
+                )
+            )
+        ),
+    }
+
+    value = coordinator._broker_runtime_diagnostics()
+
+    assert value.status == "RUNNING"
+    assert value.last_started_at == NOW + timedelta(seconds=11)
+    assert value.last_finished_at is None
+    assert value.last_success_at == NOW + timedelta(seconds=10)
+
+
+@pytest.mark.parametrize("broken_first", [False, True])
+def test_broker_diagnostics_failure_does_not_hide_blocked_bundle_or_stop_heartbeat(
+    broken_first,
+):
+    sent = []
+
+    def fail():
+        raise RuntimeError("synthetic details must not escape")
+
+    broken = SimpleNamespace(runtime=SimpleNamespace(broker_runtime_diagnostics=fail))
+    blocked = SimpleNamespace(
+        runtime=SimpleNamespace(
+            broker_runtime_diagnostics=lambda: BrokerRuntimeDiagnostics(
+                status="BLOCKED", reason="PERMANENT_BROKER_ERROR"
+            )
+        )
+    )
+    coordinator = StreamingRuntimeCoordinator(
+        object(),
+        SimpleNamespace(heartbeat=lambda _worker, _time, diagnostics=None: sent.append(diagnostics)),
+        lambda _: None,
+        worker_id="worker",
+        now=lambda: NOW,
+    )
+    coordinator._bundles = (
+        {"broken": broken, "blocked": blocked} if broken_first else {"blocked": blocked, "broken": broken}
+    )
+    coordinator._last_finished_at = NOW
+    coordinator._last_result = "OUTBOX_BLOCKED"
+
+    async def send():
+        coordinator._schedule_heartbeat()
+        await coordinator._heartbeat_task
+
+    asyncio.run(send())
+
+    assert len(sent) == 1
+    assert sent[0].broker_runtime.status == "BLOCKED"
+    assert sent[0].broker_runtime.reason == "PERMANENT_BROKER_ERROR"
+
+
+def command(state=AutomationState.IN_QUEUE) -> AutomationCommand:
+    return baseline_command(state=state)
+
+
+def bootstrap_command() -> AutomationCommand:
+    return baseline_command(
+        state=AutomationState.HOLD,
+        bootstrap=BrokerPositionBootstrap(
+            position_cycle_id="00000000-0000-4000-8000-000000000501",
+            position_lot_id="00000000-0000-4000-8000-000000000502",
+            quantity_lots=2,
+            average_price="100",
+            invested_amount="2000",
+            currency="RUB",
+            observed_at=NOW,
+        ),
+    )
+
+
+class Repository:
+    def __init__(self) -> None:
+        self.cached = []
+        self.events = []
+        self.active = []
+        self.holds = []
+
+    def transition_state(self, **values):
+        self.events.append(values)
+        self.active = [command(AutomationState.IN_WORK)]
+
+    def list_monitored(self):
+        return list(self.active)
+
+    def list_active(self):
+        return list(self.active)
+
+    def synchronize_core_state(self, automation_id, **values):
+        synced = command(AutomationState(values["state"]))
+        self.active = [synced] if synced.state is AutomationState.IN_WORK else []
+        return synced
+
+    def hold_active(self, reason, automation_id=None):
+        self.holds.append((reason, automation_id))
+
+    def get_active_intent(self, automation_id):
+        return None
+
+
+class Synchronization:
+    def __init__(self) -> None:
+        self.claimed = False
+        self.flushed = 0
+
+    def claim_commands(self, worker_id, limit):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [command()]
+
+    def flush_outbox(self):
+        self.flushed += 1
+        return True
+
+
+class Core:
+    def __init__(self) -> None:
+        self.heartbeats = []
+        self.status_batches = []
+
+    def automation_status(self, automation_id):
+        raise AssertionError("Coordinator must use the batch status contract")
+
+    def automation_statuses(self, automation_ids):
+        self.status_batches.append(tuple(automation_ids))
+        return SimpleNamespace(
+            automations={
+                automation_id: {
+                    "state": "IN_WORK",
+                    "revision": 2,
+                    "last_sequence_number": 1,
+                }
+                for automation_id in automation_ids
+            },
+            missing_automation_ids=(),
+        )
+
+    def broker_connection(self, broker_id):
+        return BrokerConnection(str(broker_id), "TINVEST_SANDBOX", "sandbox", "synthetic-token", True)
+
+    def heartbeat(self, worker_id, occurred_at, diagnostics=None):
+        self.heartbeat_value = (worker_id, occurred_at)
+        self.heartbeats.append((worker_id, occurred_at))
+        self.diagnostics = diagnostics
+
+
+class Bundle:
+    def __init__(self) -> None:
+        self.broker_id = "broker"
+        self.commands = []
+        self.closed = False
+        self.release = asyncio.Event()
+        self.runtime = self
+
+    async def replace_commands(self, commands):
+        self.commands.append(commands)
+
+    async def run(self):
+        await self.release.wait()
+
+    async def close(self):
+        self.closed = True
+        self.release.set()
+
+
+def build_coordinator(
+    repository,
+    synchronization,
+    core,
+    builder,
+    *,
+    worker_id,
+    now,
+    monotonic=system_monotonic,
+    heartbeat_interval_seconds=3.0,
+    command_limit=100,
+    command_sync_diagnostics=None,
+):
+    """Assemble the real control operation and lifecycle with fresh scenario state."""
+    iteration = SynchronizeTradingRuntimeUsecase(
+        repository,
+        synchronization,
+        core,
+        WorkerAutomationLifecycleService(repository),
+        worker_id=worker_id,
+        now=now,
+        command_limit=command_limit,
+    )
+    return StreamingRuntimeCoordinator(
+        iteration,
+        core,
+        builder,
+        worker_id=worker_id,
+        now=now,
+        monotonic=monotonic,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        command_sync_diagnostics=command_sync_diagnostics,
+    )
+
+
+def test_claims_syncs_and_assigns_commands_to_one_broker_runtime() -> None:
+    async def scenario():
+        repository = Repository()
+        synchronization = Synchronization()
+        core = Core()
+        bundle = Bundle()
+
+        async def builder(connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return repository, synchronization, core, bundle
+
+    repository, synchronization, core, bundle = asyncio.run(scenario())
+
+    assert repository.events[0]["state"] == "IN_WORK"
+    assert bundle.commands[0][0].state is AutomationState.IN_WORK
+    assert core.heartbeat_value == ("worker", NOW)
+    assert core.status_batches == [(str(command().automation_id),)]
+    assert bundle.closed
+
+
+@pytest.mark.parametrize("local_state", [None, AutomationState.CLOSED, AutomationState.IN_WORK])
+def test_production_command_sync_heartbeat_reports_absent_closed_and_grouped_cache(tmp_path, local_state) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / f'command-sync-{local_state}.db'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    if local_state is not None:
+        repository.cache_command(value.model_copy(update={"state": local_state}))
+    synchronization = Synchronization()
+    synchronization.claimed = True
+    core = Core()
+    bundle = Bundle()
+
+    async def builder(_connection):
+        return bundle
+
+    iteration = SynchronizeTradingRuntimeUsecase(
+        repository,
+        synchronization,
+        core,
+        WorkerAutomationLifecycleService(repository),
+        worker_id="worker",
+        now=lambda: NOW,
+    )
+    service = StreamingRuntimeCoordinator(
+        iteration,
+        core,
+        builder,
+        worker_id="worker",
+        now=lambda: NOW,
+        command_sync_diagnostics=lambda grouped, claimed, publication_reason: repository.command_sync_diagnostics(
+            str(value.broker_id),
+            claimed_count=claimed,
+            grouped_automation_ids=grouped,
+            captured_at=NOW,
+            publication_reason=publication_reason,
+        ),
+    )
+
+    async def scenario():
+        await service.run_iteration()
+        await service._heartbeat_task
+        await service.close()
+
+    asyncio.run(scenario())
+    projection = core.diagnostics.command_sync
+    assert projection is not None
+    assert projection.observation == "OBSERVED"
+    assert projection.complete is True
+    assert projection.claimed_count == 0
+    if local_state is None:
+        assert core.status_batches == []
+        assert projection.cached_count == projection.monitored_count == projection.grouped_count == 0
+        assert projection.rows == ()
+    elif local_state is AutomationState.CLOSED:
+        assert projection.rows[0].state is AutomationState.CLOSED
+        assert projection.rows[0].monitored is False
+        assert projection.rows[0].exclusion_reason == "CLOSED_WITHOUT_ACTIVE_INTENT"
+        assert projection.grouped_count == 0
+    else:
+        assert projection.rows[0].state is AutomationState.IN_WORK
+        assert projection.rows[0].monitored is True
+        assert projection.rows[0].grouped is True
+        assert projection.rows[0].exclusion_reason is None
+        assert projection.grouped_count == 1
+    engine.dispose()
+
+
+def test_incomplete_sqlite_cache_reports_unknown_projection_when_runtime_read_fails(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'incomplete-cache.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repository = LocalAutomationRepository(factory)
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+    with factory.begin() as session:
+        session.get_one(CachedAutomationModel, str(value.automation_id)).account_id = None
+    synchronization = Synchronization()
+    synchronization.claimed = True
+    core = Core()
+
+    async def builder(_connection):
+        raise AssertionError("Incomplete cache must fail before runtime publication")
+
+    service = StreamingRuntimeCoordinator(
+        SynchronizeTradingRuntimeUsecase(
+            repository,
+            synchronization,
+            core,
+            WorkerAutomationLifecycleService(repository),
+            worker_id="worker",
+            now=lambda: NOW,
+        ),
+        core,
+        builder,
+        worker_id="worker",
+        now=lambda: NOW,
+        command_sync_diagnostics=lambda grouped, claimed, reason: repository.command_sync_diagnostics(
+            str(value.broker_id),
+            claimed_count=claimed,
+            grouped_automation_ids=grouped,
+            captured_at=NOW,
+            publication_reason=reason,
+        ),
+    )
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="Cached automation command is incomplete"):
+            await service.run_iteration()
+        await service._heartbeat_task
+        await service.close()
+
+    asyncio.run(scenario())
+    projection = core.diagnostics.command_sync
+    assert core.diagnostics.last_result == "ERROR"
+    assert projection is not None
+    assert projection.observation == "OBSERVED"
+    assert projection.complete is False
+    assert projection.publication_observation == "UNKNOWN"
+    assert projection.publication_reason == "SYNC_FAILED"
+    assert projection.grouped_count is None
+    assert projection.rows[0].binding_complete is False
+    assert projection.rows[0].grouped is False
+    assert projection.rows[0].exclusion_reason == "INCOMPLETE_BINDING"
+    engine.dispose()
+
+
+def test_builder_failure_keeps_original_error_and_marks_grouping_unknown(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'builder-failure.db'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+    synchronization = Synchronization()
+    synchronization.claimed = True
+    core = Core()
+
+    async def builder(_connection):
+        raise RuntimeError("builder failure")
+
+    service = StreamingRuntimeCoordinator(
+        SynchronizeTradingRuntimeUsecase(
+            repository,
+            synchronization,
+            core,
+            WorkerAutomationLifecycleService(repository),
+            worker_id="worker",
+            now=lambda: NOW,
+        ),
+        core,
+        builder,
+        worker_id="worker",
+        now=lambda: NOW,
+        command_sync_diagnostics=lambda grouped, claimed, reason: repository.command_sync_diagnostics(
+            str(value.broker_id),
+            claimed_count=claimed,
+            grouped_automation_ids=grouped,
+            captured_at=NOW,
+            publication_reason=reason,
+        ),
+    )
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="builder failure"):
+            await service.run_iteration()
+        await service._heartbeat_task
+        await service.close()
+
+    asyncio.run(scenario())
+    projection = core.diagnostics.command_sync
+    assert core.diagnostics.last_result == "ERROR"
+    assert projection is not None
+    assert projection.publication_observation == "UNKNOWN"
+    assert projection.publication_reason == "REPLACE_FAILED"
+    assert projection.complete is False
+    assert projection.grouped_count == 0
+    assert projection.rows[0].monitored is True
+    assert projection.rows[0].grouped is False
+    assert projection.rows[0].exclusion_reason == "PUBLICATION_UNKNOWN"
+    engine.dispose()
+
+
+def test_status_failure_publishes_transient_hold_then_restores_core_state() -> None:
+    async def scenario():
+        repository = Repository()
+        active = command(AutomationState.IN_WORK)
+        repository.active = [active]
+        synchronization = Synchronization()
+        synchronization.claimed = True
+
+        class FlakyCore(Core):
+            fail = True
+
+            def automation_statuses(self, automation_ids):
+                if self.fail:
+                    self.fail = False
+                    raise CoreOperationError(retryable=True)
+                return super().automation_statuses(automation_ids)
+
+        core = FlakyCore()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        with pytest.raises(CoreOperationError):
+            await service.run_iteration()
+        after_failure = repository.active[0]
+        failed_runtime_state = bundle.commands[-1][0].state
+        await service.run_iteration()
+        restored_runtime_state = bundle.commands[-1][0].state
+        await service.close()
+        return (
+            repository,
+            active,
+            after_failure,
+            failed_runtime_state,
+            restored_runtime_state,
+        )
+
+    repository, active, after_failure, failed_state, restored_state = asyncio.run(scenario())
+    assert after_failure == active
+    assert repository.events == []
+    assert failed_state is AutomationState.HOLD
+    assert restored_state is AutomationState.IN_WORK
+
+
+@pytest.mark.parametrize("failure_point", ["claim", "second_flush"])
+def test_control_failure_holds_active_runtime_then_restores_without_durable_hold(
+    failure_point,
+) -> None:
+    class FailingControl(Synchronization):
+        fail_claim = False
+        block_flush_number = None
+
+        def claim_commands(self, worker_id, limit):
+            if self.fail_claim:
+                raise CoreOperationError(retryable=True)
+            return super().claim_commands(worker_id, limit)
+
+        def flush_outbox(self):
+            self.flushed += 1
+            return self.flushed != self.block_flush_number
+
+    async def scenario():
+        repository = Repository()
+        repository.active = [command(AutomationState.IN_WORK)]
+        synchronization = FailingControl()
+        synchronization.claimed = True
+        core = Core()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        if failure_point == "claim":
+            synchronization.fail_claim = True
+            with pytest.raises(CoreOperationError):
+                await service.run_iteration()
+        else:
+            synchronization.block_flush_number = synchronization.flushed + 2
+            await service.run_iteration()
+        failed_runtime_state = bundle.commands[-1][0].state
+        failed_persisted_state = repository.active[0].state
+        synchronization.fail_claim = False
+        synchronization.block_flush_number = None
+        await service.run_iteration()
+        restored_runtime_state = bundle.commands[-1][0].state
+        await service.close()
+        return (
+            repository,
+            failed_runtime_state,
+            failed_persisted_state,
+            restored_runtime_state,
+        )
+
+    repository, failed_runtime_state, persisted_state, restored_runtime_state = asyncio.run(scenario())
+    assert failed_runtime_state is AutomationState.HOLD
+    assert persisted_state is AutomationState.IN_WORK
+    assert repository.events == []
+    assert restored_runtime_state is AutomationState.IN_WORK
+
+
+def test_active_status_adapter_refreshes_quota_and_null_reset_into_sqlite_runtime(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'active-quota.sqlite'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+
+    class QuotaCore(Core):
+        refresh_count = 0
+
+        def automation_statuses(self, automation_ids):
+            assert automation_ids == [value.automation_id]
+            self.refresh_count += 1
+            return AutomationStatusesResult(
+                automations=(
+                    AutomationStatus(
+                        automation_id=value.automation_id,
+                        user_broker_id=value.user_broker_id,
+                        state=AutomationState.IN_WORK,
+                        revision=value.revision,
+                        last_sequence_number=value.last_sequence_number,
+                        resume_requested=False,
+                        settings_revision=self.refresh_count,
+                        order_quota_percent=(Decimal("10") if self.refresh_count == 1 else None),
+                    ),
+                )
+            )
+
+    async def scenario():
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        core = QuotaCore()
+        bundle = Bundle()
+
+        async def builder(_connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            FactCoordinatorCoreAdapter(core),
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        first_runtime_command = bundle.commands[-1][0]
+        await service.run_iteration()
+        second_runtime_command = bundle.commands[-1][0]
+        await service.close()
+        return first_runtime_command, second_runtime_command
+
+    first_published, reset_published = asyncio.run(scenario())
+    cached = repository.get_cached_command(str(value.automation_id))
+    engine.dispose()
+
+    assert first_published.order_quota_percent == Decimal("10")
+    assert first_published.settings_revision == 1
+    assert reset_published.order_quota_percent is None
+    assert reset_published.settings_revision == 2
+    assert cached.order_quota_percent is None
+    assert cached.settings_revision == 2
+    assert cached.revision == value.revision
+    assert cached.last_sequence_number == value.last_sequence_number
+
+
+@pytest.mark.parametrize(
+    "local_state",
+    [AutomationState.HOLD, AutomationState.IN_QUEUE, AutomationState.IN_WORK],
+)
+@pytest.mark.parametrize("core_state", ["HOLD", "CLOSED", "IN_QUEUE", None])
+def test_restored_bootstrap_hold_is_prepared_without_claim_or_early_activation(local_state, core_state) -> None:
+    class BootstrapRepository(Repository):
+        def __init__(self):
+            super().__init__()
+            self.active = [bootstrap_command().model_copy(update={"state": local_state})]
+
+        def list_active(self):
+            return [value for value in self.active if value.state is not AutomationState.HOLD]
+
+        def synchronize_core_state(self, automation_id, **values):
+            return self.active[0]
+
+    class HoldCore(Core):
+        def automation_statuses(self, automation_ids):
+            result = super().automation_statuses(automation_ids)
+            if core_state is None:
+                return SimpleNamespace(automations={}, missing_automation_ids=tuple(automation_ids))
+            for value in result.automations.values():
+                value["state"] = core_state
+            return result
+
+    async def scenario():
+        repository = BootstrapRepository()
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        core = HoldCore()
+        bundle = Bundle()
+
+        async def builder(connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.run_iteration()
+        await service.close()
+        return repository, bundle
+
+    repository, bundle = asyncio.run(scenario())
+
+    assert repository.events == []
+    expected = (
+        [(bootstrap_command().model_copy(update={"state": AutomationState(core_state)}),)] * 2
+        if core_state in {"HOLD", "IN_QUEUE"}
+        else []
+    )
+    assert bundle.commands == expected
+
+
+def test_closed_adopted_automation_keeps_uncertain_intent_supervision_after_bootstrap_ack(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'closed-adopted.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    repository = LocalAutomationRepository(factory)
+    value = bootstrap_command()
+    automation_id = str(value.automation_id)
+    repository.cache_command(value)
+    PositionBootstrapService(repository).ensure(value, StrategySettings())
+    repository.acknowledge_fact_outbox(automation_id, accepted_through_sequence=4, current_revision=2)
+    persisted = repository.save_decision_batch((decision_item(value),), occurred_at=NOW)
+    intent_id = persisted.intents[0].idempotency_key
+    repository.update_intent(intent_id, state="UNCERTAIN", occurred_at=NOW)
+
+    class ClosedCore(Core):
+        def automation_statuses(self, automation_ids):
+            result = super().automation_statuses(automation_ids)
+            for status in result.automations.values():
+                status["state"] = "CLOSED"
+            return result
+
+    async def scenario():
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        bundle = Bundle()
+
+        async def builder(connection):
+            return bundle
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            ClosedCore(),
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return bundle
+
+    bundle = asyncio.run(scenario())
+    assert len(bundle.commands) == 1
+    assert bundle.commands[0][0].state is AutomationState.CLOSED
+    assert str(bundle.commands[0][0].automation_id) == automation_id
+    assert repository.get_active_intent(automation_id).state == "UNCERTAIN"
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(LocalIntentModel)) == 1
+    engine.dispose()
+
+
+def test_flush_makes_one_decision_when_outbox_batch_is_below_deadline() -> None:
+    class BelowDeadlineSynchronization(Synchronization):
+        def flush_outbox(self):
+            self.flushed += 1
+            return True
+
+    async def scenario():
+        repository = Repository()
+        synchronization = BelowDeadlineSynchronization()
+        synchronization.claimed = True
+        core = Core()
+
+        async def builder(connection):
+            return Bundle()
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return synchronization.flushed
+
+    assert asyncio.run(scenario()) == 2
+
+
+def test_heartbeat_is_sent_no_more_than_once_per_three_seconds() -> None:
+    async def scenario():
+        monotonic_value = 0.0
+        repository = Repository()
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        core = Core()
+
+        async def builder(connection):
+            return Bundle()
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            monotonic=lambda: monotonic_value,
+            heartbeat_interval_seconds=3.0,
+        )
+        for value in (0.0, 1.0, 2.0, 3.0, 4.0):
+            monotonic_value = value
+            await service.run_iteration()
+            await asyncio.sleep(0)
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+
+    assert len(core.heartbeats) == 2
+
+
+def test_hold_is_synchronized_but_not_assigned_to_broker_runtime() -> None:
+    class HoldRepository(Repository):
+        def synchronize_core_state(self, automation_id, **values):
+            synced = command(AutomationState(values["state"]))
+            self.active = [synced]
+            return synced
+
+        def list_active(self):
+            return [item for item in self.active if item.state is AutomationState.IN_WORK]
+
+    async def scenario():
+        repository = HoldRepository()
+        repository.active = [command(AutomationState.HOLD)]
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        core = Core()
+        core.automation_statuses = lambda automation_ids: SimpleNamespace(
+            automations={
+                automation_id: {
+                    "state": "HOLD",
+                    "revision": 2,
+                    "last_sequence_number": 1,
+                }
+                for automation_id in automation_ids
+            },
+            missing_automation_ids=(),
+        )
+        builds = []
+
+        async def builder(connection):
+            builds.append(connection)
+            return Bundle()
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return builds
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_rebuilds_broker_runtime_after_its_task_finishes_with_error() -> None:
+    class FailingBundle(Bundle):
+        async def run(self):
+            cause = ValueError("UNIQUE constraint failed: fact_outbox.automation_id, fact_outbox.sequence_number")
+            cause.sqlite_errorname = "SQLITE_CONSTRAINT_UNIQUE"  # type: ignore[attr-defined]
+            raise RuntimeError("broker runtime failed") from cause
+
+    async def scenario():
+        repository = Repository()
+        synchronization = Synchronization()
+        core = Core()
+        first = FailingBundle()
+        second = Bundle()
+        bundles = iter((first, second))
+
+        async def builder(connection):
+            return next(bundles)
+
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await asyncio.sleep(0)
+        await service.run_iteration()
+        await service.close()
+        return first, second
+
+    records: list[logging.LogRecord] = []
+
+    class RecordHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = RecordHandler()
+    was_disabled = LOGGER.disabled
+    LOGGER.disabled = False
+    LOGGER.addHandler(handler)
+    try:
+        first, second = asyncio.run(scenario())
+    finally:
+        LOGGER.removeHandler(handler)
+        LOGGER.disabled = was_disabled
+
+    assert first.closed is True
+    assert len(second.commands) == 1
+    messages = [record.getMessage() for record in records]
+    assert any("Broker runtime stopped unexpectedly" in message for message in messages)
+    assert any("RuntimeError" in message for message in messages)
+    assert any("ValueError" in message for message in messages)
+    assert any("SQLITE_CONSTRAINT_UNIQUE" in message for message in messages)
+    assert any("uq_fact_outbox_sequence" in message for message in messages)
+
+
+def test_held_nonbootstrap_automation_keeps_uncertain_intent_supervision(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'held.db'}")
+    Base.metadata.create_all(engine)
+    repository = LocalAutomationRepository(sessionmaker(engine, expire_on_commit=False))
+    value = command(AutomationState.IN_WORK)
+    repository.cache_command(value)
+    automation_id = str(value.automation_id)
+    intent_id = repository.save_decision_batch((decision_item(value),), occurred_at=NOW).intents[0].idempotency_key
+    repository.update_intent(intent_id, state="UNCERTAIN", occurred_at=NOW)
+    repository.hold_active("Uncertain order", automation_id)
+
+    class HeldCore(Core):
+        def automation_statuses(self, automation_ids):
+            result = super().automation_statuses(automation_ids)
+            for status in result.automations.values():
+                status["state"] = "HOLD"
+            return result
+
+    async def scenario():
+        synchronization = Synchronization()
+        synchronization.claimed = True
+        bundle = Bundle()
+
+        async def builder(connection):
+            return bundle
+
+        core = HeldCore()
+        service = build_coordinator(
+            repository,
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            command_sync_diagnostics=lambda grouped, claimed, publication_reason: repository.command_sync_diagnostics(
+                str(value.broker_id),
+                claimed_count=claimed,
+                grouped_automation_ids=grouped,
+                captured_at=NOW,
+                publication_reason=publication_reason,
+            ),
+        )
+        await service.run_iteration()
+        await service.close()
+        return bundle, core
+
+    bundle, core = asyncio.run(scenario())
+    assert len(bundle.commands) == 1
+    assert bundle.commands[0][0].state is AutomationState.HOLD
+    assert repository.get_active_intent(automation_id).state == "UNCERTAIN"
+    projection = core.diagnostics.command_sync
+    assert projection is not None
+    assert projection.rows[0].state is AutomationState.HOLD
+    assert projection.rows[0].active_intent_state == "UNCERTAIN"
+    assert projection.rows[0].pending_fact_count > 0
+    assert projection.rows[0].monitored is True
+    assert projection.rows[0].grouped is True
+    engine.dispose()
+
+
+@pytest.mark.parametrize("blocked_flush", [1, 2])
+def test_each_outbox_block_sends_heartbeat_without_successful_progress(blocked_flush):
+    class Blocked(Synchronization):
+        def flush_outbox(self):
+            self.flushed += 1
+            return self.flushed != blocked_flush
+
+    async def scenario():
+        core = Core()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(Repository(), Blocked(), core, builder, worker_id="worker", now=lambda: NOW)
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert len(core.heartbeats) == 1
+    assert core.diagnostics.completed_iterations == 0
+    assert core.diagnostics.last_completed_at is None
+    assert core.diagnostics.last_result == "OUTBOX_BLOCKED"
+
+
+def test_iteration_exception_reports_safe_error_and_preserves_original_exception():
+    failure = ValueError("synthetic-secret")
+
+    class Failed(Synchronization):
+        def flush_outbox(self):
+            raise failure
+
+    async def scenario():
+        core = Core()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(Repository(), Failed(), core, builder, worker_id="worker", now=lambda: NOW)
+        with pytest.raises(ValueError, match="synthetic-secret") as caught:
+            await service.run_iteration()
+        assert caught.value is failure
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert core.diagnostics.last_result == "ERROR"
+    assert core.diagnostics.error_code == "ITERATION_FAILED"
+    assert "synthetic-secret" not in core.diagnostics.model_dump_json()
+
+
+def test_completed_control_iteration_increments_progress_and_hb_failure_is_consumed(caplog, monkeypatch):
+    # Alembic's fileConfig disables existing loggers in preceding migration tests.
+    monkeypatch.setattr(LOGGER, "disabled", False)
+
+    class FailedHeartbeat(Core):
+        def heartbeat(self, worker_id, occurred_at, diagnostics=None):
+            super().heartbeat(worker_id, occurred_at, diagnostics)
+            raise ValueError("heartbeat-secret")
+
+    async def scenario():
+        core = FailedHeartbeat()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(
+            Repository(),
+            Synchronization(),
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        core = asyncio.run(scenario())
+    assert core.diagnostics.completed_iterations == 1
+    assert core.diagnostics.last_result == "COMPLETED"
+    assert core.diagnostics.last_completed_at == NOW
+    assert "Heartbeat delivery failed: ValueError" in caplog.text
+    assert "heartbeat-secret" not in caplog.text
+
+
+def test_cancelled_hanging_iteration_never_claims_completion():
+    async def scenario():
+        core = Core()
+        entered = asyncio.Event()
+
+        async def builder(_connection):
+            entered.set()
+            await asyncio.Event().wait()
+
+        service = build_coordinator(
+            Repository(),
+            Synchronization(),
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        task = asyncio.create_task(service.run_iteration())
+        await entered.wait()
+        assert not core.heartbeats
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await service.close()
+        assert not core.heartbeats
+
+    asyncio.run(scenario())
+
+
+def test_outbox_read_failure_preserves_control_heartbeat_and_interval_bounds():
+    samples = []
+
+    def failed_read():
+        samples.append(1)
+        raise RuntimeError("storage-secret")
+
+    async def scenario():
+        core = Core()
+        repository = Repository()
+        synchronization = Synchronization()
+        ticks = [0.0]
+
+        async def builder(_connection):
+            return Bundle()
+
+        iteration = SynchronizeTradingRuntimeUsecase(
+            repository,
+            synchronization,
+            core,
+            WorkerAutomationLifecycleService(repository),
+            worker_id="worker",
+            now=lambda: NOW,
+        )
+        service = StreamingRuntimeCoordinator(
+            iteration,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            monotonic=lambda: ticks[0],
+            outbox_diagnostics=failed_read,
+        )
+        await service.run_iteration()
+        await service._heartbeat_task
+        ticks[0] = 1
+        await service.run_iteration()
+        assert len(samples) == 1
+        ticks[0] = 3
+        await service.run_iteration()
+        await service.close()
+        return core
+
+    core = asyncio.run(scenario())
+    assert len(samples) == 2
+    assert core.diagnostics.completed_iterations == 3
+    assert core.diagnostics.outbox.observation == "UNKNOWN"
+    assert core.diagnostics.outbox.pending_count is None
+
+
+def test_command_sync_diagnostic_failure_does_not_fail_control_iteration(caplog):
+    def failed_projection(_grouped, _claimed, _publication_reason):
+        raise RuntimeError("diagnostic-secret")
+
+    async def scenario():
+        core = Core()
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(
+            Repository(),
+            Synchronization(),
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            command_sync_diagnostics=failed_projection,
+        )
+        await service.run_iteration()
+        await service._heartbeat_task
+        await service.close()
+        return core
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        core = asyncio.run(scenario())
+
+    assert core.diagnostics.last_result == "COMPLETED"
+    assert core.diagnostics.command_sync is not None
+    assert core.diagnostics.command_sync.observation == "UNKNOWN"
+    assert core.diagnostics.command_sync.reason == "READ_FAILED"
+    assert "diagnostic-secret" not in caplog.text
+
+
+def test_slow_heartbeat_remains_single_and_close_waits_for_delivery():
+    entered, release = Event(), Event()
+
+    class SlowCore(Core):
+        def heartbeat(self, worker_id, occurred_at, diagnostics=None):
+            entered.set()
+            assert release.wait(timeout=5)
+            super().heartbeat(worker_id, occurred_at, diagnostics)
+
+    async def scenario():
+        core = SlowCore()
+        ticks = [0.0]
+
+        async def builder(_connection):
+            return Bundle()
+
+        service = build_coordinator(
+            Repository(),
+            Synchronization(),
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: NOW,
+            monotonic=lambda: ticks[0],
+        )
+        try:
+            await service.run_iteration()
+            assert await asyncio.to_thread(entered.wait, 5)
+            ticks[0] = 6
+            await service.run_iteration()
+            assert not core.heartbeats
+            closing = asyncio.create_task(service.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            release.set()
+            await closing
+            assert len(core.heartbeats) == 1
+            assert core.diagnostics.completed_iterations == 1
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_iteration_after_success_does_not_send_fresh_completed_heartbeat():
+    async def scenario():
+        core, synchronization = Core(), Synchronization()
+        synchronization.claimed = True
+        entered = asyncio.Event()
+        ticks, clock = [0.0], [NOW]
+
+        async def builder(_connection):
+            entered.set()
+            await asyncio.Event().wait()
+
+        service = build_coordinator(
+            Repository(),
+            synchronization,
+            core,
+            builder,
+            worker_id="worker",
+            now=lambda: clock[0],
+            monotonic=lambda: ticks[0],
+        )
+        await service.run_iteration()
+        await service._heartbeat_task
+        synchronization.claimed = False
+        ticks[0], clock[0] = 3.0, NOW + timedelta(seconds=3)
+        task = asyncio.create_task(service.run_iteration())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await service.close()
+        assert len(core.heartbeats) == 1
+        assert core.diagnostics.completed_iterations == 1
+        assert core.diagnostics.last_completed_at == NOW
+        assert core.diagnostics.last_finished_at == NOW
+
+    asyncio.run(scenario())

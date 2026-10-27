@@ -19,11 +19,12 @@ from moex_sentinel.services.trading_fact_ports import (
     TradingFactsUnitOfWorkPort,
 )
 from sentinel_contracts.automation_lifecycle import (
+    TECHNICAL_RECOVERY_RESUME_MESSAGE,
     InvalidAutomationTransition,
     TransitionOrigin,
     validate_automation_transition,
 )
-from sentinel_contracts.time import utc_now_ms
+from sentinel_contracts.time import is_historical, require_utc_millisecond, utc_now_ms
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
     AutomationStateChangedEnvelope,
@@ -38,6 +39,7 @@ from sentinel_contracts.trading_facts import (
     PositionLotOpenedEnvelope,
     PositionLotSource,
     TradeAuditRecordedEnvelope,
+    TradeExecutionRecordedEnvelope,
 )
 
 PERSISTENCE_ERROR_CODES = {
@@ -48,6 +50,7 @@ PERSISTENCE_ERROR_CODES = {
     TradingFactErrorCode.REVISION_CONFLICT: FactIngressErrorCode.AUTOMATION_REVISION_CONFLICT,
     TradingFactErrorCode.INVALID_STATE: FactIngressErrorCode.INVALID_FACT_STATE,
 }
+WORKER_UNCERTAIN_HOLD_REASON = "Uncertain broker intent could not be reconciled unambiguously"
 
 
 class _FactGroupRejected(RuntimeError):
@@ -172,12 +175,19 @@ class TradingFactIngressService:
                 if fact.expected_revision != current.revision:
                     raise _FactGroupRejected(FactIngressErrorCode.AUTOMATION_REVISION_CONFLICT)
                 if isinstance(fact, AutomationStateChangedEnvelope):
+                    recovery_resume = self._is_recovery_resume(
+                        uow,
+                        current,
+                        fact,
+                        runtime_authorization=runtime_authorization,
+                    )
                     try:
                         changed = validate_automation_transition(
                             current.state,
                             fact.payload.state,
                             origin=TransitionOrigin.WORKER_FACT,
                             bootstrap=bootstrap,
+                            recovery_resume=recovery_resume,
                         )
                     except InvalidAutomationTransition as error:
                         raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE) from error
@@ -194,7 +204,30 @@ class TradingFactIngressService:
                     runtime_authorization=runtime_authorization,
                     automation_instrument_id=current.instrument_id,
                 )
-                self._mapper.apply(uow, fact)
+                age_policy_expired_at = self._validate_age_policy_failure(
+                    uow,
+                    fact,
+                    scope_id=scope_id,
+                    automation_id=automation_id,
+                    runtime_instance_id=runtime_instance_id,
+                    generation=generation,
+                    runtime_authorization=runtime_authorization,
+                    automation_instrument_id=current.instrument_id,
+                    now=self._now(),
+                )
+                if age_policy_expired_at is not None and not uow.record_age_policy_candidate(
+                    scope_id,
+                    str(fact.payload.idempotency_key),
+                    expired_at=age_policy_expired_at,
+                ):
+                    raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+                self._mapper.apply(
+                    uow,
+                    fact,
+                    age_policy_expired=age_policy_expired_at is not None,
+                )
+                if isinstance(fact, TradeExecutionRecordedEnvelope):
+                    uow.sync_age_policy_settled_execution(scope_id, str(fact.payload.broker_order_id))
                 if reservation_key is not None and not uow.confirm_submit_not_sent(
                     scope_id,
                     reservation_key,
@@ -291,6 +324,100 @@ class TradingFactIngressService:
         return reservation.idempotency_key
 
     @staticmethod
+    def _validate_age_policy_failure(
+        uow: TradingFactsUnitOfWorkPort,
+        fact: FactEnvelope,
+        *,
+        scope_id: str,
+        automation_id: UUID,
+        runtime_instance_id: UUID | None,
+        generation: int | None,
+        runtime_authorization: FactRuntimeAuthorization | None,
+        automation_instrument_id: str,
+        now: datetime,
+    ) -> datetime | None:
+        if not isinstance(fact, BrokerOrderStateChangedEnvelope):
+            return None
+        payload = fact.payload
+        if payload.safe_reason != "ORDER_AGE_LIMIT_EXCEEDED":
+            return None
+        if (
+            payload.to_state.value != BrokerOrderStatus.FAILED.value
+            or payload.state.value != BrokerOrderStatus.FAILED.value
+            or payload.safe_message != "Order exceeded 24-hour processing limit"
+            or payload.terminal_at is not None
+            or payload.pre_rpc_abort_proof is not None
+            or runtime_instance_id is None
+            or generation is None
+            or runtime_authorization is None
+        ):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        try:
+            now = require_utc_millisecond(now)
+        except ValueError:
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE) from None
+        reservation = uow.get_fact_submit_reservation(scope_id, str(payload.idempotency_key))
+        order = uow.orders.get_order(scope_id, str(payload.broker_order_id))
+        if reservation is None:
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        origin_matches = (
+            reservation.runtime_instance_id == str(runtime_instance_id)
+            and reservation.generation == generation
+            and reservation.origin_registration_status == "OWNER"
+        )
+        retired_origin_matches = (
+            reservation.origin_registration_status == "RETIRED"
+            and reservation.generation < generation
+        )
+        try:
+            # The Worker payload records when its age sweep observed expiry. The
+            # envelope timestamp may be advanced by the outbox for monotonic order.
+            expired_at = require_utc_millisecond(payload.occurred_at)
+        except (AttributeError, TypeError, ValueError):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE) from None
+        if (
+            not is_historical(order.created_at, now)
+            or not is_historical(order.created_at, expired_at)
+            or expired_at > now
+            or reservation.state not in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
+            or not (origin_matches or retired_origin_matches)
+            or reservation.automation_id != str(automation_id)
+            or reservation.idempotency_key != order.idempotency_key
+            or reservation.idempotency_key != str(payload.idempotency_key)
+            or reservation.side != order.side.value
+            or reservation.side != payload.side.value
+            or reservation.quantity_lots != order.quantity_lots
+            or reservation.quantity_lots != payload.quantity_lots
+            or reservation.limit_price != order.limit_price
+            or reservation.limit_price != payload.limit_price
+            or reservation.requested_amount != order.requested_amount
+            or reservation.requested_amount != payload.requested_amount
+            or order.user_broker_id != scope_id
+            or order.automation_id != str(automation_id)
+            or order.instrument_id != automation_instrument_id
+            or order.instrument_id != str(payload.instrument_id)
+            or order.state is BrokerOrderStatus.FAILED
+            or order.terminal_at is not None
+            or payload.from_state is None
+            or payload.from_state.value != order.state.value
+            or payload.external_order_id != order.external_order_id
+            or payload.executed_amount != order.executed_amount
+            or payload.executed_commission != order.executed_commission
+            or payload.executed_at != order.executed_at
+            or payload.broker_responded_at != order.broker_responded_at
+            or payload.dispatch_started_at != order.dispatch_started_at
+            or payload.estimated_commission != order.estimated_commission
+            or payload.order_type.value != order.order_type.value
+            or payload.intent_kind.value != order.intent_kind.value
+            or str(payload.decision_id) != order.decision_id
+            or (payload.position_cycle_id is None) != (order.position_cycle_id is None)
+            or (payload.position_cycle_id is not None and str(payload.position_cycle_id) != order.position_cycle_id)
+            or payload.strategy_snapshot != order.strategy_snapshot
+        ):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        return expired_at
+
+    @staticmethod
     def _proof_matches_reservation(
         proof,
         payload,
@@ -359,6 +486,32 @@ class TradingFactIngressService:
             if not amount.is_finite() or amount != 0:
                 return False
         return True
+
+    @staticmethod
+    def _is_recovery_resume(
+        uow: TradingFactsUnitOfWorkPort,
+        current: TradingAutomationDraft,
+        fact: AutomationStateChangedEnvelope,
+        *,
+        runtime_authorization: FactRuntimeAuthorization | None,
+    ) -> bool:
+        if not (
+            current.state is AutomationState.HOLD
+            and fact.payload.state is AutomationState.IN_QUEUE
+            and current.resume_requested
+            and current.suspended_from_state is AutomationState.IN_WORK
+            and current.hold_reason == WORKER_UNCERTAIN_HOLD_REASON
+            and runtime_authorization is not None
+            and not runtime_authorization.recovery_only
+            and fact.safe_message == TECHNICAL_RECOVERY_RESUME_MESSAGE
+        ):
+            return False
+        return uow.automations.has_current_worker_technical_hold(
+            current.user_broker_id,
+            current.id,
+            revision=current.revision,
+            hold_reason=WORKER_UNCERTAIN_HOLD_REASON,
+        )
 
     @staticmethod
     def _validate_state_metadata(current: TradingAutomationDraft, fact: AutomationStateChangedEnvelope) -> None:

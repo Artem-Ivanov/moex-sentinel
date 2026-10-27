@@ -30,6 +30,7 @@ def test_core_operational_environment_uses_contract_names_and_defaults(monkeypat
         "MARKET_OPERATION_TIMEOUT_SECONDS": 10,
         "MARKET_CLOSE_TIMEOUT_SECONDS": 5,
         "MARKET_QUIET_SECONDS": 30,
+        "MARKET_TRADING_STATUS_TTL_SECONDS": 30,
         "MARKET_CANDLES_REFRESH_SECONDS": 60,
         "ANALYTICS_VERSION_HTTP_TIMEOUT_SECONDS": 1,
     }
@@ -55,6 +56,7 @@ def test_core_operational_environment_uses_contract_names_and_defaults(monkeypat
     assert settings.market_operation_timeout_seconds == fields["MARKET_OPERATION_TIMEOUT_SECONDS"]
     assert settings.market_close_timeout_seconds == fields["MARKET_CLOSE_TIMEOUT_SECONDS"]
     assert settings.market_quiet_seconds == fields["MARKET_QUIET_SECONDS"]
+    assert settings.market_trading_status_ttl_seconds == fields["MARKET_TRADING_STATUS_TTL_SECONDS"]
     assert settings.market_candles_refresh_seconds == fields["MARKET_CANDLES_REFRESH_SECONDS"]
     assert settings.analytics_version_http_timeout_seconds == fields["ANALYTICS_VERSION_HTTP_TIMEOUT_SECONDS"]
 
@@ -69,6 +71,7 @@ def test_core_operational_environment_uses_contract_names_and_defaults(monkeypat
     monkeypatch.setenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "2.75")
     monkeypatch.setenv("MARKET_RECOVERY_RETRY_BASE_SECONDS", "2.5")
     monkeypatch.setenv("MARKET_CANDLES_REFRESH_SECONDS", "15")
+    monkeypatch.setenv("MARKET_TRADING_STATUS_TTL_SECONDS", "18")
     monkeypatch.setenv("ANALYTICS_VERSION_HTTP_TIMEOUT_SECONDS", "0.5")
     configured = Settings(_env_file=None, broker_access_mode="READ_ONLY")
     assert configured.database_pool_size == 7
@@ -82,6 +85,7 @@ def test_core_operational_environment_uses_contract_names_and_defaults(monkeypat
     assert configured.telegram_request_timeout_seconds == 2.75
     assert configured.market_recovery_retry_base_seconds == 2.5
     assert configured.market_candles_refresh_seconds == 15
+    assert configured.market_trading_status_ttl_seconds == 18
     assert configured.analytics_version_http_timeout_seconds == 0.5
 
 
@@ -93,6 +97,8 @@ def test_core_operational_environment_uses_contract_names_and_defaults(monkeypat
         ("daily_admission_retry_delays_seconds", [float("inf")]),
         ("readiness_alert_retry_delays_seconds", [float("nan")]),
         ("market_recovery_retry_base_seconds", float("inf")),
+        ("market_trading_status_ttl_seconds", 0),
+        ("market_trading_status_ttl_seconds", float("inf")),
         ("market_operation_timeout_seconds", float("nan")),
         ("analytics_version_http_timeout_seconds", 0),
         ("database_pool_timeout_seconds", float("nan")),

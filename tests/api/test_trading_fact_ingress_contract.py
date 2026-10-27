@@ -117,6 +117,7 @@ def test_baseline_routes_delegate_strict_typed_values(
     assert commands_response.json()["commands"][0]["currency"] == "RUB"
     assert statuses_response.status_code == 200
     assert statuses_response.json()["automations"][0]["revision"] == 1
+    assert "commission_statuses" not in statuses_response.json()
     assert facts_response.status_code == 200
     assert facts_response.json()["results"][0]["accepted_through_sequence"] == 9
     assert claims.calls == [(10,)]

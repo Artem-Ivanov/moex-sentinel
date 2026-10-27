@@ -110,9 +110,9 @@ class BrokerTickPreparationService:
         snapshot: MarketBatchSnapshot,
     ) -> None:
         account_ids = tuple(dict.fromkeys(item.account_id for item in commands))
-        await asyncio.gather(*(self._load_account(account_id) for account_id in account_ids))
         if self._reconciliation is not None:
             await self._reconciliation.reconcile(commands)
+        await asyncio.gather(*(self._load_account(account_id) for account_id in account_ids))
         await self._load_cash(commands)
         await asyncio.gather(*(self._prepare_command(item, snapshot) for item in commands))
         await self._hydration.hydrate(commands)

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from sqlite3 import Connection as SQLiteConnection
 from threading import Lock
-from typing import cast
+from typing import Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import and_, case, delete, exists, func, or_, select, update
@@ -16,15 +16,19 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from sentinel_contracts.automation_lifecycle import (
+    TECHNICAL_RECOVERY_RESUME_MESSAGE,
     InvalidAutomationTransition,
     TransitionOrigin,
     validate_automation_transition,
 )
 from sentinel_contracts.broker_execution import BrokerOrderStatus, OrderSide
-from sentinel_contracts.broker_order_policy import BROKER_TERMINAL_STATES, validate_order_transition
+from sentinel_contracts.broker_order_policy import (
+    BROKER_TERMINAL_STATES,
+    validate_order_transition,
+)
 from sentinel_contracts.business_audit import BusinessAuditEvent
 from sentinel_contracts.strategy import STRATEGY_CODE, STRATEGY_VERSION
-from sentinel_contracts.time import floor_utc_millisecond, utc_now_ms
+from sentinel_contracts.time import floor_utc_millisecond, is_historical, utc_now_ms
 from sentinel_contracts.trading import AutomationState, DecisionKind
 from sentinel_contracts.trading_admission import (
     PreRpcAbortProof,
@@ -54,7 +58,11 @@ from sentinel_contracts.trading_facts import (
     TradeDecisionRecordedPayload,
     TradeExecutionRecordedPayload,
 )
-from sentinel_contracts.worker_diagnostics import OutboxDiagnostics
+from sentinel_contracts.worker_diagnostics import (
+    CommandSyncDiagnostics,
+    CommandSyncRow,
+    OutboxDiagnostics,
+)
 from trading_automaton.domain.position_valuation import lot_position_snapshot
 from trading_automaton.domain.storage_dtos import (
     AccountCommissionProfile,
@@ -79,6 +87,7 @@ from trading_automaton.storage.models import (
     AccountCommissionProfileModel,
     BusinessAuditEventModel,
     CachedAutomationModel,
+    ExecutionCommissionCacheModel,
     FactOutboxModel,
     LocalIntentModel,
     LotAllocationModel,
@@ -87,6 +96,21 @@ from trading_automaton.storage.models import (
     TradingCycleStateModel,
     WorkerRunModel,
 )
+
+_AGE_POLICY_MARKER = "_age_policy"
+_AGE_POLICY_VERSION = 1
+_AGE_POLICY_REASON = "ORDER_AGE_LIMIT_EXCEEDED"
+_AGE_POLICY_MESSAGE = "Order exceeded 24-hour processing limit"
+_RECOVERY_FINANCIAL_FACT_KINDS = {
+    FactKind.TRADE_DECISION_RECORDED.value,
+    FactKind.BROKER_ORDER_RECORDED.value,
+    FactKind.BROKER_ORDER_STATE_CHANGED.value,
+    FactKind.TRADE_EXECUTION_RECORDED.value,
+    FactKind.POSITION_CYCLE_UPDATED.value,
+    FactKind.POSITION_LOT_OPENED.value,
+    FactKind.EXECUTION_LOT_ALLOCATED.value,
+    FactKind.TRADE_AUDIT_RECORDED.value,
+}
 
 __all__ = [
     "AccountCommissionProfile",
@@ -121,11 +145,11 @@ class LocalAutomationRepository:
         self._factory = factory
         self._fact_writer = fact_writer or FactOutboxWriter()
         self._environment = environment
-        # Serializes finalizations inside the supported single worker process.
+        # Serializes financial finalization and recovery/rebase transactions inside the supported worker process.
         # Multiple worker processes sharing one SQLite file remain unsupported.
         self._finalize_lock = Lock()
 
-    def _active_intent_predicate(self) -> ColumnElement[bool]:
+    def _active_intent_predicate(self, *, include_policy_expired: bool = False) -> ColumnElement[bool]:
         active = LocalIntentModel.state.in_(
             (
                 "CREATED",
@@ -137,7 +161,27 @@ class LocalAutomationRepository:
                 "UNCERTAIN",
             )
         )
-        active = or_(active, and_(LocalIntentModel.state == "FAILED", LocalIntentModel.terminal_at.is_(None)))
+        active = or_(
+            active,
+            and_(
+                LocalIntentModel.state == "FAILED",
+                LocalIntentModel.terminal_at.is_(None),
+            ),
+        )
+        if not include_policy_expired:
+            marker_version = func.json_extract(LocalIntentModel.strategy_snapshot, "$._age_policy.version")
+            expired_at = func.json_extract(LocalIntentModel.strategy_snapshot, "$._age_policy.expired_at")
+            valid_age_policy = and_(
+                func.json_type(LocalIntentModel.strategy_snapshot, "$._age_policy.version") == "integer",
+                marker_version == _AGE_POLICY_VERSION,
+                func.json_type(LocalIntentModel.strategy_snapshot, "$._age_policy.expired_at") == "text",
+                func.length(expired_at) == 29,
+                expired_at.like("____-__-__T__:__:__.___+00:00"),
+                func.julianday(expired_at).is_not(None),
+                func.julianday(expired_at) - func.julianday(LocalIntentModel.created_at) > 1,
+                func.julianday(expired_at) <= func.julianday("now"),
+            )
+            active = and_(active, ~and_(LocalIntentModel.state == "FAILED", func.coalesce(valid_age_policy, False)))
         terminal_unfinalized = and_(
             LocalIntentModel.state.in_(("FILLED", "REJECTED", "CANCELLED", "EXPIRED")),
             LocalIntentModel.terminal_at.is_(None),
@@ -260,7 +304,7 @@ class LocalAutomationRepository:
                     payload=TradeAuditRecordedPayload(
                         audit_event_id=UUID(event.event_id),
                         process_id=UUID(event.process_id),
-                        parent_process_id=UUID(event.parent_process_id) if event.parent_process_id else None,
+                        parent_process_id=(UUID(event.parent_process_id) if event.parent_process_id else None),
                         decision_id=None,
                         broker_order_id=None,
                         execution_id=None,
@@ -305,8 +349,8 @@ class LocalAutomationRepository:
                 payload=AutomationStateChangedPayload(
                     state=target_state,
                     suspended_from_state=(previous_state if target_state is AutomationState.HOLD else None),
-                    hold_reason=safe_message if target_state is AutomationState.HOLD else None,
-                    closed_at=occurred_at if target_state is AutomationState.CLOSED else None,
+                    hold_reason=(safe_message if target_state is AutomationState.HOLD else None),
+                    closed_at=(occurred_at if target_state is AutomationState.CLOSED else None),
                 ),
                 safe_message=safe_message,
                 occurred_at=occurred_at,
@@ -410,7 +454,10 @@ class LocalAutomationRepository:
             return ExecutionFinalizationResult(self._intent_record(intent), True, snapshot)
 
     def _finalize_trading_cycle(
-        self, session: Session, intent: LocalIntentModel, finalization: ExecutionFinalization
+        self,
+        session: Session,
+        intent: LocalIntentModel,
+        finalization: ExecutionFinalization,
     ) -> None:
         """Write the execution transition in the caller's transaction, keeping monotonic time markers."""
         model = session.get(TradingCycleStateModel, intent.automation_id)
@@ -476,7 +523,13 @@ class LocalAutomationRepository:
         first_buy = intent.side == "BUY" and lot is not None and lot.original_lots == int(snapshot["quantity_lots"])
 
         if first_buy:
-            self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
+            self._append_cycle_fact(
+                session,
+                cached,
+                snapshot,
+                occurred_at,
+                updated_at=finalization.occurred_at,
+            )
         self._fact_writer.append(
             session,
             cached,
@@ -523,7 +576,13 @@ class LocalAutomationRepository:
                 occurred_at=occurred_at,
             )
             if not first_buy:
-                self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
+                self._append_cycle_fact(
+                    session,
+                    cached,
+                    snapshot,
+                    occurred_at,
+                    updated_at=finalization.occurred_at,
+                )
         else:
             allocations = session.scalars(
                 select(LotAllocationModel)
@@ -556,7 +615,13 @@ class LocalAutomationRepository:
                     safe_message="Execution allocated to position lot",
                     occurred_at=allocation.closed_at,
                 )
-            self._append_cycle_fact(session, cached, snapshot, occurred_at, updated_at=finalization.occurred_at)
+            self._append_cycle_fact(
+                session,
+                cached,
+                snapshot,
+                occurred_at,
+                updated_at=finalization.occurred_at,
+            )
             if int(snapshot["quantity_lots"]) == 0:
                 cached.position_cycle_id = None
         intent.execution_facts_emitted_at = occurred_at
@@ -594,7 +659,7 @@ class LocalAutomationRepository:
             payload=PositionCycleUpdatedPayload(
                 position_cycle_id=UUID(cached.position_cycle_id),
                 instrument_id=UUID(cached.fact_instrument_id),
-                state=FactPositionCycleState.OPEN if quantity_lots > 0 else FactPositionCycleState.CLOSED,
+                state=(FactPositionCycleState.OPEN if quantity_lots > 0 else FactPositionCycleState.CLOSED),
                 quantity_lots=quantity_lots,
                 average_entry_price=Decimal(str(snapshot["average_price"])),
                 invested_amount=Decimal(str(snapshot["invested_amount"])),
@@ -621,7 +686,10 @@ class LocalAutomationRepository:
     ) -> dict[str, object] | None:
         if finalization.state not in BROKER_TERMINAL_STATES:
             raise ValueError("Execution finalization requires a terminal state.")
-        if finalization.side not in {"BUY", "SELL"} or intent.side not in {"BUY", "SELL"}:
+        if finalization.side not in {"BUY", "SELL"} or intent.side not in {
+            "BUY",
+            "SELL",
+        }:
             raise ValueError("Execution finalization side is invalid.")
         proof_origin = self._pre_rpc_abort_origin(intent, cached, finalization)
         if (
@@ -638,11 +706,15 @@ class LocalAutomationRepository:
             (cached.broker_id, finalization.broker_id, "broker_id"),
             (cached.account_id, finalization.account_id, "account_id"),
             (
-                cached.instrument_id if proof_origin is None else proof_origin["instrument_uid"],
+                (cached.instrument_id if proof_origin is None else proof_origin["instrument_uid"]),
                 finalization.instrument_id,
                 "instrument_id",
             ),
-            (cached.lot_size if proof_origin is None else proof_origin["lot_size"], finalization.lot_size, "lot_size"),
+            (
+                cached.lot_size if proof_origin is None else proof_origin["lot_size"],
+                finalization.lot_size,
+                "lot_size",
+            ),
         )
         mismatch = next((name for actual, provided, name in expected if actual != provided), None)
         if mismatch is not None:
@@ -1037,6 +1109,191 @@ class LocalAutomationRepository:
             model.bootstrap_observed_at = None if snapshot is None else snapshot.observed_at
             return True
 
+    def consume_recovery_resume(
+        self,
+        command: TypedAutomationCommand,
+        *,
+        occurred_at: datetime,
+    ) -> TypedAutomationCommand | None:
+        """Consume a guarded Core resume request after every local fact is drained."""
+        automation_id = str(command.automation_id)
+        if (
+            command.state is not AutomationState.HOLD
+            or not command.resume_requested
+            or command.bootstrap is not None
+        ):
+            return None
+        with self._finalize_lock, self._factory.begin() as session:
+            connection = session.connection()
+            driver = cast(SQLiteConnection, connection.connection.driver_connection)
+            if not driver.in_transaction:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            cached = session.get(CachedAutomationModel, automation_id)
+            if (
+                cached is None
+                or cached.state != AutomationState.HOLD.value
+                or command.revision > cached.revision
+                or command.last_sequence_number > cached.last_sequence_number
+            ):
+                return None
+            cached.resume_requested = True
+            if session.scalar(
+                select(FactOutboxModel.event_id)
+                .where(FactOutboxModel.automation_id == automation_id)
+                .limit(1)
+            ) is not None:
+                return None
+            if (
+                cached.revision != command.revision
+                or cached.last_sequence_number != command.last_sequence_number
+            ):
+                return None
+            if session.scalar(
+                select(LocalIntentModel.idempotency_key)
+                .where(
+                    LocalIntentModel.automation_id == automation_id,
+                    self._active_intent_predicate(),
+                )
+                .limit(1)
+            ) is not None:
+                return None
+            validate_automation_transition(
+                AutomationState.HOLD,
+                AutomationState.IN_QUEUE,
+                origin=TransitionOrigin.WORKER_FACT,
+                recovery_resume=True,
+            )
+            self._compare_and_set_state(session, cached, AutomationState.IN_QUEUE)
+            cached.broker_id = str(command.broker_id)
+            cached.account_id = command.account_id
+            cached.user_broker_id = str(command.user_broker_id)
+            cached.instrument_id = command.external_instrument_id
+            cached.fact_instrument_id = str(command.instrument_id)
+            cached.currency = command.currency
+            cached.lot_size = command.lot_size
+            cached.min_price_increment = command.min_price_increment
+            if command.settings_revision > (cached.settings_revision or 0):
+                cached.settings_revision = command.settings_revision
+                cached.order_quota_percent = command.order_quota_percent
+            self._fact_writer.append(
+                session,
+                cached,
+                payload=AutomationStateChangedPayload(
+                    state=AutomationState.IN_QUEUE,
+                    suspended_from_state=None,
+                    hold_reason=None,
+                    closed_at=None,
+                ),
+                safe_message=TECHNICAL_RECOVERY_RESUME_MESSAGE,
+                occurred_at=occurred_at,
+                changes_revision=True,
+            )
+            return self._command(cached)
+
+    def reconcile_recovery_resume_outbox(
+        self,
+        automation_id: str,
+        *,
+        state: AutomationState | None,
+        revision: int | None,
+        last_sequence_number: int | None,
+        resume_requested: bool | None,
+        user_broker_id: str | None = None,
+        allow_financial_rebase: bool = False,
+    ) -> bool | None:
+        """Rebase only financial suffixes after Core cancels a known recovery resume."""
+        if not allow_financial_rebase:
+            return None
+        with self._finalize_lock, self._factory.begin() as session:
+            connection = session.connection()
+            driver = cast(SQLiteConnection, connection.connection.driver_connection)
+            if not driver.in_transaction:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            cached = session.get(CachedAutomationModel, automation_id)
+            if cached is None:
+                return None
+            rows = session.scalars(
+                select(FactOutboxModel)
+                .where(FactOutboxModel.automation_id == automation_id)
+                .order_by(FactOutboxModel.sequence_number)
+            ).all()
+            recovery_rows = [
+                row
+                for row in rows
+                if row.fact_kind == FactKind.AUTOMATION_STATE_CHANGED.value
+                and row.safe_message == TECHNICAL_RECOVERY_RESUME_MESSAGE
+                and row.payload.get("state") == AutomationState.IN_QUEUE.value
+            ]
+            if (
+                state is not AutomationState.HOLD
+                or resume_requested is not False
+                or revision is None
+                or last_sequence_number is None
+                or user_broker_id is None
+                or cached.user_broker_id != user_broker_id
+            ):
+                return False
+            if revision <= 0 or last_sequence_number < 0:
+                return False
+            if any(row.user_broker_id != user_broker_id for row in rows):
+                return False
+            suffix = [row for row in rows if row.sequence_number > last_sequence_number]
+            controls = [row for row in recovery_rows if row.sequence_number > last_sequence_number]
+            if len(controls) > 1:
+                return False
+            highest_known_sequence = max(
+                cached.last_sequence_number,
+                max((row.sequence_number for row in rows), default=0),
+            )
+            if last_sequence_number > highest_known_sequence:
+                return False
+            if revision < cached.revision:
+                return False
+            if suffix and revision < max(row.expected_revision for row in suffix):
+                return False
+            expected_suffix = list(range(last_sequence_number + 1, highest_known_sequence + 1))
+            if [row.sequence_number for row in suffix] != expected_suffix:
+                return False
+            for row in suffix:
+                if row in controls:
+                    continue
+                if row.fact_kind in {FactKind.AUTOMATION_STATE_CHANGED.value}:
+                    return False
+                if row.fact_kind not in _RECOVERY_FINANCIAL_FACT_KINDS:
+                    return False
+
+            session.execute(
+                delete(FactOutboxModel).where(
+                    FactOutboxModel.automation_id == automation_id,
+                    FactOutboxModel.sequence_number <= last_sequence_number,
+                )
+            )
+            if controls:
+                session.execute(
+                    delete(FactOutboxModel).where(
+                        FactOutboxModel.event_id.in_([row.event_id for row in controls])
+                    )
+                )
+            session.flush()
+            financial_suffix = [row for row in suffix if row not in controls]
+            for offset, row in enumerate(financial_suffix, start=1):
+                session.execute(
+                    update(FactOutboxModel)
+                    .where(FactOutboxModel.event_id == row.event_id)
+                    .values(
+                        sequence_number=last_sequence_number + offset,
+                        expected_revision=revision,
+                        delivery_state="PENDING",
+                        next_retry_at=None,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+            cached.state = AutomationState.HOLD.value
+            cached.revision = revision
+            cached.last_sequence_number = last_sequence_number + len(financial_suffix)
+            cached.resume_requested = False
+            return True
+
     def ensure_position_bootstrap(self, command: TypedAutomationCommand) -> bool:
         """Create recovery lot and the complete typed activation group in one transaction."""
         snapshot = command.bootstrap
@@ -1207,7 +1464,10 @@ class LocalAutomationRepository:
                 level=FactTradeAuditLevel.INFO.value,
                 stage="BOOTSTRAP_POSITION_ADOPTED",
                 message="Broker position adopted as clean runtime state",
-                event_data={"strategy_code": STRATEGY_CODE, "strategy_version": STRATEGY_VERSION},
+                event_data={
+                    "strategy_code": STRATEGY_CODE,
+                    "strategy_version": STRATEGY_VERSION,
+                },
                 occurred_at=snapshot.observed_at,
                 critical=False,
             )
@@ -1226,7 +1486,10 @@ class LocalAutomationRepository:
                 level=FactTradeAuditLevel.INFO,
                 stage="BOOTSTRAP_POSITION_ADOPTED",
                 safe_message="Broker position adopted as clean runtime state",
-                data={"strategy_code": STRATEGY_CODE, "strategy_version": STRATEGY_VERSION},
+                data={
+                    "strategy_code": STRATEGY_CODE,
+                    "strategy_version": STRATEGY_VERSION,
+                },
                 occurred_at=snapshot.observed_at,
                 created_at=snapshot.observed_at,
                 critical=False,
@@ -1284,7 +1547,7 @@ class LocalAutomationRepository:
         active_intent_exists = exists(
             select(LocalIntentModel.idempotency_key).where(
                 LocalIntentModel.automation_id == CachedAutomationModel.automation_id,
-                self._active_intent_predicate(),
+                self._active_intent_predicate(include_policy_expired=True),
             )
         )
         with self._factory() as session:
@@ -1303,7 +1566,7 @@ class LocalAutomationRepository:
         active_intent_exists = exists(
             select(LocalIntentModel.idempotency_key).where(
                 LocalIntentModel.automation_id == CachedAutomationModel.automation_id,
-                self._active_intent_predicate(),
+                self._active_intent_predicate(include_policy_expired=True),
             )
         )
         with self._factory() as session:
@@ -1363,7 +1626,10 @@ class LocalAutomationRepository:
                 connection.exec_driver_sql("BEGIN")
             pending_bootstrap_state = session.scalar(
                 select(FactOutboxModel.event_id)
-                .join(CachedAutomationModel, CachedAutomationModel.automation_id == FactOutboxModel.automation_id)
+                .join(
+                    CachedAutomationModel,
+                    CachedAutomationModel.automation_id == FactOutboxModel.automation_id,
+                )
                 .where(
                     FactOutboxModel.delivery_state == "PENDING",
                     FactOutboxModel.fact_kind == FactKind.AUTOMATION_STATE_CHANGED.value,
@@ -1447,7 +1713,10 @@ class LocalAutomationRepository:
             .where(
                 or_(
                     FactOutboxModel.delivery_state == "FAILED",
-                    and_(FactOutboxModel.delivery_state == "PENDING", FactOutboxModel.next_retry_at > now),
+                    and_(
+                        FactOutboxModel.delivery_state == "PENDING",
+                        FactOutboxModel.next_retry_at > now,
+                    ),
                 )
             )
             .group_by(FactOutboxModel.automation_id)
@@ -1458,7 +1727,10 @@ class LocalAutomationRepository:
             .outerjoin(blocked, blocked.c.automation_id == FactOutboxModel.automation_id)
             .where(
                 FactOutboxModel.delivery_state == "PENDING",
-                or_(blocked.c.sequence_number.is_(None), FactOutboxModel.sequence_number < blocked.c.sequence_number),
+                or_(
+                    blocked.c.sequence_number.is_(None),
+                    FactOutboxModel.sequence_number < blocked.c.sequence_number,
+                ),
             )
         )
         rows = session.scalars(
@@ -1586,6 +1858,184 @@ class LocalAutomationRepository:
             failed_count=counts[1],
             oldest_pending_at=counts[2],
             max_retry_count=counts[3],
+        )
+
+    def command_sync_diagnostics(
+        self,
+        broker_id: str | None,
+        *,
+        claimed_count: int,
+        grouped_automation_ids: set[str] | None,
+        captured_at: datetime,
+        publication_reason: Literal["REPLACE_FAILED", "SYNC_FAILED"] | None = None,
+    ) -> CommandSyncDiagnostics:
+        """Read a bounded, broker-scoped projection without exposing execution data."""
+        if broker_id is None:
+            return CommandSyncDiagnostics(reason="UNCONFIGURED_BROKER")
+        active_intent = self._active_intent_predicate()
+        active_state = (
+            select(LocalIntentModel.state)
+            .where(
+                LocalIntentModel.automation_id == CachedAutomationModel.automation_id,
+                active_intent,
+            )
+            .order_by(LocalIntentModel.created_at.desc(), LocalIntentModel.idempotency_key)
+            .limit(1)
+            .scalar_subquery()
+        )
+        active_terminal_at = (
+            select(LocalIntentModel.terminal_at)
+            .where(
+                LocalIntentModel.automation_id == CachedAutomationModel.automation_id,
+                active_intent,
+            )
+            .order_by(LocalIntentModel.created_at.desc(), LocalIntentModel.idempotency_key)
+            .limit(1)
+            .scalar_subquery()
+        )
+        monitored_predicate = or_(CachedAutomationModel.state != "CLOSED", active_state.is_not(None))
+        pending_count = func.count(case((FactOutboxModel.delivery_state == "PENDING", 1)))
+        failed_count = func.count(case((FactOutboxModel.delivery_state == "FAILED", 1)))
+        with self._factory() as session:
+            connection = session.connection()
+            driver = cast(SQLiteConnection, connection.connection.driver_connection)
+            if not driver.in_transaction:
+                connection.exec_driver_sql("BEGIN")
+            scoped_filter = CachedAutomationModel.broker_id == broker_id
+            scoped_count = (
+                session.scalar(select(func.count()).select_from(CachedAutomationModel).where(scoped_filter)) or 0
+            )
+            unscoped_count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(CachedAutomationModel)
+                    .where(CachedAutomationModel.broker_id.is_(None))
+                )
+                or 0
+            )
+            rows = session.execute(
+                select(CachedAutomationModel, active_state, active_terminal_at)
+                .where(scoped_filter)
+                .order_by(CachedAutomationModel.automation_id)
+                .limit(101)
+            ).all()
+            monitored_total = (
+                session.scalar(
+                    select(func.count()).select_from(CachedAutomationModel).where(scoped_filter, monitored_predicate)
+                )
+                or 0
+            )
+            automation_ids = [row.automation_id for row, _, _ in rows[:100]]
+            fact_counts: dict[str, tuple[int, int]] = {}
+            if automation_ids:
+                fact_counts = {
+                    automation_id: (pending, failed)
+                    for automation_id, pending, failed in session.execute(
+                        select(FactOutboxModel.automation_id, pending_count, failed_count)
+                        .where(
+                            FactOutboxModel.automation_id.in_(automation_ids),
+                            FactOutboxModel.delivery_state.in_(("PENDING", "FAILED")),
+                        )
+                        .group_by(FactOutboxModel.automation_id)
+                    )
+                }
+        projection_rows = []
+        for cached, intent_state, terminal_at in rows[:100]:
+            bootstrap = cached.bootstrap_position_cycle_id is not None
+            binding_complete = all(
+                value is not None
+                for value in (
+                    cached.user_broker_id,
+                    cached.broker_id,
+                    cached.account_id,
+                    cached.instrument_id,
+                    cached.fact_instrument_id,
+                    cached.currency,
+                    cached.lot_size,
+                    cached.min_price_increment,
+                    *(
+                        (
+                            cached.bootstrap_position_lot_id,
+                            cached.bootstrap_quantity_lots,
+                            cached.bootstrap_average_price,
+                            cached.bootstrap_invested_amount,
+                            cached.bootstrap_currency,
+                            cached.bootstrap_observed_at,
+                        )
+                        if bootstrap
+                        else ()
+                    ),
+                )
+            )
+            active = intent_state is not None
+            monitored = cached.state != AutomationState.CLOSED or active
+            grouped = grouped_automation_ids is not None and cached.automation_id in grouped_automation_ids
+            if grouped:
+                exclusion_reason = None
+            elif not binding_complete:
+                exclusion_reason = "INCOMPLETE_BINDING"
+            elif publication_reason is not None:
+                exclusion_reason = "PUBLICATION_UNKNOWN"
+            elif cached.state == AutomationState.CLOSED and not active:
+                exclusion_reason = "CLOSED_WITHOUT_ACTIVE_INTENT"
+            elif cached.state == AutomationState.HOLD and not active and not bootstrap:
+                exclusion_reason = "HOLD_WITHOUT_ACTIVE_INTENT_OR_BOOTSTRAP"
+            elif bootstrap:
+                exclusion_reason = "BOOTSTRAP_STATE_NOT_GROUPABLE"
+            else:
+                exclusion_reason = "NOT_MONITORED"
+            pending, failed = fact_counts.get(cached.automation_id, (0, 0))
+            projection_rows.append(
+                CommandSyncRow(
+                    automation_id=cached.automation_id,
+                    state=cached.state,
+                    revision=cached.revision,
+                    last_sequence_number=cached.last_sequence_number,
+                    binding_complete=binding_complete,
+                    bootstrap=bootstrap,
+                    active_intent_state=intent_state,
+                    active_intent_terminal_present=(terminal_at is not None if active else None),
+                    pending_fact_count=pending,
+                    failed_fact_count=failed,
+                    monitored=monitored,
+                    grouped=grouped,
+                    exclusion_reason=exclusion_reason,
+                )
+            )
+        truncated = scoped_count > 100
+        complete = (
+            unscoped_count == 0
+            and not truncated
+            and publication_reason is None
+            and all(row.binding_complete for row in projection_rows)
+        )
+        publication_observation = "UNKNOWN" if publication_reason is not None else "OBSERVED"
+        grouped_count = None if grouped_automation_ids is None else len(grouped_automation_ids)
+        if unscoped_count:
+            return CommandSyncDiagnostics(
+                observation="UNKNOWN",
+                reason="UNSCOPED_CACHE",
+                broker_id=broker_id,
+                captured_at=captured_at,
+                truncated=truncated,
+                publication_observation=publication_observation,
+                publication_reason=publication_reason,
+                rows=tuple(projection_rows),
+            )
+        return CommandSyncDiagnostics(
+            observation="OBSERVED",
+            reason="OBSERVED",
+            broker_id=broker_id,
+            captured_at=captured_at,
+            complete=complete,
+            truncated=truncated,
+            cached_count=scoped_count,
+            claimed_count=claimed_count,
+            monitored_count=monitored_total,
+            grouped_count=grouped_count,
+            publication_observation=publication_observation,
+            publication_reason=publication_reason,
+            rows=tuple(projection_rows),
         )
 
     def has_pending_fact_outbox(self, automation_id: str) -> bool:
@@ -1845,6 +2295,55 @@ class LocalAutomationRepository:
             )
             return self._intent_record(model)
 
+    def expire_intent_by_age(self, idempotency_key: str, *, expired_at: datetime) -> LocalIntentRecord | None:
+        """Mark a strictly old active intent as administrative FAILED without terminal proof."""
+        expired_at = floor_utc_millisecond(expired_at)
+        if expired_at is None:
+            raise ValueError("Age-policy timestamp must be an aware UTC datetime.")
+        with self._finalize_lock, self._factory.begin() as session:
+            model = session.get(LocalIntentModel, idempotency_key)
+            if model is None:
+                raise KeyError(idempotency_key)
+            if model.state not in {
+                BrokerOrderStatus.CREATED,
+                BrokerOrderStatus.DISPATCH_PENDING,
+                BrokerOrderStatus.SUBMITTING,
+                BrokerOrderStatus.SUBMITTED,
+                BrokerOrderStatus.ACCEPTED,
+                BrokerOrderStatus.PARTIALLY_FILLED,
+                BrokerOrderStatus.UNCERTAIN,
+            } or model.terminal_at is not None:
+                return None
+            created_at = floor_utc_millisecond(model.created_at)
+            if created_at is None or not is_historical(created_at, expired_at):
+                return None
+            from_state = model.state
+            validate_order_transition(
+                from_state,
+                BrokerOrderStatus.FAILED,
+                finalized=False,
+                policy_expired=True,
+            )
+            model.state = BrokerOrderStatus.FAILED
+            model.updated_at = expired_at
+            model.strategy_snapshot = {
+                **model.strategy_snapshot,
+                _AGE_POLICY_MARKER: {
+                    "version": _AGE_POLICY_VERSION,
+                    "expired_at": expired_at.isoformat(timespec="milliseconds"),
+                },
+            }
+            session.flush()
+            self._append_order_state_fact(
+                session,
+                model,
+                from_state=from_state,
+                occurred_at=expired_at,
+                safe_reason=_AGE_POLICY_REASON,
+                safe_message=_AGE_POLICY_MESSAGE,
+            )
+            return self._intent_record(model)
+
     def _append_order_state_fact(
         self,
         session: Session,
@@ -1855,6 +2354,8 @@ class LocalAutomationRepository:
         include_position_cycle: bool = True,
         fact_instrument_id: str | None = None,
         pre_rpc_abort_proof: PreRpcAbortProof | None = None,
+        safe_reason: str | None = None,
+        safe_message: str = "Broker order state changed",
     ) -> None:
         cached = session.get(CachedAutomationModel, intent.automation_id)
         decision = session.scalar(
@@ -1896,25 +2397,90 @@ class LocalAutomationRepository:
                 updated_at=intent.updated_at,
                 from_state=FactBrokerOrderStatus(from_state),
                 to_state=FactBrokerOrderStatus(intent.state),
-                safe_reason=intent.state,
-                safe_message="Broker order state changed",
+                safe_reason=safe_reason or intent.state,
+                safe_message=safe_message,
                 occurred_at=occurred_at,
                 created_at=intent.created_at,
                 pre_rpc_abort_proof=pre_rpc_abort_proof,
             ),
-            safe_message="Broker order state changed",
+            safe_message=safe_message,
             occurred_at=occurred_at,
         )
 
     def get_active_intent(self, automation_id: str) -> LocalIntentRecord | None:
         with self._factory() as session:
+            cached_state = session.scalar(
+                select(CachedAutomationModel.state).where(CachedAutomationModel.automation_id == automation_id)
+            )
             model = session.scalar(
-                select(LocalIntentModel).where(
+                select(LocalIntentModel)
+                .where(
                     LocalIntentModel.automation_id == automation_id,
-                    self._active_intent_predicate(),
+                    self._active_intent_predicate(
+                        include_policy_expired=cached_state == AutomationState.HOLD.value
+                    ),
                 )
+                .order_by(LocalIntentModel.created_at.desc())
             )
             return None if model is None else self._intent_record(model)
+
+    def list_policy_expired_unconfirmed(
+        self,
+        automation_ids: tuple[str, ...],
+        *,
+        now: datetime,
+        limit: int = 100,
+        after: tuple[datetime, str] | None = None,
+    ) -> tuple[LocalIntentRecord, ...]:
+        """Return a scoped keyset batch for exact-key recovery, never dispatch."""
+        if limit <= 0 or not automation_ids:
+            return ()
+        now = floor_utc_millisecond(now)
+        if now is None:
+            raise ValueError("Age-policy recovery time must be an aware UTC datetime.")
+        marker_version = func.json_extract(LocalIntentModel.strategy_snapshot, "$._age_policy.version")
+        marker_expired_at = func.json_extract(LocalIntentModel.strategy_snapshot, "$._age_policy.expired_at")
+        valid_marker = and_(
+            func.json_type(LocalIntentModel.strategy_snapshot, "$._age_policy.version") == "integer",
+            marker_version == _AGE_POLICY_VERSION,
+            func.json_type(LocalIntentModel.strategy_snapshot, "$._age_policy.expired_at") == "text",
+            func.length(marker_expired_at) == 29,
+            marker_expired_at.like("____-__-__T__:__:__.___+00:00"),
+            func.julianday(marker_expired_at).is_not(None),
+            func.julianday(marker_expired_at) - func.julianday(LocalIntentModel.created_at) > 1,
+            func.julianday(marker_expired_at) <= func.julianday(now),
+        )
+        conditions = [
+            LocalIntentModel.state == BrokerOrderStatus.FAILED,
+            LocalIntentModel.terminal_at.is_(None),
+            LocalIntentModel.automation_id.in_(automation_ids),
+            valid_marker,
+        ]
+        if after is not None:
+            cursor_at = floor_utc_millisecond(after[0])
+            if cursor_at is None:
+                raise ValueError("Age-policy recovery cursor must be an aware UTC datetime.")
+            conditions.append(
+                or_(
+                    LocalIntentModel.created_at > cursor_at,
+                    and_(
+                        LocalIntentModel.created_at == cursor_at,
+                        LocalIntentModel.idempotency_key > after[1],
+                    ),
+                )
+            )
+        with self._factory() as session:
+            rows = session.scalars(
+                select(LocalIntentModel)
+                .where(*conditions)
+                .order_by(LocalIntentModel.created_at, LocalIntentModel.idempotency_key)
+                .limit(limit)
+            )
+            return tuple(
+                self._intent_record(item)
+                for item in rows
+                if self._has_valid_age_policy_marker(item, now=now)
+            )
 
     def get_latest_intent(self, automation_id: str) -> LocalIntentRecord | None:
         with self._factory() as session:
@@ -1924,6 +2490,11 @@ class LocalAutomationRepository:
                 .order_by(LocalIntentModel.created_at.desc())
                 .limit(1)
             )
+            return None if model is None else self._intent_record(model)
+
+    def get_intent(self, idempotency_key: str) -> LocalIntentRecord | None:
+        with self._factory() as session:
+            model = session.get(LocalIntentModel, idempotency_key)
             return None if model is None else self._intent_record(model)
 
     def has_active_intents(self) -> bool:
@@ -1940,12 +2511,19 @@ class LocalAutomationRepository:
     ) -> tuple[ActiveBuyIntentReservation, ...]:
         with self._factory() as session:
             query = (
-                select(LocalIntentModel, CachedAutomationModel, TradeDecisionModel.estimated_commission)
+                select(
+                    LocalIntentModel,
+                    CachedAutomationModel,
+                    TradeDecisionModel.estimated_commission,
+                )
                 .join(
                     CachedAutomationModel,
                     CachedAutomationModel.automation_id == LocalIntentModel.automation_id,
                 )
-                .outerjoin(TradeDecisionModel, TradeDecisionModel.intent_id == LocalIntentModel.idempotency_key)
+                .outerjoin(
+                    TradeDecisionModel,
+                    TradeDecisionModel.intent_id == LocalIntentModel.idempotency_key,
+                )
                 .where(
                     LocalIntentModel.side == "BUY",
                     self._active_intent_predicate(),
@@ -2050,7 +2628,10 @@ class LocalAutomationRepository:
                     # Hydration may predate a fill. Read the authoritative LIFO ledger
                     # in this transaction instead of publishing its stale quantities.
                     snapshot = self._stored_position_snapshot(
-                        session, item.automation_id, lot_size=item.lot_size, mark_price=item.best_bid
+                        session,
+                        item.automation_id,
+                        lot_size=item.lot_size,
+                        mark_price=item.best_bid,
                     )
                     if int(snapshot["quantity_lots"]) > 0:
                         self._append_cycle_fact(
@@ -2120,7 +2701,7 @@ class LocalAutomationRepository:
                     payload=TradeDecisionRecordedPayload(
                         decision_id=UUID(decision_model.id),
                         process_id=UUID(item.process_id) if item.process_id else None,
-                        position_cycle_id=UUID(cached.position_cycle_id) if cached.position_cycle_id else None,
+                        position_cycle_id=(UUID(cached.position_cycle_id) if cached.position_cycle_id else None),
                         instrument_id=UUID(cached.fact_instrument_id),
                         quantity_lots=item.quantity_lots,
                         lot_size=item.lot_size,
@@ -2186,7 +2767,13 @@ class LocalAutomationRepository:
         """Apply an observation only while its original cycle is still current."""
         if item.cycle_state is None:
             return True
-        fields = ("pending_low", "last_buy_candle_at", "sell_armed", "last_sell_price", "updated_at")
+        fields = (
+            "pending_low",
+            "last_buy_candle_at",
+            "sell_armed",
+            "last_sell_price",
+            "updated_at",
+        )
         values = {field: item.cycle_state[field] for field in fields}
         cycle = session.get(TradingCycleStateModel, item.automation_id)
         if cycle is None:
@@ -2294,6 +2881,132 @@ class LocalAutomationRepository:
                 .order_by(TradeLotModel.opened_at.desc(), TradeLotModel.id.desc())
             ).all()
             return [self._lot_record(row, intent_kind) for row, intent_kind in rows]
+
+    def execution_commission_candidates(
+        self,
+        scopes: list[tuple[str, str, str]],
+        *,
+        limit: int = 100,
+    ) -> list[tuple[str, str, str, str]]:
+        """Choose the fairest open-lot fee batch within the active command scopes."""
+        if not scopes:
+            return []
+        if not 1 <= limit <= 100:
+            raise ValueError("Commission batch limit must be between 1 and 100.")
+        broker_by_automation = {automation_id: broker_id for automation_id, broker_id, _ in scopes}
+        currency_by_automation = {automation_id: currency.upper() for automation_id, _, currency in scopes}
+        scope_by_automation = {
+            automation_id: (broker_by_automation[automation_id], currency_by_automation[automation_id])
+            for automation_id, _, _ in scopes
+        }
+        with self._factory() as session:
+            rows = session.execute(
+                select(
+                    TradeLotModel.automation_id,
+                    TradeLotModel.source_intent_id,
+                    case(broker_by_automation, value=TradeLotModel.automation_id),
+                    case(currency_by_automation, value=TradeLotModel.automation_id),
+                    ExecutionCommissionCacheModel.last_checked_at,
+                )
+                .outerjoin(
+                    ExecutionCommissionCacheModel,
+                    and_(
+                        ExecutionCommissionCacheModel.automation_id == TradeLotModel.automation_id,
+                        ExecutionCommissionCacheModel.source_intent_id == TradeLotModel.source_intent_id,
+                        ExecutionCommissionCacheModel.user_broker_id
+                        == case(broker_by_automation, value=TradeLotModel.automation_id),
+                        ExecutionCommissionCacheModel.currency
+                        == case(currency_by_automation, value=TradeLotModel.automation_id),
+                    ),
+                )
+                .where(
+                    TradeLotModel.automation_id.in_(tuple(scope_by_automation)),
+                    TradeLotModel.remaining_lots > 0,
+                    TradeLotModel.source_intent_id.is_not(None),
+                )
+                .distinct()
+                .order_by(
+                    ExecutionCommissionCacheModel.last_checked_at.asc().nulls_first(),
+                    TradeLotModel.source_intent_id,
+                    TradeLotModel.automation_id,
+                )
+                .limit(limit)
+            ).all()
+            return [
+                (automation_id, source_id, broker_id, currency)
+                for automation_id, source_id, broker_id, currency, _ in rows
+                if source_id is not None and broker_id is not None and currency is not None
+            ]
+
+    def execution_commission_cache(
+        self,
+        scopes: list[tuple[str, str, str, str]],
+    ) -> dict[tuple[str, str], dict[str, object]]:
+        if not scopes:
+            return {}
+        predicates = [
+            and_(
+                ExecutionCommissionCacheModel.automation_id == automation_id,
+                ExecutionCommissionCacheModel.source_intent_id == source_id,
+                ExecutionCommissionCacheModel.user_broker_id == broker_id,
+                ExecutionCommissionCacheModel.currency == currency.upper(),
+            )
+            for automation_id, source_id, broker_id, currency in scopes
+        ]
+        with self._factory() as session:
+            rows = session.scalars(select(ExecutionCommissionCacheModel).where(or_(*predicates))).all()
+            return {
+                (row.automation_id, row.source_intent_id): {
+                    "user_broker_id": row.user_broker_id,
+                    "currency": row.currency,
+                    "commission_status": row.commission_status,
+                    "effective_broker_commission": row.effective_broker_commission,
+                }
+                for row in rows
+            }
+
+    def save_execution_commission_statuses(
+        self,
+        updates: list[tuple[str, str, str, str, str, Decimal | None]],
+        *,
+        checked_at: datetime,
+    ) -> None:
+        """Atomically store a complete checked batch and preserve its trusted high-water values."""
+        with self._factory.begin() as session:
+            for automation_id, source_id, broker_id, currency, status, amount in updates:
+                if status not in {"KNOWN", "MISSING", "UNKNOWN"}:
+                    raise ValueError("Invalid execution commission status.")
+                row = session.get(
+                    ExecutionCommissionCacheModel,
+                    (automation_id, source_id, broker_id, currency.upper()),
+                )
+                previous = None if row is None else row.effective_broker_commission
+                if status == "KNOWN" and amount is None:
+                    raise ValueError("Known execution commission requires an amount.")
+                if previous is not None and amount is not None and amount < previous:
+                    amount = previous
+                    if status == "KNOWN":
+                        status = "UNKNOWN"
+                elif previous is not None and amount is None:
+                    amount = previous
+                values = {
+                    "effective_broker_commission": amount,
+                    "commission_status": status,
+                    "last_checked_at": checked_at,
+                }
+                if row is None:
+                    session.add(
+                        ExecutionCommissionCacheModel(
+                            automation_id=automation_id,
+                            source_intent_id=source_id,
+                            user_broker_id=broker_id,
+                            currency=currency.upper(),
+                            **values,
+                        )
+                    )
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
 
     def realized_pnl(self, automation_id: str) -> Decimal:
         with self._factory() as session:
@@ -2463,6 +3176,38 @@ class LocalAutomationRepository:
             created_at=model.created_at,
             updated_at=model.updated_at,
             strategy_snapshot=deepcopy(model.strategy_snapshot),
+        )
+
+    @staticmethod
+    def _has_valid_age_policy_marker(intent: LocalIntentModel, *, now: datetime) -> bool:
+        marker = intent.strategy_snapshot.get(_AGE_POLICY_MARKER)
+        if (
+            intent.state != BrokerOrderStatus.FAILED
+            or intent.terminal_at is not None
+            or not isinstance(marker, dict)
+            or set(marker) != {"version", "expired_at"}
+            or type(marker.get("version")) is not int
+            or marker["version"] != _AGE_POLICY_VERSION
+            or not isinstance(marker.get("expired_at"), str)
+        ):
+            return False
+        try:
+            expired_at = datetime.fromisoformat(marker["expired_at"])
+        except ValueError:
+            return False
+        if (
+            expired_at.tzinfo is None
+            or expired_at.utcoffset() != timedelta(0)
+            or expired_at.isoformat(timespec="milliseconds") != marker["expired_at"]
+        ):
+            return False
+        created_at = floor_utc_millisecond(intent.created_at)
+        captured_at = floor_utc_millisecond(now)
+        return (
+            created_at is not None
+            and captured_at is not None
+            and expired_at <= captured_at
+            and is_historical(created_at, expired_at)
         )
 
     @staticmethod

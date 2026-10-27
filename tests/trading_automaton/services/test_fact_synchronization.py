@@ -5,6 +5,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest
+from sqlalchemy import select
 
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import (
@@ -18,9 +19,13 @@ from sentinel_contracts.trading_facts import (
     FactIngressErrorCode,
 )
 from tests.contracts.trading_facts_helpers import all_envelopes
+from tests.trading_automaton.command_factory import decision_item
+from tests.trading_automaton.storage.worker_storage_helpers import NOW as WORKER_NOW
+from tests.trading_automaton.storage.worker_storage_helpers import baseline_command, filled_buy
 from trading_automaton.domain.errors import CoreOperationError
 from trading_automaton.domain.storage_dtos import FactOutboxRecord
 from trading_automaton.services.fact_synchronization import FactSynchronizationService
+from trading_automaton.storage.models import CachedAutomationModel, FactOutboxModel
 
 NOW = datetime(2026, 8, 13, 12, tzinfo=UTC)
 
@@ -68,10 +73,43 @@ class RepositoryStub:
         self.rejected: list[tuple[str, tuple[str, ...], str]] = []
         self.reconciled: list[tuple[str, str, int, int, int, Decimal | None]] = []
         self.holds: list[tuple[str | None, str]] = []
+        self.recovery_requests: list[AutomationCommand] = []
+        self.recovery_reconciliations: list[
+            tuple[str, AutomationState | None, int | None, int | None, bool | None]
+        ] = []
+        self.recovery_rebase_permissions: list[bool] = []
+        self.recovery_result: bool | None = None
 
     def cache_command(self, command: AutomationCommand) -> bool:
         self.cached.append(command)
         return True
+
+    def consume_recovery_resume(self, command: AutomationCommand, *, occurred_at: datetime) -> AutomationCommand | None:
+        self.recovery_requests.append(command)
+        return command.model_copy(
+            update={
+                "state": AutomationState.IN_QUEUE,
+                "revision": command.revision + 1,
+                "last_sequence_number": command.last_sequence_number + 1,
+            }
+        )
+
+    def reconcile_recovery_resume_outbox(
+        self,
+        automation_id: str,
+        *,
+        state: AutomationState | None,
+        revision: int | None,
+        last_sequence_number: int | None,
+        resume_requested: bool | None,
+        user_broker_id: str | None = None,
+        allow_financial_rebase: bool = False,
+    ) -> bool | None:
+        self.recovery_reconciliations.append(
+            (automation_id, state, revision, last_sequence_number, resume_requested)
+        )
+        self.recovery_rebase_permissions.append(allow_financial_rebase)
+        return self.recovery_result
 
     def ready_fact_outbox(self, limit: int, *, now: datetime, deadline_ms: int) -> list[FactOutboxRecord]:
         return [row for row in self.rows if row.next_retry_at is None or row.next_retry_at <= now][:limit]
@@ -129,13 +167,15 @@ class RepositoryStub:
 
 
 class ClientStub:
-    def __init__(self, *outcomes: FactBatchResult | Exception) -> None:
+    def __init__(self, *outcomes: FactBatchResult | Exception, commands=(), statuses=None) -> None:
         self.outcomes = list(outcomes)
+        self.commands = list(commands)
+        self.statuses = statuses
         self.published: list[list[FactEnvelope]] = []
         self.status_batches: list[tuple[UUID, ...]] = []
 
     def claim_commands(self, worker_id: str, limit: int) -> list[AutomationCommand]:
-        return []
+        return self.commands[:limit]
 
     def publish_facts(self, facts: list[FactEnvelope]) -> FactBatchResult:
         self.published.append(facts)
@@ -146,6 +186,8 @@ class ClientStub:
 
     def automation_statuses(self, automation_ids: list[UUID]) -> AutomationStatusesResult:
         self.status_batches.append(tuple(automation_ids))
+        if self.statuses is not None:
+            return self.statuses
         first = all_envelopes()[0]
         return AutomationStatusesResult(
             automations=(
@@ -235,6 +277,164 @@ def test_non_retryable_failure_reconciles_without_acknowledging_failed_rows() ->
     ]
     assert repository.reconciled == [(failed.automation_id, "HOLD", 4, 7, 2, Decimal("10"))]
     assert client.status_batches == [(UUID(failed.automation_id),)]
+    assert repository.recovery_reconciliations == [
+        (failed.automation_id, AutomationState.HOLD, 4, 7, False)
+    ]
+    assert repository.recovery_rebase_permissions == [True]
+
+
+def test_non_revision_conflict_never_enables_financial_rebase() -> None:
+    failed = row(0)
+    result = FactBatchResult(
+        results=(),
+        failures=(
+            FactGroupFailure(
+                automation_id=UUID(failed.automation_id),
+                code=FactIngressErrorCode.INVALID_FACT_STATE,
+                event_ids=(UUID(failed.event_id),),
+                sequence_numbers=(failed.sequence_number,),
+                retryable=False,
+            ),
+        ),
+    )
+    repository = RepositoryStub([failed])
+    service = FactSynchronizationService(
+        repository,
+        ClientStub(result),
+        now=lambda: NOW,
+        sleep=lambda _delay: None,
+        deadline_ms=0,
+    )
+
+    assert service.flush_outbox() is True
+    assert repository.recovery_rebase_permissions == [False]
+
+
+def test_recovery_resume_claim_only_writes_queue_proposal_without_returning_activation_command() -> None:
+    incoming = row(0)
+    command = AutomationCommand.model_validate(
+        {
+            "automation_id": incoming.automation_id,
+            "user_broker_id": incoming.user_broker_id,
+            "broker_id": str(UUID(int=703)),
+            "account_id": "account",
+            "external_instrument_id": "instrument",
+            "instrument_id": str(UUID(int=704)),
+            "currency": "RUB",
+            "lot_size": 1,
+            "min_price_increment": "0.01",
+            "state": "HOLD",
+            "revision": 4,
+            "last_sequence_number": 7,
+            "resume_requested": True,
+        }
+    )
+    repository = RepositoryStub([])
+    service = FactSynchronizationService(
+        repository,
+        ClientStub(commands=[command]),
+        now=lambda: NOW,
+        sleep=lambda _delay: None,
+    )
+
+    claimed = service.claim_commands("worker", 10)
+
+    assert claimed == []
+    assert repository.cached == []
+    assert repository.recovery_requests == [command]
+
+
+def test_recovery_resume_cancellation_with_unknown_boundary_blocks_without_rejecting() -> None:
+    failed = row(0)
+    result = FactBatchResult(
+        results=(),
+        failures=(
+            FactGroupFailure(
+                automation_id=UUID(failed.automation_id),
+                code=FactIngressErrorCode.AUTOMATION_REVISION_CONFLICT,
+                event_ids=(UUID(failed.event_id),),
+                sequence_numbers=(failed.sequence_number,),
+                retryable=False,
+            ),
+        )
+    )
+    repository = RepositoryStub([failed])
+    repository.recovery_result = False
+    client = ClientStub(result, statuses=AutomationStatusesResult(automations=()))
+    service = FactSynchronizationService(
+        repository,
+        client,
+        now=lambda: NOW,
+        sleep=lambda _delay: None,
+        deadline_ms=0,
+    )
+
+    assert service.flush_outbox() is False
+    assert repository.rejected == []
+    assert repository.holds == []
+    assert repository.recovery_reconciliations == [(failed.automation_id, None, None, None, None)]
+
+
+def test_revision_conflict_before_resume_claim_rebases_real_financial_graph(
+    worker_repository_factory,
+) -> None:
+    repo, factory = worker_repository_factory()
+    command = baseline_command()
+    automation_id = str(command.automation_id)
+    repo.cache_command(command)
+    repo.save_decision_batch((decision_item(command),), occurred_at=WORKER_NOW)
+    repo.finalize_execution(filled_buy())
+    with factory.begin() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        cached.state = AutomationState.HOLD.value
+        cached.resume_requested = False
+    pending = repo.ready_fact_outbox(100, now=WORKER_NOW + timedelta(minutes=1), deadline_ms=0)
+    assert len(pending) >= 5
+    result = FactBatchResult(
+        results=(),
+        failures=(
+            FactGroupFailure(
+                automation_id=command.automation_id,
+                code=FactIngressErrorCode.AUTOMATION_REVISION_CONFLICT,
+                event_ids=tuple(UUID(item.event_id) for item in pending),
+                sequence_numbers=tuple(item.sequence_number for item in pending),
+                retryable=False,
+            ),
+        )
+    )
+    status = AutomationStatus(
+        automation_id=command.automation_id,
+        user_broker_id=command.user_broker_id,
+        state=AutomationState.HOLD,
+        revision=command.revision + 1,
+        last_sequence_number=0,
+        resume_requested=False,
+    )
+    client = ClientStub(result, statuses=AutomationStatusesResult(automations=(status,)))
+    service = FactSynchronizationService(
+        repo,
+        client,
+        now=lambda: WORKER_NOW + timedelta(minutes=1),
+        sleep=lambda _delay: None,
+        deadline_ms=0,
+    )
+
+    assert service.flush_outbox() is True
+    rebased = repo.ready_fact_outbox(100, now=WORKER_NOW + timedelta(minutes=2), deadline_ms=0)
+    assert [item.sequence_number for item in rebased] == list(range(1, len(pending) + 1))
+    assert [item.event_id for item in rebased] == [item.event_id for item in pending]
+    assert [item.payload for item in rebased] == [item.payload for item in pending]
+    assert {item.expected_revision for item in rebased} == {status.revision}
+    with factory() as session:
+        cached = session.get_one(CachedAutomationModel, automation_id)
+        assert cached.state == AutomationState.HOLD.value
+        assert cached.resume_requested is False
+        assert session.scalar(
+            select(FactOutboxModel.event_id).where(
+                FactOutboxModel.automation_id == automation_id,
+                FactOutboxModel.safe_message == "Automation resumed after technical recovery",
+            )
+        ) is None
 
 
 def test_retries_byte_equivalent_batch_on_transport_failure() -> None:

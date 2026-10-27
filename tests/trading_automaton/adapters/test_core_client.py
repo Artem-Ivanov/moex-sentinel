@@ -24,6 +24,7 @@ from sentinel_contracts.trading_facts import (
     FactBatchResult,
 )
 from sentinel_contracts.version import SERVICE_VERSION
+from sentinel_contracts.worker_diagnostics import WorkerDiagnostics, WorkerExecutionDiagnostics
 from tests.contracts.trading_facts_helpers import all_envelopes
 from tests.services.test_runtime_versions import NOW, progress
 from trading_automaton.adapters.core_client import CoreClient
@@ -115,6 +116,72 @@ def test_exposes_http_conflicts_without_transport_retry() -> None:
     assert attempts == 1
 
 
+@pytest.mark.parametrize("marker", [None, "v2", ""])
+def test_heartbeat_omits_execution_diagnostics_without_v1_capability(marker) -> None:
+    heartbeat_bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/internal/runtime":
+            config = {"environment": "TEST", "access_mode": "READ_ONLY"}
+            if marker is not None:
+                config["execution_diagnostics"] = marker
+            return httpx.Response(200, json=config)
+        if request.url.path.endswith("/heartbeats"):
+            heartbeat_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"Unexpected route: {request.url.path}")
+
+    diagnostics = WorkerDiagnostics(
+        completed_iterations=0,
+        last_completed_at=None,
+        last_finished_at=datetime(2026, 10, 20, tzinfo=UTC),
+        last_result="OUTBOX_BLOCKED",
+        outbox={"reason": "READ_FAILED"},
+        execution_diagnostics=WorkerExecutionDiagnostics(reason="UNCONFIGURED_BROKER"),
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://core:8000") as http:
+        CoreClient(
+            http,
+            application_environment="TEST",
+            access_mode="READ_ONLY",
+        ).heartbeat("worker", datetime(2026, 10, 20, tzinfo=UTC), diagnostics)
+
+    assert len(heartbeat_bodies) == 1
+    assert "execution_diagnostics" not in heartbeat_bodies[0]["worker_diagnostics"]
+
+
+def test_heartbeat_sends_execution_diagnostics_when_core_advertises_v1() -> None:
+    heartbeat_bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/internal/runtime":
+            return httpx.Response(
+                200,
+                json={"environment": "TEST", "access_mode": "READ_ONLY", "execution_diagnostics": "v1"},
+            )
+        if request.url.path.endswith("/heartbeats"):
+            heartbeat_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"Unexpected route: {request.url.path}")
+
+    diagnostics = WorkerDiagnostics(
+        completed_iterations=0,
+        last_completed_at=None,
+        last_finished_at=datetime(2026, 10, 20, tzinfo=UTC),
+        last_result="OUTBOX_BLOCKED",
+        outbox={"reason": "READ_FAILED"},
+        execution_diagnostics=WorkerExecutionDiagnostics(reason="UNCONFIGURED_BROKER"),
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://core:8000") as http:
+        CoreClient(
+            http,
+            application_environment="TEST",
+            access_mode="READ_ONLY",
+        ).heartbeat("worker", datetime(2026, 10, 20, tzinfo=UTC), diagnostics)
+
+    assert heartbeat_bodies[0]["worker_diagnostics"]["execution_diagnostics"]["reason"] == "UNCONFIGURED_BROKER"
+
+
 def test_keeps_required_heartbeat_and_broker_connection_routes() -> None:
     requests: list[httpx.Request] = []
 
@@ -146,7 +213,6 @@ def test_keeps_required_heartbeat_and_broker_connection_routes() -> None:
 
 
 def test_heartbeat_uses_stable_instance_and_actual_shared_version():
-
     bodies = []
 
     def handle(request):
@@ -372,12 +438,15 @@ def test_prod_pending_registration_retries_same_identity_until_owner() -> None:
             worker_token="a" * 64,
         )
         first_instance = client.runtime_instance_id
+        assert client.runtime_generation is None
         with pytest.raises(CoreOperationError) as pending:
             client.heartbeat("worker-pending", NOW)
+        assert client.runtime_generation is None
         client.broker_connection(str(broker_id))
 
     registrations_seen = [request for request in requests if request.url.path.endswith("/runtime-instances")]
     assert len(registrations_seen) == 2
+    assert client.runtime_generation == 2
     assert pending.value.retryable is True
     assert [json.loads(request.content)["runtime_instance_id"] for request in registrations_seen] == [
         str(first_instance),

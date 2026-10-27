@@ -47,6 +47,12 @@ class RecoveringSource:
             item["market"]["order_book"]["captured_at"] += shift
             if value.external_instrument_id in stale:
                 item["market"]["order_book"]["captured_at"] -= timedelta(milliseconds=2001)
+            else:
+                item["market"]["api_trading_status"] = {
+                    "api_trade_available": True,
+                    "observed_at": self.clock[0],
+                    "expires_at": self.clock[0] + timedelta(seconds=30),
+                }
             for candle in item["candles"]:
                 candle["started_at"] += self.clock[0].replace(second=0, microsecond=0) - NOW
                 candle["captured_at"] += shift

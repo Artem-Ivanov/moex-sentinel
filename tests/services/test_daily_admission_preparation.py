@@ -399,6 +399,7 @@ def test_prepare_daily_revalidates_after_canary_preview(monkeypatch) -> None:
     repository = SimpleNamespace(
         get_scope=lambda _broker_id: ("synthetic-account", "PROD"),
         get_view=lambda _broker_id, *, now: view,
+        needs_age_policy_recovery=lambda _broker_id: False,
     )
     connection = BrokerConnection(
         broker_id=broker_id,

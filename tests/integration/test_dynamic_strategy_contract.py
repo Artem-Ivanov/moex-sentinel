@@ -45,6 +45,11 @@ class Generations(Source):
         self.generation += 1
         self.clock[0] = NOW + timedelta(minutes=self.generation)
         item = instrument()
+        item["market"]["api_trading_status"] = {
+            "api_trade_available": True,
+            "observed_at": self.clock[0],
+            "expires_at": self.clock[0] + timedelta(seconds=30),
+        }
         item["market"]["order_book"]["captured_at"] = self.clock[0]
         item["market"]["order_book"]["bids"][0]["price"] = bid
         item["market"]["order_book"]["asks"][0]["price"] = ask

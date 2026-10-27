@@ -114,6 +114,31 @@ def test_converts_consistent_order_book_response() -> None:
     assert events[0].best_ask.price == Decimal("100.1")
 
 
+def test_stream_trading_status_does_not_invent_api_trade_availability() -> None:
+    response = SimpleNamespace(
+        orderbook=None,
+        last_price=None,
+        trading_status=SimpleNamespace(
+            instrument_uid="i1",
+            trading_status="NORMAL_TRADING",
+            limit_order_available_flag=True,
+            time=NOW,
+        ),
+        candle=None,
+    )
+
+    async def scenario():
+        adapter = TInvestStreamingAdapter(FakeManager((response,)))
+        return [item async for item in adapter.events()]
+
+    (event,) = asyncio.run(scenario())
+
+    assert event.instrument_id == "i1"
+    assert event.limit_order_available is True
+    assert event.captured_at == NOW
+    assert not hasattr(event, "api_trade_available")
+
+
 def test_close_stops_stream_manager() -> None:
     manager = FakeManager()
     adapter = TInvestStreamingAdapter(manager)

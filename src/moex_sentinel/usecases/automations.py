@@ -7,6 +7,7 @@ from functools import partial
 from typing import Protocol
 
 from moex_sentinel.domain.automations import (
+    DecisionReasonsSnapshot,
     PositionDetailsError,
     TradingAutomationDetails,
     TradingAutomationStatuses,
@@ -19,7 +20,9 @@ from moex_sentinel.domain.repository_records import AutomationRecord
 from moex_sentinel.services.automations import AutomationStateConflictError
 from moex_sentinel.services.environment import EnvironmentMismatchError
 from moex_sentinel.services.sync_execution import run_sync
+from moex_sentinel.services.trading_fact_ports import TradingFactsUnitOfWorkPort
 from moex_sentinel.usecases.errors import UseCaseError
+from sentinel_contracts.time import is_historical, utc_now_ms
 
 
 class AutomationServicePort(Protocol):
@@ -147,6 +150,26 @@ class ViewTradingAutomationUsecase:
             raise UseCaseError("AUTOMATION_REVISION_CONFLICT", "Автомат уже изменился.") from error
         except AutomationStateConflictError as error:
             raise UseCaseError("AUTOMATION_STATE_CONFLICT", "Действие недоступно в текущем состоянии.") from error
+
+
+class ViewTradingAutomationDecisionReasonsUsecase:
+    def __init__(
+        self,
+        automation_lookup: ViewTradingAutomationUsecase,
+        uow_factory: Callable[[], TradingFactsUnitOfWorkPort],
+    ) -> None:
+        self._automation_lookup = automation_lookup
+        self._uow_factory = uow_factory
+
+    def execute(self, automation_id: str, limit: int = 5) -> DecisionReasonsSnapshot:
+        automation = self._automation_lookup.execute(automation_id)
+        captured_at = utc_now_ms()
+        with self._uow_factory() as uow:
+            items = uow.audit.list_recent_decision_reasons(automation.broker_id, automation_id, limit)
+        items = tuple(
+            item.model_copy(update={"historical": is_historical(item.occurred_at, captured_at)}) for item in items
+        )
+        return DecisionReasonsSnapshot(captured_at=captured_at, items=items)
 
 
 class ViewTradingAutomationStatusesUsecase:

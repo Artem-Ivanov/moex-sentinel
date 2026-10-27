@@ -67,6 +67,7 @@ class ExternalOperation(PositionalModel):
     commission: Money | None
     instrument_id: str | None = None
     ticker: str | None = None
+    parent_operation_id: str | None = None
 
 
 class OperationsPage(PositionalModel):
@@ -128,3 +129,15 @@ class BrokerOperationsView(PositionalModel):
     model_config = ConfigDict(frozen=True)
     items: tuple[BrokerOperation, ...]
     errors: tuple[BrokerReadError, ...]
+
+
+class BrokerOperationsPageView(PositionalModel):
+    model_config = ConfigDict(frozen=True)
+    items: tuple[BrokerOperation, ...]
+    errors: tuple[BrokerReadError, ...]
+    input_cursor: str | None
+    next_cursor: str | None
+    source_item_count: int
+    selected_item_count: int
+    source_exhausted: bool | None
+    coverage_complete: bool

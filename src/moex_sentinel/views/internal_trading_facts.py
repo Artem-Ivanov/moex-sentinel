@@ -38,15 +38,21 @@ async def claim_automation_commands(
 async def automation_statuses(
     payload: AutomationStatusesRequestSchema,
     request: Request,
-) -> AutomationStatusesResult:
+) -> AutomationStatusesResult | JSONResponse:
     principal = getattr(request.state, "worker_principal", None)
-    return await run_sync(
+    result = await run_sync(
         partial(
             _usecases(request).view_automation_statuses.execute,
             payload.automation_ids,
+            commission_order_ids=payload.commission_intent_ids,
             **({} if principal is None else {"broker_id": principal.broker_id}),
         )
     )
+    if not payload.commission_intent_ids:
+        return JSONResponse(
+            result.model_dump(mode="json", exclude={"commission_statuses"})
+        )
+    return result
 
 
 @router.post("/internal/automation-facts", response_model=FactBatchResult)

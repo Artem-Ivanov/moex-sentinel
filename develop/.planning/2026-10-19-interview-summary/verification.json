@@ -1,0 +1,13 @@
+{
+  "status": "PASS",
+  "document_sha256": "6e806d1002d4bbb2afd9780d7ec9999e7db7b133bf7052907d22e33952111097",
+  "python_syntax_blocks": 5,
+  "protocol_domain_checks": "PASS",
+  "amount_schema_checks": "PASS",
+  "rolling_window_checks": "PASS",
+  "yaml_blocks": 1,
+  "local_links_and_anchors": "PASS",
+  "ownership_diagram_check": "PASS",
+  "sql_executed": false,
+  "react_application_executed": false
+}

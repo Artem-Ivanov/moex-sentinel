@@ -10,7 +10,7 @@ from moex_sentinel.services.trading_readiness_alerts import (
     ReadinessObservation,
     TradingReadinessAlertService,
 )
-from sentinel_contracts.worker_diagnostics import OutboxObservation, WorkerObservation
+from sentinel_contracts.worker_diagnostics import BrokerRuntimeDiagnostics, OutboxObservation, WorkerObservation
 
 NOW = datetime(2026, 10, 14, 10, tzinfo=UTC)
 
@@ -63,6 +63,291 @@ def test_enabled_service_requires_a_transport():
         TradingReadinessAlertService(
             lambda: _resolved(observation()), None, environment="PROD", enabled=True, clock=lambda: NOW
         )
+
+
+def test_sustained_initial_broker_block_alerts_only_for_expected_work():
+    ticks = [0.0]
+    blocked = observation(
+        expected_work=True,
+        worker=WorkerObservation(
+            observation="OBSERVED",
+            status="DEGRADED",
+            reason="CONTROL_PROGRESS",
+            completed_iterations=1,
+            last_completed_at=NOW.isoformat(),
+            completion_age_ms=0,
+            last_finished_at=NOW.isoformat(),
+            last_result="COMPLETED",
+            outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+            broker_runtime=BrokerRuntimeDiagnostics(status="BLOCKED", reason="PERMANENT_BROKER_ERROR"),
+        ),
+    )
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(blocked),
+        transport,
+        environment="PROD",
+        enabled=True,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        first = await service.observe_once()
+        ticks[0] = 59
+        second = await service.observe_once()
+        ticks[0] = 60
+        third = await service.observe_once()
+        duplicate = await service.observe_once()
+        return first, second, third, duplicate
+
+    first, second, third, duplicate = asyncio.run(scenario())
+
+    assert first == second == duplicate == ()
+    assert third[0].signal == "BROKER_STARTUP_BLOCKED"
+    assert third[0].safe_reason == "PERMANENT_BROKER_ERROR"
+    assert len(transport.messages) == 1
+    assert "PERMANENT_BROKER_ERROR" in transport.messages[0]
+
+
+@pytest.mark.parametrize("expected_work", [False])
+def test_intentional_modes_do_not_alert_for_initial_broker_block(expected_work):
+    ticks = [0.0]
+    blocked = observation(
+        expected_work=expected_work,
+        worker=WorkerObservation(
+            observation="OBSERVED",
+            status="DEGRADED",
+            reason="CONTROL_PROGRESS",
+            outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+            broker_runtime=BrokerRuntimeDiagnostics(status="BLOCKED", reason="PERMANENT_BROKER_ERROR"),
+        ),
+    )
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(blocked),
+        transport,
+        environment="PROD",
+        enabled=True,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        for elapsed in (0, 60, 120):
+            ticks[0] = elapsed
+            await service.observe_once()
+
+    asyncio.run(scenario())
+
+    assert transport.messages == []
+
+
+def test_initial_expected_admission_block_alerts_even_after_broker_frame_is_ready():
+    ticks = [0.0]
+    denied = observation(
+        expected_work=True,
+        effective_denial_reasons=("LIMITS_NOT_CONFIGURED",),
+        account_effective_can_submit=False,
+        worker=WorkerObservation(
+            observation="OBSERVED",
+            status="OK",
+            reason="CONTROL_PROGRESS",
+            last_result="COMPLETED",
+            outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+            broker_runtime=BrokerRuntimeDiagnostics(
+                status="RUNNING",
+                decision_eligibility="READY",
+                reason="DECISION_FRAME_AVAILABLE",
+                last_started_at=NOW - timedelta(seconds=1),
+                last_finished_at=NOW,
+                last_success_at=NOW,
+            ),
+        ),
+    )
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(denied),
+        transport,
+        environment="PROD",
+        enabled=True,
+        startup_grace_seconds=60,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        await service.observe_once()
+        ticks[0] = 60
+        return await service.observe_once()
+
+    events = asyncio.run(scenario())
+
+    assert events[0].signal == "STARTUP_ADMISSION_BLOCKED"
+    assert events[0].safe_reason == "LIMITS_NOT_CONFIGURED"
+    assert len(transport.messages) == 1
+
+
+def test_market_and_intentional_admission_reasons_do_not_trigger_startup_block_alert():
+    ticks = [0.0]
+    denied = observation(
+        expected_work=True,
+        effective_denial_reasons=("STALE_MARKET", "DISARMED"),
+        account_effective_can_submit=False,
+    )
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(denied),
+        transport,
+        environment="PROD",
+        enabled=True,
+        startup_grace_seconds=10,
+        control_confirmation_seconds=10,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        for tick in (0, 10, 20):
+            ticks[0] = tick
+            await service.observe_once()
+
+    asyncio.run(scenario())
+
+    assert transport.messages == []
+
+
+def test_account_view_failure_does_not_recover_admission_alert_but_definite_view_does():
+    ticks = [0.0]
+    current = [
+        observation(
+            expected_work=True,
+            effective_denial_reasons=("LIMITS_NOT_CONFIGURED",),
+            account_effective_can_submit=False,
+        )
+    ]
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(current[0]),
+        transport,
+        environment="PROD",
+        enabled=True,
+        startup_grace_seconds=10,
+        control_confirmation_seconds=10,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        await service.observe_once()
+        ticks[0] = 10
+        active = await service.observe_once()
+        current[0] = observation(
+            captured_at=NOW + timedelta(seconds=11),
+            expected_work=True,
+            account_status="UNKNOWN",
+            account_effective_can_submit=None,
+            effective_denial_reasons=(),
+        )
+        ticks[0] = 11
+        unavailable = await service.observe_once()
+        current[0] = observation(
+            captured_at=NOW + timedelta(seconds=12),
+            expected_work=True,
+            account_status="ARMED",
+            account_effective_can_submit=True,
+            effective_denial_reasons=(),
+        )
+        ticks[0] = 12
+        recovered = await service.observe_once()
+        return active, unavailable, recovered
+
+    active, unavailable, recovered = asyncio.run(scenario())
+
+    assert active[0].signal == "STARTUP_ADMISSION_BLOCKED"
+    assert not any(event.state == "RECOVERED" for event in unavailable)
+    assert [event.signal for event in recovered if event.state == "RECOVERED"] == ["STARTUP_ADMISSION_BLOCKED"]
+    assert len(transport.messages) == 2
+
+
+@pytest.mark.parametrize(
+    "broker_runtime",
+    [
+        BrokerRuntimeDiagnostics(reason="STALE"),
+        BrokerRuntimeDiagnostics(reason="NOT_OBSERVED"),
+    ],
+)
+def test_stale_or_missing_broker_observation_does_not_recover_startup_alert(broker_runtime):
+    ticks = [0.0]
+    current = [
+        observation(
+            expected_work=True,
+            worker=WorkerObservation(
+                observation="OBSERVED",
+                status="DEGRADED",
+                reason="CONTROL_PROGRESS",
+                outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+                broker_runtime=BrokerRuntimeDiagnostics(status="BLOCKED", reason="PERMANENT_BROKER_ERROR"),
+            ),
+        )
+    ]
+    transport = Transport()
+    service = TradingReadinessAlertService(
+        lambda: _resolved(current[0]),
+        transport,
+        environment="PROD",
+        enabled=True,
+        startup_grace_seconds=10,
+        control_confirmation_seconds=10,
+        clock=lambda: NOW,
+        monotonic_clock=lambda: ticks[0],
+    )
+
+    async def scenario():
+        await service.observe_once()
+        ticks[0] = 10
+        await service.observe_once()
+        current[0] = observation(
+            captured_at=NOW + timedelta(seconds=11),
+            expected_work=True,
+            worker=WorkerObservation(
+                observation="OBSERVED",
+                status="OK",
+                reason="CONTROL_PROGRESS",
+                outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+                broker_runtime=broker_runtime,
+            ),
+        )
+        ticks[0] = 11
+        stale_events = await service.observe_once()
+        current[0] = observation(
+            captured_at=NOW + timedelta(seconds=12),
+            expected_work=True,
+            worker=WorkerObservation(
+                observation="OBSERVED",
+                status="OK",
+                reason="CONTROL_PROGRESS",
+                completed_iterations=1,
+                last_completed_at=(NOW + timedelta(seconds=12)).isoformat(),
+                outbox=OutboxObservation(observation="OBSERVED", status="OK", reason="CLEAR"),
+                broker_runtime=BrokerRuntimeDiagnostics(
+                    status="RUNNING",
+                    reason="NO_DECISION_FRAME",
+                    decision_eligibility="NOT_READY",
+                    last_started_at=NOW + timedelta(seconds=11),
+                    last_finished_at=NOW + timedelta(seconds=12),
+                    last_success_at=NOW + timedelta(seconds=12),
+                ),
+            ),
+        )
+        ticks[0] = 12
+        recovered_events = await service.observe_once()
+        return stale_events, recovered_events
+
+    stale_events, recovered_events = asyncio.run(scenario())
+
+    assert not any(event.state == "RECOVERED" for event in stale_events)
+    assert any(event.signal == "BROKER_STARTUP_BLOCKED" and event.state == "RECOVERED" for event in recovered_events)
 
 
 def test_close_prevents_inflight_observation_from_sending():

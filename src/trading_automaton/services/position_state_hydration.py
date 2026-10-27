@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sentinel_contracts.analytics import MarketIndicators
 from sentinel_contracts.broker_execution import BrokerPosition
@@ -29,6 +29,11 @@ class HydrationRepositoryPort(Protocol):
     def realized_pnl(self, automation_id: str) -> Decimal: ...
 
     def has_pending_fact_outbox(self, automation_id: str) -> bool: ...
+
+    def execution_commission_cache(
+        self,
+        scopes: list[tuple[str, str, str, str]],
+    ) -> dict[tuple[str, str], dict[str, object]]: ...
 
 
 class PortfolioCachePort(Protocol):
@@ -90,6 +95,7 @@ class PositionStateHydrationService:
         *,
         consistency: PositionConsistencyPort | None = None,
         audit: PositionAuditPort | None = None,
+        commission_cache_enabled: bool = False,
         id_factory: Callable[[], str] = lambda: str(uuid4()),
         now: Callable[[], datetime],
         prepared_metrics: PreparedMetricsPort,
@@ -101,6 +107,7 @@ class PositionStateHydrationService:
         self._prepared_metrics = prepared_metrics
         self._consistency = consistency
         self._audit = audit
+        self._commission_cache_enabled = commission_cache_enabled
         self._id_factory = id_factory
         # One committed success per currently monitored automation; restart records it again.
         self._successful_reconciliations: dict[str, tuple[object, ...]] = {}
@@ -131,6 +138,7 @@ class PositionStateHydrationService:
             return None
         history, lots, cycle, active_intent, realized_pnl = durable
         process_id = self._id_factory()
+        reconciled = False
         if self._consistency is not None:
             try:
                 broker_lots = int(position.quantity_lots.to_integral_exact())
@@ -180,6 +188,7 @@ class PositionStateHydrationService:
                 )
                 return None
             lots = list(consistency.lots)
+            reconciled = True
             worker_lots = sum(item.remaining_lots for item in lots)
             fingerprint = (
                 str(command.broker_id),
@@ -206,6 +215,10 @@ class PositionStateHydrationService:
                 )
                 if cycle_id is not None:
                     self._successful_reconciliations[automation_id] = fingerprint
+        if reconciled and self._commission_cache_enabled:
+            lots = await self._overlay_entry_commissions(command, lots)
+            if lots is None:
+                return None
         indicators = await self._prepared_metrics.get(command.external_instrument_id)
         if indicators is None:
             return None
@@ -219,6 +232,49 @@ class PositionStateHydrationService:
             realized_pnl=realized_pnl,
             process_id=process_id,
         )
+
+    async def _overlay_entry_commissions(
+        self, command: AutomationCommand, lots: list[TradeLotRecord]
+    ) -> list[TradeLotRecord] | None:
+        """Overlay durable absolute fees after reconciliation without changing raw lots."""
+        if not lots:
+            return lots
+        source_ids = {
+            lot.source_intent_id
+            for lot in lots
+            if lot.source_intent_id is not None and _is_uuid(lot.source_intent_id)
+        }
+        if not source_ids:
+            return lots
+        cache = await asyncio.to_thread(
+            self._repository.execution_commission_cache,
+            [
+                (
+                    str(command.automation_id),
+                    source_id,
+                    str(command.user_broker_id),
+                    command.currency.upper(),
+                )
+                for source_id in source_ids
+            ],
+        )
+        projected: list[TradeLotRecord] = []
+        for lot in lots:
+            source_id = lot.source_intent_id
+            if source_id is None or not _is_uuid(source_id):
+                projected.append(lot)
+                continue
+            entry = cache.get((str(command.automation_id), source_id))
+            if entry is None or entry.get("commission_status") == "UNKNOWN":
+                return None
+            amount = entry.get("effective_broker_commission")
+            if amount is not None:
+                if not isinstance(amount, Decimal) or not amount.is_finite() or amount < 0:
+                    return None
+                if amount > lot.entry_commission:
+                    lot = lot.model_copy(update={"entry_commission": amount})
+            projected.append(lot)
+        return projected
 
     async def _audit_reconciliation(
         self,
@@ -251,3 +307,11 @@ class PositionStateHydrationService:
             self._repository.get_active_intent(automation_id),
             self._repository.realized_pnl(automation_id),
         )
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True

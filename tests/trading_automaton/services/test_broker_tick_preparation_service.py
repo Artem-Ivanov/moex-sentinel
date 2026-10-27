@@ -14,6 +14,7 @@ from sentinel_contracts.streaming_market import (
     MarketBatchSnapshot,
     StreamOrderBook,
     StreamTradingStatus,
+    UnaryApiTradingStatus,
 )
 from sentinel_contracts.trading import AutomationState
 from sentinel_contracts.trading_facts import AutomationCommand
@@ -100,6 +101,40 @@ class Reconciliation:
 
     async def reconcile(self, commands):
         self.calls.append(commands)
+
+
+def test_reconciles_known_orders_before_refreshing_account_portfolio() -> None:
+    calls = []
+
+    class OrderedBroker(Broker):
+        async def get_positions(self, account_id):
+            calls.append("portfolio")
+            raise RuntimeError("portfolio endpoint unavailable")
+
+    class OrderedReconciliation(Reconciliation):
+        async def reconcile(self, commands):
+            calls.append("reconciliation")
+            self.calls.append(commands)
+
+    async def scenario():
+        reconciliation = OrderedReconciliation()
+        service = BrokerTickPreparationService(
+            OrderedBroker(),
+            Portfolio(),
+            Bootstrap(),
+            Commissions(),
+            Hydration(),
+            reconciliation=reconciliation,
+            now=lambda: NOW,
+        )
+        with pytest.raises(RuntimeError, match="portfolio endpoint unavailable"):
+            await service.prepare((command(),), MarketBatchSnapshot.immutable("test", NOW, {}))
+        return reconciliation
+
+    reconciliation = asyncio.run(scenario())
+
+    assert calls == ["reconciliation", "portfolio"]
+    assert reconciliation.calls == [(command(),)]
 
 
 def test_prepares_zero_position_and_external_caches_before_sla_snapshot() -> None:
@@ -225,7 +260,8 @@ def bootstrap_market(**changes):
             NOW,
             True,
         ),
-        trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, True, NOW),
+        trading_status=StreamTradingStatus("instrument", "NORMAL_TRADING", True, NOW),
+        api_trading_status=UnaryApiTradingStatus(True, NOW, NOW + timedelta(seconds=30)),
     ).model_copy(update=changes)
     return MarketBatchSnapshot.immutable("bootstrap", NOW, {"instrument": state})
 

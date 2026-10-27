@@ -1,0 +1,7 @@
+{
+  "status": "PASS",
+  "checks": 29,
+  "py_compile": "PASS",
+  "sha256": "24337a74b202a09dc0c1337c420fb1cc8ae981d43484333551ee2b7e9299c76a",
+  "scope": "offline collector fake API/Docker, no live requests"
+}

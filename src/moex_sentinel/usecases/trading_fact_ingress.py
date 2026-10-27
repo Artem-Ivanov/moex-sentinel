@@ -17,7 +17,13 @@ class ClaimAutomationCommandsPort(Protocol):
 
 
 class AutomationStatusesPort(Protocol):
-    def statuses(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult: ...
+    def statuses(
+        self,
+        automation_ids: list[UUID],
+        *,
+        broker_id: UUID | None = None,
+        commission_order_ids: list[UUID] | None = None,
+    ) -> AutomationStatusesResult: ...
 
 
 class ClaimAutomationCommandsUsecase:
@@ -34,11 +40,22 @@ class ViewAutomationStatusesUsecase:
     def __init__(self, repository: AutomationStatusesPort) -> None:
         self._repository = repository
 
-    def execute(self, automation_ids: list[UUID], *, broker_id: UUID | None = None) -> AutomationStatusesResult:
+    def execute(
+        self,
+        automation_ids: list[UUID],
+        *,
+        broker_id: UUID | None = None,
+        commission_order_ids: list[UUID] | None = None,
+    ) -> AutomationStatusesResult:
+        optional = {} if not commission_order_ids else {"commission_order_ids": commission_order_ids}
         return (
-            self._repository.statuses(automation_ids)
+            self._repository.statuses(automation_ids, **optional)
             if broker_id is None
-            else self._repository.statuses(automation_ids, broker_id=broker_id)
+            else self._repository.statuses(
+                automation_ids,
+                broker_id=broker_id,
+                **optional,
+            )
         )
 
 

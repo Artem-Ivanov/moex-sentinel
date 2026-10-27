@@ -2,6 +2,10 @@
 
 from moex_sentinel.storage.models.automation_facts import PositionCycleModel, TradingAutomationModel
 from moex_sentinel.storage.models.base import Base
+from moex_sentinel.storage.models.execution_commissions import (
+    BrokerFeeScanStateModel,
+    BrokerOrderFeeObservationModel,
+)
 from moex_sentinel.storage.models.order_facts import (
     BrokerOrderEventModel,
     BrokerOrderModel,
@@ -31,8 +35,10 @@ __all__ = [
     "AutomationEventModel",
     "Base",
     "BrokerAccountFeeProfileModel",
+    "BrokerFeeScanStateModel",
     "BrokerInstrumentModel",
     "BrokerOrderEventModel",
+    "BrokerOrderFeeObservationModel",
     "BrokerOrderModel",
     "ExecutionLotAllocationModel",
     "InstrumentSyncStateModel",
