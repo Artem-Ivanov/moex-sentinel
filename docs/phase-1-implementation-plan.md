@@ -1,5 +1,77 @@
 # Актуальный план развития
 
+## Аудит и исправления торгового автомата 02.11.2026
+
+Выполнены аудит, native очистка и архитектурные исправления с саб-агентами. Старый GOLD BUY139 `55a0…` завершён FAILED/AGE_POLICY/terminalNULL, exact Core ACK event25980666…/sequence374575. GOLD HOLD15, SIBN HOLD12, resume_requested=false. Прежний Worker/image восстановлен с OWNER13, heartbeat/control progress, outbox0/0 и исходной restart policy; новые заявки и Resume не выполнялись. Core-only patch7fab5ffd выложен с отдельного разрешения; Worker patch остаётся локальным.
+
+Исправлены три Important: недостижимый aging при permanent broker block, утечка `_attempted` после ошибки/отмены и отказ Core принимать административный AGE существующего order без reservation. Добавлена безопасная RPC диагностика. Existing-reserve guards и границы Core/Worker/Analytics сохранены. Независимые app/ops/postfact reviews C0/I0/M0.
+
+SELL94 отдельного GOLD ключа `a668…` остаётся IN_FLIGHT/unmarked в Core; его full payload/reserve и финансовая история/80e не изменены. NoBUYreserve/noCandidate/noSettlement. Fresh broker preflight:0ordinary/stop,16operationscomplete, точные старые request outcomes UNKNOWN; финансовый исход и Net PnL не установлены. ActualCore schema0007, миграций нет. Полный диагностический журнал не пересчитывался.
+
+Проверки:191Worker PASS,80Core/helper PASS,6изолированныхPG16 PASS,53операционныхfake/unit PASS. Full backend2802 PASS/22прежнихFAIL/206SKIP; те же22 воспроизведены на HEAD, новых нет, общий suite остаётся RED. Worker rollout, устранение этих baseline failures и окончательное финансовое settlement в эту приёмку не входят. [Отчёт и доказательства](audits/trading-automaton-20261102.md).
+
+## Проверка 29.10.2026: задача безопасного восстановления торговли
+
+Свежий read-only аудит 29Oct15:49–15:51UTC (18:49–18:51МСК) подтвердил:
+broker loop всё ещё BLOCKED/PERMANENT_BROKER_ERROR с27Oct14:02:16UTC;
+control/HB и owner11 живы, outbox0/0, effective admission=true. Оба автомата
+IN_WORK; Resume сам по себе не устраняет остановку broker runtime. Последние
+сохранённые решения относятся к27Oct. Core/брокер GOLD284/SIBN1лот совпадают
+через свежую catalog/D1 identity; Worker lots остаются UNKNOWN/BUDGET_EXCEEDED.
+
+GOLD BUY139 `55a0cae9-a382-4ba1-a898-c928f7f82f23` всё ещё UNCERTAIN
+более55часов, без external order ID и terminal proof. Отдельный SELL94 reserve
+`a6685cd6-9f6f-426b-be0d-c274df743e7f` IN_FLIGHT требует своей корреляции.
+Точный исходный RPC/error не установлен: bounded incident logs пусты.
+Свежие broker active orders, exact request state и полное покрытие исполнений
+этот аудит не получил; reconciliation26Oct и outstanding0 не доказывают
+отсутствие заявки. Текущие runtime/adapter/iteration hashes совпадают с локальным
+кодом: permanent failure ожидает close, aging24h вызывается внутри остановленного
+broker loop. Отдельный дефект отсчёта24h не доказан.
+
+Очередь P1: установить источник permanent failure; раздельно сверить BUY139
+и SELL94; существующую активную заявку отменять с проверкой terminal/partial fills;
+при возрасте строго >24ч применять штатный административный FAILED/AGE_POLICY
+с terminal_at=NULL и сохранением неизвестного исхода, без освобождения резерва.
+Только финансовый settlement выполнять после полной свежей account reconciliation
+и проверки exact candidates/markers всех unresolved резервов. История, late fills, consumed keys и
+финансовые связи сохраняются. Затем контролируемо восстановить runtime с
+проверкой единственного owner/lease и свежих торговых итераций. Удаление строк и
+повторная отправка старого ключа не входят в восстановление. В этом аудите отмена,
+Resume, SQL writes, restart и deploy не выполнялись.
+
+Задача и критерии: [tasks.md](../develop/reports/trading-audit-20261029/tasks.md).
+Отчёт/evidence: `develop/reports/trading-audit-20261029/`; независимое итоговое
+ревью фиксируется в `final-review.md`. F1/F2 rollout/приёмка остаются отдельной
+очередью: образы прежние28Oct, Worker D1 hash отличается от локального F2.
+
+
+
+## Read-only проверка торговли28.10.2026
+
+По проектному `moex-trading-audit` выполнена свежая проверка28Oct09:24:58–09:29:54UTC
+(12:24:58–12:29:54МСК). Core/Analytics/frontend healthy; Worker control heartbeat
+и command sync живы, outbox0pending/0failed, owner11. Оба автомата IN_WORK,
+Core/брокер GOLD284 и SIBN1лот совпадают по account/instrument mapping.
+При этом broker runtime BLOCKED/PERMANENT_BROKER_ERROR с27Oct14:02:16UTC;
+последние сохранённые решения относятся к27Oct, новой торговли сегодня аудит
+не подтвердил. Общий effective admissiontrue и lifecycleIN_WORK не доказывают
+работу торговой итерации. Исходный конкретный broker error неизвестен:
+ограниченный журнал окна инцидента пуст. Перезапуски/торговые действия не выполнялись.
+
+GOLD55a0cae9-a382-4ba1-a898-c928f7f82f23 BUY139 остаётся CoreUNCERTAIN старше24ч;
+отдельный резерв a6685cd6-9f6f-426b-be0d-c274df743e7f SELL94 IN_FLIGHT требует
+собственной корреляции. WorkerD1 UNKNOWN/BUDGET_EXCEEDED; Workerлоты/fees не
+подтверждены. RuntimeCore/Worker/collector imageIDs прежние, как в pre-F1/F2
+inventory27Oct; локальная реализация F1/F2 уже есть, её rollout не наблюдается.
+Очередь: установить точную причину permanent failure и проверить безопасное
+восстановление/aging исходных intent; отдельно завершить приёмку и rolloutF1/F2.
+Новые данные не являются разрешением на recovery/deployment.
+
+Локальные evidence/report/tasks: `develop/reports/trading-audit-20261028/`.
+Независимое итоговое кросс-ревью фиксируется в `final-review.md` этого каталога.
+
+
 ## Активная веха27.10.2026: поздние комиссии и D1
 
 Пользователь поручил реализовать оставшиеся F1/F2 и выделить отдельного агента мониторинга. [Контракт](superpowers/specs/2026-10-27-execution-commissions.md) и [план реализации](superpowers/plans/2026-10-27-fees-diagnostics.md) сверены с текущими callers и свежими read-only данными. F1 в реализации: отдельный additive учёт EXECUTED BROKER_FEE по exact parent/order/account, без изменения исходных исполнений. F2 локально готово:19testsPASS, independent C0/I0/M0; runtime ещё не обновлён. Синтетические100auto/50k истории по-прежнему могут исчерпать100ms, предел не скрыт.

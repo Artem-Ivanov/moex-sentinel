@@ -17,6 +17,16 @@ from trading_automaton.usecases.broker_iteration import RunBrokerIterationUsecas
 
 LOGGER = logging.getLogger(__name__)
 BROKER_RECOVERY_PROBE_SECONDS = 60.0
+_SAFE_BROKER_ERROR_CODES = frozenset(
+    {
+        "BROKER_AUTH_FAILED",
+        "BROKER_FORBIDDEN",
+        "BROKER_ORDER_NOT_FOUND",
+        "BROKER_REQUEST_LOOKUP_UNSUPPORTED",
+        "BROKER_RATE_LIMITED",
+        "BROKER_UNAVAILABLE",
+    }
+)
 
 
 class AnalyticsPort(Protocol):
@@ -79,10 +89,31 @@ class AnalyticsBrokerRuntime:
                         "Broker preparation paused; runtime restart required",
                         extra={
                             "reason_code": "BROKER_PREPARATION_BLOCKED",
-                            "data": {"retries": failures, "retryable": error.retryable},
+                            "data": {
+                                "retries": failures,
+                                "retryable": error.retryable,
+                                "code": error.code if error.code in _SAFE_BROKER_ERROR_CODES else "BROKER_ERROR",
+                            },
                         },
                     )
-                    await self._closed.wait()
+                    while not self._closed.is_set():
+                        try:
+                            async with self._run_lock:
+                                if self._closed.is_set():
+                                    return
+                                await self._iteration.maintain_local()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            LOGGER.warning(
+                                "Blocked broker local maintenance failed",
+                                extra={"reason_code": "BROKER_BLOCKED_LOCAL_MAINTENANCE_FAILED"},
+                            )
+                        with suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                self._closed.wait(),
+                                timeout=self._recovery_probe_seconds,
+                            )
                     return
                 if failures >= self._retry_limit:
                     delay = self._recovery_probe_seconds

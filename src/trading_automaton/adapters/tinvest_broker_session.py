@@ -171,7 +171,8 @@ class BrokerSdkSession:
                     direction=direction,
                     quantity=request.quantity_lots,
                 )
-            )
+            ),
+            rpc_operation="GetOrderPrice",
         )
         return CommissionQuote(
             order_amount=quotation_to_decimal(response.initial_order_amount),
@@ -193,12 +194,15 @@ class BrokerSdkSession:
                     if self._environment == "TEST"
                     else self.services.operations.get_portfolio(account_id=account_id)
                 ),
+                rpc_operation="GetSandboxPortfolio" if self._environment == "TEST" else "GetPortfolio",
                 snapshot_operation="GetSandboxPortfolio" if self._environment == "TEST" else "GetPortfolio",
             )
             blocked_instruments: set[str] = set()
             if self._environment == "PROD":
                 inventory = await self._broker_request(
-                    self.services.operations.get_positions(account_id=account_id), snapshot_operation="GetPositions"
+                    self.services.operations.get_positions(account_id=account_id),
+                    rpc_operation="GetPositions",
+                    snapshot_operation="GetPositions",
                 )
                 blocked_instruments = {
                     item.instrument_uid for item in inventory.securities if item.blocked != 0 or item.exchange_blocked
@@ -232,6 +236,7 @@ class BrokerSdkSession:
                         if self._environment == "TEST"
                         else self.services.operations.get_positions(account_id=account_id)
                     ),
+                    rpc_operation="GetSandboxPositions" if self._environment == "TEST" else "GetPositions",
                     snapshot_operation="GetSandboxPositions" if self._environment == "TEST" else "GetPositions",
                 )
                 values: dict[str, Decimal] = {}
@@ -334,7 +339,7 @@ class BrokerSdkSession:
                 price_type=PriceType.PRICE_TYPE_CURRENCY,
             )
 
-        response = await self._broker_request(enter_sdk_post())
+        response = await self._broker_request(enter_sdk_post(), rpc_operation="PostOrder")
         state = response if isinstance(response, BrokerOrderState) else _order_state(response)
         if self._environment == "PROD" and state.pre_rpc_abort_proof is None:
             state = state.model_copy(
@@ -453,7 +458,8 @@ class BrokerSdkSession:
                 account_id=account_id,
                 order_id=broker_order_id,
                 price_type=PriceType.PRICE_TYPE_CURRENCY,
-            )
+            ),
+            rpc_operation="GetOrderState",
         )
         state = _order_state(response, order_state=True)
         await self._invalidate_if_terminal(account_id, state)
@@ -467,7 +473,8 @@ class BrokerSdkSession:
             self.services.orders.cancel_order(
                 account_id=account_id,
                 order_id=broker_order_id,
-            )
+            ),
+            rpc_operation="CancelOrder",
         )
 
     async def find_by_idempotency_key(
@@ -484,7 +491,8 @@ class BrokerSdkSession:
                         order_id=idempotency_key,
                         price_type=PriceType.PRICE_TYPE_CURRENCY,
                         order_id_type=OrderIdType.ORDER_ID_TYPE_REQUEST,
-                    )
+                    ),
+                    rpc_operation="GetOrderStateByRequestId",
                 )
             except TInvestAdapterError as error:
                 if error.code in {"BROKER_ORDER_NOT_FOUND", "BROKER_REQUEST_LOOKUP_UNSUPPORTED"}:
@@ -495,7 +503,10 @@ class BrokerSdkSession:
             state = _order_state(response, order_state=True)
             await self._invalidate_if_terminal(account_id, state)
             return state
-        response = await self._broker_request(self.services.orders.get_orders(account_id=account_id))
+        response = await self._broker_request(
+            self.services.orders.get_orders(account_id=account_id),
+            rpc_operation="GetOrders",
+        )
         for order in response.orders:
             if order.order_request_id == idempotency_key:
                 state = _order_state(order, order_state=True)
@@ -532,6 +543,19 @@ class BrokerSdkSession:
         self,
         request: Awaitable[Any],
         *,
+        rpc_operation: Literal[
+            "GetOrderPrice",
+            "GetPortfolio",
+            "GetSandboxPortfolio",
+            "GetPositions",
+            "GetSandboxPositions",
+            "PostOrder",
+            "GetOrderState",
+            "CancelOrder",
+            "GetOrderStateByRequestId",
+            "GetOrders",
+            "GetOperationsByCursor",
+        ],
         snapshot_operation: (
             Literal["GetSandboxPortfolio", "GetSandboxPositions", "GetPortfolio", "GetPositions"] | None
         ) = None,
@@ -564,7 +588,7 @@ class BrokerSdkSession:
                 extra={
                     "reason_code": "BROKER_SDK_REQUEST_FAILED",
                     "data": {
-                        "operation": snapshot_operation or "broker_request",
+                        "operation": rpc_operation,
                         "grpc_status": error.code.name if isinstance(error.code, StatusCode) else "UNRECOGNIZED",
                         "code": mapped.code,
                         "retryable": mapped.retryable,
@@ -595,7 +619,8 @@ class BrokerSdkSession:
                     instrument_id=instrument_id,
                     limit=limit,
                 )
-            )
+            ),
+            rpc_operation="GetOperationsByCursor",
         )
         return tuple(
             BrokerRecoveryOperation(

@@ -25,7 +25,13 @@ from moex_sentinel.services.trading_admission_ports import (
 )
 from moex_sentinel.services.trading_fact_ingress import TradingFactIngressService
 from moex_sentinel.storage.database import create_database_engine
-from moex_sentinel.storage.models import AutomationEventModel, Base, BrokerOrderModel, TradingAutomationModel
+from moex_sentinel.storage.models import (
+    AutomationEventModel,
+    Base,
+    BrokerOrderEventModel,
+    BrokerOrderModel,
+    TradingAutomationModel,
+)
 from moex_sentinel.storage.models.trading_admission import (
     TradingAccountAdmissionModel,
     TradingSubmitReservationModel,
@@ -400,7 +406,10 @@ def _seed_postgresql_fact_ingress(factory) -> None:
     admit_order_prefix(factory)
 
 
-def test_real_worker_age_event_is_accepted_as_core_candidate(isolated_postgresql_database_url, tmp_path) -> None:
+@pytest.mark.parametrize("reserve_present", [True, False], ids=["existing-reserve", "missing-reserve"])
+def test_real_worker_age_event_is_accepted_with_or_without_core_reserve(
+    isolated_postgresql_database_url, tmp_path, reserve_present
+) -> None:
     engine = create_database_engine(isolated_postgresql_database_url)
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
@@ -484,6 +493,15 @@ def test_real_worker_age_event_is_accepted_as_core_candidate(isolated_postgresql
             accepted_through_sequence=prefix_result.results[0].accepted_through_sequence,
             current_revision=prefix_result.results[0].current_revision,
         )
+        if not reserve_present:
+            with factory.begin() as session:
+                session.delete(
+                    session.scalar(
+                        select(TradingSubmitReservationModel).where(
+                            TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                        )
+                    )
+                )
 
         assert repository.transition_state(
             automation_id=str(AUTOMATION_A),
@@ -511,8 +529,11 @@ def test_real_worker_age_event_is_accepted_as_core_candidate(isolated_postgresql
         )
         with factory.begin() as session:
             admission = session.get_one(TradingAccountAdmissionModel, str(SCOPE_ID))
-            admission.recovery_only = False
-            admission.recovery_runtime_instance_id = None
+            assert admission.recovery_only is True
+            assert admission.recovery_runtime_instance_id == str(RUNTIME_B)
+            admission.configuration_fingerprint = None
+            runtime = session.get_one(WorkerRuntimeInstanceModel, str(RUNTIME_B))
+            runtime.strategy_enabled = False
 
         aged = repository.expire_intent_by_age(str(SUBMIT_KEY), expired_at=NOW)
         assert aged is not None
@@ -530,25 +551,64 @@ def test_real_worker_age_event_is_accepted_as_core_candidate(isolated_postgresql
         assert payload["terminal_at"] is None
         assert "_age_policy" not in payload["strategy_snapshot"]
 
-        accepted = production_fact_service(factory).publish(
+        with factory.begin() as session:
+            admission = session.get_one(TradingAccountAdmissionModel, str(SCOPE_ID))
+            admission.recovery_runtime_instance_id = str(RUNTIME_A)
+        rejected = production_fact_service(factory).publish(
             _envelopes(aged_rows), runtime_instance_id=RUNTIME_B, generation=2
         )
-        assert accepted.failures == (), accepted.failures
+        assert rejected.results == ()
+        assert rejected.failures[0].code.value == "TEMPORARY_CORE_FAILURE"
+        assert rejected.failures[0].retryable is True
         with factory() as session:
+            automation = session.get_one(TradingAutomationModel, str(AUTOMATION_A))
+            order = session.get_one(BrokerOrderModel, str(SUBMIT_KEY))
+            assert automation.last_sequence_number == prefix_result.results[0].accepted_through_sequence
+            assert automation.revision == 1
+            assert (order.state, order.terminal_at) == ("SUBMITTING", None)
+            assert session.scalar(select(func.count()).select_from(BrokerOrderEventModel)) == 1
             reservation = session.scalar(
                 select(TradingSubmitReservationModel).where(
                     TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
                 )
             )
-            assert reservation is not None
+            if reserve_present:
+                assert reservation is not None
+                assert reservation.state == "IN_FLIGHT"
+                assert "_age_policy" not in reservation.payload
+            else:
+                assert reservation is None
+        with factory.begin() as session:
+            admission = session.get_one(TradingAccountAdmissionModel, str(SCOPE_ID))
+            admission.recovery_runtime_instance_id = str(RUNTIME_B)
+
+        accepted = production_fact_service(factory).publish(
+            _envelopes(aged_rows), runtime_instance_id=RUNTIME_B, generation=2
+        )
+        assert accepted.failures == (), accepted.failures
+        with factory() as session:
+            admission = session.get_one(TradingAccountAdmissionModel, str(SCOPE_ID))
+            assert admission.recovery_only is True
+            assert admission.recovery_runtime_instance_id == str(RUNTIME_B)
+            assert admission.configuration_fingerprint is None
+            assert session.get_one(WorkerRuntimeInstanceModel, str(RUNTIME_B)).strategy_enabled is False
+            reservation = session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
             order = session.get_one(BrokerOrderModel, str(SUBMIT_KEY))
             assert (order.state, order.terminal_at) == ("FAILED", None)
-            assert reservation.state == "IN_FLIGHT"
-            assert reservation.payload["_age_policy"] == {
-                "version": 1,
-                "expired_at": NOW.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            }
-            assert reservation.reserved_cash == Decimal("1001")
+            if reserve_present:
+                assert reservation is not None
+                assert reservation.state == "IN_FLIGHT"
+                assert reservation.payload["_age_policy"] == {
+                    "version": 1,
+                    "expired_at": NOW.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                }
+                assert reservation.reserved_cash == Decimal("1001")
+            else:
+                assert reservation is None
     finally:
         if worker_engine is not None:
             worker_engine.dispose()
@@ -575,9 +635,7 @@ def test_real_worker_age_recovery_resumes_through_queue_after_core_request(
             session.add(instrument)
             session.flush()
             session.add(
-                automation_model(
-                    str(AUTOMATION_A), user_broker_id=str(SCOPE_ID), instrument_id=str(INSTRUMENT_A)
-                )
+                automation_model(str(AUTOMATION_A), user_broker_id=str(SCOPE_ID), instrument_id=str(INSTRUMENT_A))
             )
         seed_fact_submit_reservation(factory)
         with factory.begin() as session:
@@ -836,8 +894,7 @@ def test_real_worker_age_recovery_resumes_through_queue_after_core_request(
                     CachedAutomationModel.state,
                     CachedAutomationModel.revision,
                     CachedAutomationModel.last_sequence_number,
-                )
-                .where(CachedAutomationModel.automation_id == str(AUTOMATION_A))
+                ).where(CachedAutomationModel.automation_id == str(AUTOMATION_A))
             ).one()
             assert cached.state == AutomationState.IN_QUEUE.value
         # Core accepts the typed HOLD→IN_QUEUE proposal before the queue can activate.

@@ -55,6 +55,8 @@ class PreparationCashPort(Protocol):
 class PreparationReconciliationPort(Protocol):
     async def reconcile(self, commands: tuple[AutomationCommand, ...]) -> object: ...
 
+    async def maintain_local_age_policy(self, commands: tuple[AutomationCommand, ...]) -> None: ...
+
 
 class BrokerTickPreparationService:
     def __init__(
@@ -103,6 +105,10 @@ class BrokerTickPreparationService:
                 await self._prepare_adopted(command)
             except ValueError:
                 LOGGER.warning("Position bootstrap remains pending", extra={"reason_code": "BOOTSTRAPPING"})
+
+    async def maintain_local(self, commands: tuple[AutomationCommand, ...]) -> None:
+        if self._reconciliation is not None:
+            await self._reconciliation.maintain_local_age_policy(commands)
 
     async def _prepare_regular(
         self,

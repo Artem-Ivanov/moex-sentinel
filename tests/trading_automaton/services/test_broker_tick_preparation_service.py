@@ -103,6 +103,33 @@ class Reconciliation:
         self.calls.append(commands)
 
 
+def test_local_maintenance_delegates_only_to_intent_reconciliation() -> None:
+    class LocalReconciliation(Reconciliation):
+        async def maintain_local_age_policy(self, commands):
+            self.local_calls = commands
+
+    async def scenario():
+        broker = Broker()
+        reconciliation = LocalReconciliation()
+        service = BrokerTickPreparationService(
+            broker,
+            Portfolio(),
+            Bootstrap(),
+            Commissions(),
+            Hydration(),
+            reconciliation=reconciliation,
+            now=lambda: NOW,
+        )
+        await service.maintain_local((command(),))
+        return broker, reconciliation
+
+    broker, reconciliation = asyncio.run(scenario())
+
+    assert reconciliation.local_calls == (command(),)
+    assert broker.position_calls == 0
+    assert broker.free_cash_calls == 0
+
+
 def test_reconciles_known_orders_before_refreshing_account_portfolio() -> None:
     calls = []
 

@@ -1219,6 +1219,18 @@ def test_only_snapshot_exact_tls_unwrap_failure_is_retryable(
     records = [r for r in caplog.records if getattr(r, "reason_code", None) == "BROKER_SDK_REQUEST_FAILED"]
     assert len(records) == 1
     assert records[0].data["grpc_status"] == status.name
+    assert (
+        records[0].data["operation"]
+        == {
+            "positions": "GetSandboxPortfolio",
+            "cash": "GetSandboxPositions",
+            "submit": "PostOrder",
+        }[operation]
+    )
+    assert records[0].data["code"] == {
+        StatusCode.UNAUTHENTICATED: "BROKER_AUTH_FAILED",
+        StatusCode.PERMISSION_DENIED: "BROKER_FORBIDDEN",
+    }.get(status, "BROKER_UNAVAILABLE")
     assert records[0].data["retryable"] is retryable
     assert "private-token" not in str(records[0].__dict__)
     assert records[0].exc_info is None

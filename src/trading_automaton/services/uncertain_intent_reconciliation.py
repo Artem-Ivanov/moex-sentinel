@@ -145,6 +145,7 @@ class UncertainIntentReconciliationService:
         self._poll_limit = poll_limit
         self._broker_request_timeout_seconds = broker_request_timeout_seconds
         self._attempted: set[str] = set()
+        self._durable_terminal_attempts: set[str] = set()
         self._retry_after: dict[str, datetime] = {}
         self._age_recovery_cursor: dict[tuple[str, ...], tuple[datetime, str]] = {}
 
@@ -177,6 +178,13 @@ class UncertainIntentReconciliationService:
             unresolved=sum(item == "UNRESOLVED" for item in results),
         )
 
+    async def maintain_local_age_policy(self, commands: tuple[AutomationCommand, ...]) -> None:
+        """Apply only the local age policy; this path does not contact the broker."""
+        for command in commands:
+            automation_id = str(command.automation_id)
+            intent = await asyncio.to_thread(self._repository.get_active_intent, automation_id)
+            await self._expire_intent_by_age(automation_id, intent)
+
     async def _reconcile_one(
         self,
         command: AutomationCommand,
@@ -185,18 +193,8 @@ class UncertainIntentReconciliationService:
     ) -> str:
         automation_id = str(command.automation_id)
         intent = intent_override or await asyncio.to_thread(self._repository.get_active_intent, automation_id)
-        if intent_override is None and intent is not None and intent_age_expired(intent, now=self._now()):
-            expired = await asyncio.to_thread(
-                self._repository.expire_intent_by_age,
-                intent.idempotency_key,
-                expired_at=self._now(),
-            )
-            if expired is not None:
-                intent = expired
-                if self._cash is not None:
-                    await self._cash.release(intent.idempotency_key)
-                if self._active_intents is not None:
-                    self._active_intents.clear(automation_id, intent.idempotency_key)
+        if intent_override is None:
+            intent = await self._expire_intent_by_age(automation_id, intent)
         policy_expired = intent is not None and _has_age_policy_marker(intent, now=self._now())
         if (
             intent is not None
@@ -234,6 +232,56 @@ class UncertainIntentReconciliationService:
         # Keep correlation stable across retries and restarts without storing a new column.
         process_id = str(uuid5(_RECOVERY_NAMESPACE, f"{command.broker_id}:{automation_id}:{intent.idempotency_key}"))
         self._attempted.add(intent.idempotency_key)
+        try:
+            return await self._reconcile_attempt(
+                command,
+                intent,
+                automation_id,
+                process_id,
+                broker_only,
+                policy_expired,
+            )
+        finally:
+            if intent.idempotency_key in self._durable_terminal_attempts:
+                self._durable_terminal_attempts.discard(intent.idempotency_key)
+            else:
+                self._attempted.discard(intent.idempotency_key)
+
+    async def _expire_intent_by_age(
+        self,
+        automation_id: str,
+        intent: LocalIntentRecord | None,
+    ) -> LocalIntentRecord | None:
+        if (
+            intent is None
+            or getattr(intent, "terminal_at", None) is not None
+            or intent.state in BROKER_TERMINAL_STATES
+            or intent.state == "FAILED"
+            or not intent_age_expired(intent, now=self._now())
+        ):
+            return intent
+        expired = await asyncio.to_thread(
+            self._repository.expire_intent_by_age,
+            intent.idempotency_key,
+            expired_at=self._now(),
+        )
+        if expired is not None:
+            if self._cash is not None:
+                await self._cash.release(intent.idempotency_key)
+            if self._active_intents is not None:
+                self._active_intents.clear(automation_id, intent.idempotency_key)
+            return expired
+        return intent
+
+    async def _reconcile_attempt(
+        self,
+        command: AutomationCommand,
+        intent: LocalIntentRecord,
+        automation_id: str,
+        process_id: str,
+        broker_only: bool,
+        policy_expired: bool,
+    ) -> str:
         try:
             await self._audit_stage(
                 command,
@@ -425,6 +473,7 @@ class UncertainIntentReconciliationService:
             terminal_at=occurred_at,
             process_id=process_id,
         )
+        self._durable_terminal_attempts.add(intent.idempotency_key)
         if self._cash is not None:
             await self._cash.complete(intent.idempotency_key, "CANCELLED")
         if self._active_intents is not None:
@@ -693,6 +742,7 @@ class UncertainIntentReconciliationService:
             ),
             ledger_already_applied=ledger_already_applied,
         )
+        self._durable_terminal_attempts.add(intent.idempotency_key)
         return True
 
     def _state_from_operations(

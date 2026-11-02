@@ -283,6 +283,57 @@ def test_worker_settings_reach_http_sdk_and_recovery_consumers(monkeypatch, tmp_
         http.close()
 
 
+@pytest.mark.parametrize(
+    ("broker_code", "logged_code"),
+    [("BROKER_FORBIDDEN", "BROKER_FORBIDDEN"), ("private details", "BROKER_ERROR")],
+)
+def test_permanent_broker_block_keeps_local_maintenance_alive(monkeypatch, caplog, broker_code, logged_code) -> None:
+    monkeypatch.setattr("trading_automaton.runtime.analytics_broker.LOGGER.disabled", False)
+
+    class Analytics:
+        async def close(self):
+            pass
+
+    class Iteration:
+        maintenance_calls = 0
+
+        async def replace_commands(self, commands):
+            pass
+
+        async def execute(self, *, is_closed):
+            raise BrokerOperationError(broker_code, "safe message", retryable=False)
+
+        async def maintain_local(self):
+            assert runtime._run_lock.locked()
+            self.maintenance_calls += 1
+            raise RuntimeError("local cleanup failed")
+
+    iteration = Iteration()
+    runtime = composition.AnalyticsBrokerRuntime(Analytics(), iteration, recovery_probe_seconds=73)
+
+    async def close_wait():
+        runtime._closed.set()
+
+    monkeypatch.setattr(runtime._closed, "wait", close_wait)
+
+    async def bounded_wait(awaitable, *, timeout):  # noqa: ASYNC109 - stop after one bounded probe
+        assert timeout == 73
+        await awaitable
+
+    monkeypatch.setattr(asyncio, "wait_for", bounded_wait)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(runtime.run())
+
+    assert iteration.maintenance_calls == 1
+    diagnostics = runtime.broker_runtime_diagnostics()
+    assert diagnostics.status == "BLOCKED"
+    assert diagnostics.reason == "PERMANENT_BROKER_ERROR"
+    record = next(record for record in caplog.records if record.reason_code == "BROKER_PREPARATION_BLOCKED")
+    assert record.data["code"] == logged_code
+    assert "safe message" not in str(record.__dict__)
+
+
 def test_composition_uses_one_typed_synchronization_path(tmp_path) -> None:
     settings = AutomatonSettings(
         CORE_URL="http://core.invalid",

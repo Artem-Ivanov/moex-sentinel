@@ -27,7 +27,7 @@ from trading_automaton.services.broker_tick_preparation import BrokerTickPrepara
     [
         (0, True, 1, [60]),
         (2, True, 3, [1, 3, 60]),
-        (2, False, 1, []),
+        (2, False, 1, [60]),
     ],
 )
 def test_preparation_uses_runtime_retry_budget_then_cooldown_or_permanent_pause(

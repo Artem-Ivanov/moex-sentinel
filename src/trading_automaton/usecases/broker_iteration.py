@@ -27,6 +27,8 @@ class TickPort(Protocol):
 class PreparationPort(Protocol):
     async def prepare(self, commands: tuple[AutomationCommand, ...], snapshot: MarketBatchSnapshot) -> None: ...
 
+    async def maintain_local(self, commands: tuple[AutomationCommand, ...]) -> None: ...
+
 
 class PersistenceFailurePort(Protocol):
     async def hold(self, commands: tuple[AutomationCommand, ...]) -> None: ...
@@ -61,6 +63,11 @@ class RunBrokerIterationUsecase:
         self._commands = commands
         active_ids = {str(item.automation_id) for item in commands}
         self._last_seen = {key: value for key, value in self._last_seen.items() if key in active_ids}
+
+    async def maintain_local(self) -> None:
+        """Run only local recovery maintenance while the broker source is blocked."""
+        if self._commands:
+            await self._preparation.maintain_local(self._commands)
 
     async def execute(self, *, is_closed: Callable[[], bool]) -> BrokerIterationOutcome:
         """Prepare recovery even during outage, then tick only current commands on a fresh unseen frame."""

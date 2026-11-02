@@ -185,6 +185,114 @@ def test_age_expired_unknown_intent_is_not_resubmitted_or_held() -> None:
     assert gate.is_tracked(value.idempotency_key) is True
 
 
+def test_local_age_maintenance_expires_only_old_nonterminal_intents_without_broker_calls() -> None:
+    value = intent()
+    value.created_at = NOW - timedelta(hours=24, milliseconds=1)
+    value.terminal_at = None
+    value.state = "ACCEPTED"
+
+    class AgingRepository(Repository):
+        def expire_intent_by_age(self, intent_id, *, expired_at):
+            assert intent_id == value.idempotency_key
+            value.state = "FAILED"
+            value.terminal_at = None
+            self.expirations = [intent_id]
+            return value
+
+    class NoRpcBroker(Broker):
+        async def get_order_state(self, *_args):
+            raise AssertionError("Local age maintenance must not call broker RPC")
+
+        async def find_by_idempotency_key(self, *_args):
+            raise AssertionError("Local age maintenance must not call broker RPC")
+
+        async def inspect_position(self, *_args):
+            raise AssertionError("Local age maintenance must not call broker RPC")
+
+        async def inspect_recent_operations(self, *_args):
+            raise AssertionError("Local age maintenance must not call broker RPC")
+
+    repository = AgingRepository(ledger_lots=0)
+    repository.active_intent = value
+    cash = Cash()
+    gate = ActiveIntentGateService()
+    gate.activate(value.automation_id, value.idempotency_key)
+    recovery = UncertainIntentReconciliationService(
+        repository,
+        NoRpcBroker(()),
+        now=lambda: NOW,
+        cash=cash,
+        active_intents=gate,
+    )
+
+    asyncio.run(recovery.maintain_local_age_policy((command(),)))
+
+    assert repository.expirations == [value.idempotency_key]
+    assert value.terminal_at is None
+    assert cash.releases == [value.idempotency_key]
+    assert gate.has_active_intent(value.automation_id) is False
+
+
+def test_local_age_maintenance_leaves_terminal_intents_untouched() -> None:
+    value = intent()
+    value.created_at = NOW - timedelta(hours=25)
+    value.terminal_at = None
+    value.state = "FILLED"
+
+    class TerminalRepository(Repository):
+        def expire_intent_by_age(self, *_args, **_kwargs):
+            raise AssertionError("Terminal intents must not enter age-policy expiry")
+
+    repository = TerminalRepository(ledger_lots=0)
+    repository.active_intent = value
+    cash = Cash()
+    gate = ActiveIntentGateService()
+    gate.activate(value.automation_id, value.idempotency_key)
+    service = UncertainIntentReconciliationService(
+        repository,
+        Broker(()),
+        now=lambda: NOW,
+        cash=cash,
+        active_intents=gate,
+    )
+
+    asyncio.run(service.maintain_local_age_policy((command(),)))
+
+    assert cash.releases == []
+    assert gate.has_active_intent(value.automation_id) is True
+
+
+def test_cancelled_reconciliation_releases_attempt_key_for_retry() -> None:
+    async def scenario():
+        repository = Repository(ledger_lots=5)
+        entered = asyncio.Event()
+
+        class CancellableBroker(Broker):
+            cancelled = False
+
+            async def inspect_recent_operations(self, account_id, instrument_id, limit):
+                if not self.cancelled:
+                    entered.set()
+                    await asyncio.Event().wait()
+                return (sell_operation(),)
+
+        broker = CancellableBroker(())
+        service = UncertainIntentReconciliationService(repository, broker, now=lambda: NOW)
+        task = asyncio.create_task(service.reconcile((command(),)))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        broker.cancelled = True
+        result = await service.reconcile((command(),))
+        return repository, result
+
+    repository, result = asyncio.run(scenario())
+
+    assert result.resolved == 1
+    assert len(repository.finalizations) == 1
+
+
 def test_aged_background_late_fill_does_not_clear_new_active_intent() -> None:
     automation_id = str(command().automation_id)
     old_intent = intent()
@@ -1669,6 +1777,34 @@ def test_failed_recovery_never_reports_completion(durable_audit, failure):
     stages = [item["stage"] for item in audit_payloads(outbox)]
     assert BusinessAuditStage.WORKER_RECOVERY_STARTED.value in stages
     assert BusinessAuditStage.WORKER_RECOVERY_COMPLETED.value not in stages
+
+
+def test_precommit_finalization_failure_releases_attempt_key_for_retry() -> None:
+    class FailOnceRepository(Repository):
+        failed = False
+
+        def finalize_execution(self, finalization, *, ledger_already_applied=False):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("Synthetic transient persistence failure")
+            super().finalize_execution(finalization, ledger_already_applied=ledger_already_applied)
+
+    repository = FailOnceRepository(ledger_lots=5)
+    service = UncertainIntentReconciliationService(
+        repository,
+        Broker((sell_operation(),)),
+        now=lambda: NOW,
+    )
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="transient persistence failure"):
+            await service.reconcile((command(),))
+        return await service.reconcile((command(),))
+
+    result = asyncio.run(scenario())
+
+    assert result.resolved == 1
+    assert len(repository.finalizations) == 1
 
 
 def test_delayed_fill_is_reconciled_after_cooldown_without_restart() -> None:

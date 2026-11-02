@@ -729,6 +729,7 @@ def test_age_policy_failure_requires_strictly_expired_core_order_and_marks_candi
                     "to_state": FactBrokerOrderStatus.FAILED,
                     "safe_reason": "ORDER_AGE_LIMIT_EXCEEDED",
                     "safe_message": "Order exceeded 24-hour processing limit",
+                    "created_at": created_at,
                     "terminal_at": None,
                     "occurred_at": NOW,
                     "updated_at": NOW,
@@ -753,9 +754,7 @@ def test_age_policy_failure_requires_strictly_expired_core_order_and_marks_candi
             assert reservation.state == "IN_FLIGHT"
             assert reservation.payload["_age_policy"] == {
                 "version": 1,
-                "expired_at": (
-                    NOW.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-                ),
+                "expired_at": (NOW.isoformat(timespec="milliseconds").replace("+00:00", "Z")),
             }
         else:
             assert result.results == ()
@@ -763,6 +762,314 @@ def test_age_policy_failure_requires_strictly_expired_core_order_and_marks_candi
             assert order.state == "SUBMITTING"
             assert "_age_policy" not in reservation.payload
         assert reservation.reserved_cash == Decimal("1001")
+
+
+@pytest.mark.parametrize(
+    "payload_changes",
+    [
+        {},
+        {"idempotency_key": "00000000-0000-4000-8000-000000000295"},
+        {"side": OrderSide.SELL},
+        {"quantity_lots": 2},
+        {"limit_price": Decimal("101")},
+        {"requested_amount": Decimal("1001")},
+        {"decision_id": UUID("00000000-0000-4000-8000-000000000296")},
+        {"strategy_snapshot": {"changed": True}},
+        {"executed_amount": Decimal("1")},
+        {"updated_at": NOW + timedelta(milliseconds=1)},
+    ],
+)
+def test_native_age_policy_fact_without_reservation_checks_order_lineage(database, payload_changes) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    sell_payload = {
+        "executed_lots": 0,
+        "executed_amount": "0",
+        "executed_commission": "0",
+        "anchor_executed_lots": 0,
+        "unrelated_financial_state": {"keep": True},
+    }
+    with factory.begin() as session:
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        order.created_at = NOW - timedelta(hours=25)
+        session.add(
+            TradingSubmitReservationModel(
+                reservation_id="00000000-0000-4000-8000-000000000247",
+                user_broker_id=str(SCOPE_ID),
+                automation_id=str(AUTOMATION_A),
+                idempotency_key="00000000-0000-4000-8000-000000000248",
+                request_fingerprint="f" * 64,
+                state="IN_FLIGHT",
+                runtime_instance_id=str(RUNTIME_A),
+                generation=1,
+                configuration_fingerprint=CONFIGURATION_FINGERPRINT,
+                permit_id="00000000-0000-4000-8000-000000000249",
+                side="SELL",
+                instrument_uid="external-canary",
+                quantity_lots=1,
+                limit_price=Decimal("100"),
+                requested_amount=Decimal("94"),
+                reserved_cash=Decimal(0),
+                reserved_position_units=Decimal("94"),
+                payload=sell_payload,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.delete(
+            session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
+        )
+    transition = complete_fact_sequence()[3]
+    failed = transition.model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000243"),
+            "sequence_number": 5,
+            "occurred_at": NOW,
+            "payload": transition.payload.model_copy(
+                update={
+                    "order_event_id": UUID("00000000-0000-4000-8000-000000000244"),
+                    "idempotency_key": str(SUBMIT_KEY),
+                    "from_state": FactBrokerOrderStatus.SUBMITTING,
+                    "state": FactBrokerOrderStatus.FAILED,
+                    "to_state": FactBrokerOrderStatus.FAILED,
+                    "safe_reason": "ORDER_AGE_LIMIT_EXCEEDED",
+                    "safe_message": "Order exceeded 24-hour processing limit",
+                    "occurred_at": NOW,
+                    "created_at": NOW - timedelta(hours=25),
+                    "updated_at": NOW,
+                    "terminal_at": None,
+                    **payload_changes,
+                }
+            ),
+        }
+    )
+
+    result = production_fact_service(factory).publish([failed], runtime_instance_id=RUNTIME_A, generation=1)
+
+    if payload_changes:
+        assert result.results == ()
+        assert result.failures[0].code is FactIngressErrorCode.INVALID_FACT_STATE
+    else:
+        assert result.failures == ()
+    with factory() as session:
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        assert (order.state, order.terminal_at) == (("FAILED", None) if not payload_changes else ("SUBMITTING", None))
+        assert (
+            session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
+            is None
+        )
+        sell_reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.side == "SELL",
+                TradingSubmitReservationModel.automation_id == str(AUTOMATION_A),
+            )
+        )
+        assert sell_reservation is not None
+        assert sell_reservation.reserved_position_units == Decimal("94")
+        assert sell_reservation.payload == sell_payload
+        assert "_age_policy" not in sell_reservation.payload
+
+
+@pytest.mark.parametrize(
+    ("age", "expired_at", "accepted"),
+    [
+        (timedelta(hours=24), NOW, False),
+        (timedelta(hours=25), NOW + timedelta(milliseconds=1), False),
+    ],
+)
+def test_native_age_policy_without_reservation_rejects_boundary_and_future_times(
+    database, age, expired_at, accepted
+) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    created_at = NOW - age
+    with factory.begin() as session:
+        session.get_one(BrokerOrderModel, str(ORDER_ID)).created_at = created_at
+        session.delete(
+            session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
+        )
+    transition = complete_fact_sequence()[3]
+    failed = transition.model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000245"),
+            "sequence_number": 5,
+            "occurred_at": expired_at,
+            "payload": transition.payload.model_copy(
+                update={
+                    "order_event_id": UUID("00000000-0000-4000-8000-000000000246"),
+                    "idempotency_key": str(SUBMIT_KEY),
+                    "from_state": FactBrokerOrderStatus.SUBMITTING,
+                    "state": FactBrokerOrderStatus.FAILED,
+                    "to_state": FactBrokerOrderStatus.FAILED,
+                    "safe_reason": "ORDER_AGE_LIMIT_EXCEEDED",
+                    "safe_message": "Order exceeded 24-hour processing limit",
+                    "created_at": created_at,
+                    "occurred_at": expired_at,
+                    "updated_at": expired_at,
+                    "terminal_at": None,
+                }
+            ),
+        }
+    )
+
+    result = production_fact_service(factory).publish([failed], runtime_instance_id=RUNTIME_A, generation=1)
+
+    assert (result.failures == ()) is accepted
+
+
+def test_native_age_replay_and_late_fill_without_reservation_are_idempotent(database) -> None:
+    _, factory = database
+    seed_fact_submit_reservation(factory)
+    admit_order_prefix(factory)
+    sell_payload = {
+        "executed_lots": 0,
+        "executed_amount": "0",
+        "executed_commission": "0",
+        "anchor_executed_lots": 0,
+        "unrelated_financial_state": {"keep": True},
+    }
+    with factory.begin() as session:
+        session.get_one(BrokerOrderModel, str(ORDER_ID)).created_at = NOW - timedelta(hours=25)
+        session.add(
+            TradingSubmitReservationModel(
+                reservation_id="00000000-0000-4000-8000-000000000250",
+                user_broker_id=str(SCOPE_ID),
+                automation_id=str(AUTOMATION_A),
+                idempotency_key="00000000-0000-4000-8000-000000000251",
+                request_fingerprint="f" * 64,
+                state="IN_FLIGHT",
+                runtime_instance_id=str(RUNTIME_A),
+                generation=1,
+                configuration_fingerprint=CONFIGURATION_FINGERPRINT,
+                permit_id="00000000-0000-4000-8000-000000000252",
+                side="SELL",
+                instrument_uid="external-canary",
+                quantity_lots=1,
+                limit_price=Decimal("100"),
+                requested_amount=Decimal("94"),
+                reserved_cash=Decimal(0),
+                reserved_position_units=Decimal("94"),
+                payload=sell_payload,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.delete(
+            session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
+        )
+
+    facts = complete_fact_sequence()
+    service_value = production_fact_service(factory)
+    age_fact = facts[3].model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000253"),
+            "sequence_number": 5,
+            "occurred_at": NOW,
+            "payload": facts[3].payload.model_copy(
+                update={
+                    "order_event_id": UUID("00000000-0000-4000-8000-000000000254"),
+                    "idempotency_key": str(SUBMIT_KEY),
+                    "from_state": FactBrokerOrderStatus.SUBMITTING,
+                    "state": FactBrokerOrderStatus.FAILED,
+                    "to_state": FactBrokerOrderStatus.FAILED,
+                    "safe_reason": "ORDER_AGE_LIMIT_EXCEEDED",
+                    "safe_message": "Order exceeded 24-hour processing limit",
+                    "created_at": NOW - timedelta(hours=25),
+                    "updated_at": NOW,
+                    "occurred_at": NOW,
+                    "terminal_at": None,
+                }
+            ),
+        }
+    )
+    assert service_value.publish([age_fact], runtime_instance_id=RUNTIME_A, generation=1).failures == ()
+    assert service_value.publish([age_fact], runtime_instance_id=RUNTIME_A, generation=1).failures == ()
+
+    late_fill = facts[3].model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000255"),
+            "sequence_number": 6,
+            "occurred_at": NOW + timedelta(seconds=1),
+            "payload": facts[3].payload.model_copy(
+                update={
+                    "order_event_id": UUID("00000000-0000-4000-8000-000000000256"),
+                    "idempotency_key": str(SUBMIT_KEY),
+                    "from_state": FactBrokerOrderStatus.FAILED,
+                    "state": FactBrokerOrderStatus.FILLED,
+                    "to_state": FactBrokerOrderStatus.FILLED,
+                    "safe_reason": "BROKER_FILLED",
+                    "safe_message": "Broker confirmed fill",
+                    "executed_amount": Decimal("1000"),
+                    "executed_commission": Decimal("1"),
+                    "executed_at": NOW + timedelta(seconds=1),
+                    "terminal_at": NOW + timedelta(seconds=1),
+                    "created_at": NOW - timedelta(hours=25),
+                    "updated_at": NOW + timedelta(seconds=1),
+                    "occurred_at": NOW + timedelta(seconds=1),
+                }
+            ),
+        }
+    )
+    execution = facts[4].model_copy(
+        update={
+            "event_id": UUID("00000000-0000-4000-8000-000000000257"),
+            "sequence_number": 7,
+            "payload": facts[4].payload.model_copy(
+                update={
+                    "executed_at": NOW + timedelta(seconds=1),
+                    "created_at": NOW + timedelta(seconds=1),
+                }
+            ),
+        }
+    )
+    assert service_value.publish([late_fill, execution], runtime_instance_id=RUNTIME_A, generation=1).failures == ()
+    assert service_value.publish([late_fill, execution], runtime_instance_id=RUNTIME_A, generation=1).failures == ()
+
+    with factory() as session:
+        order = session.get_one(BrokerOrderModel, str(ORDER_ID))
+        assert (order.state, order.terminal_at, order.executed_amount) == (
+            "FILLED",
+            NOW + timedelta(seconds=1),
+            Decimal("1000"),
+        )
+        assert session.scalar(select(func.count()).select_from(TradeExecutionModel)) == 1
+        assert session.scalar(select(func.count()).select_from(AutomationEventModel)) == 7
+        assert session.scalar(select(func.count()).select_from(BrokerOrderEventModel)) == 3
+        assert (
+            session.scalar(
+                select(TradingSubmitReservationModel).where(
+                    TradingSubmitReservationModel.idempotency_key == str(SUBMIT_KEY)
+                )
+            )
+            is None
+        )
+        sell_reservation = session.scalar(
+            select(TradingSubmitReservationModel).where(
+                TradingSubmitReservationModel.idempotency_key == "00000000-0000-4000-8000-000000000251"
+            )
+        )
+        assert sell_reservation is not None
+        assert sell_reservation.reserved_position_units == Decimal("94")
+        assert sell_reservation.payload == sell_payload
+        assert "_age_policy" not in sell_reservation.payload
 
 
 def test_late_fill_advances_settled_age_execution_delta_from_core_facts(database) -> None:

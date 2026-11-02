@@ -140,6 +140,35 @@ class Preparation:
         self.calls += 1
         self.prepared.set()
 
+    async def maintain_local(self, commands) -> None:
+        self.local_commands = commands
+
+
+def test_local_maintenance_uses_current_commands_without_fetching_analytics() -> None:
+    class NoAnalytics(Analytics):
+        async def snapshot(self, request):
+            raise AssertionError("Local maintenance must not fetch Analytics")
+
+    async def scenario():
+        analytics = NoAnalytics()
+        preparation = Preparation()
+        iteration = RunBrokerIterationUsecase(
+            AnalyticsFrameService(analytics, now=lambda: NOW, order_books=OrderBookValidationService()),
+            object(),
+            preparation=preparation,
+            metrics=AnalyticsMetricsCache(),
+            source_id=str(command(1).broker_id),
+            fallback=AdaptiveThresholds("0.5", "0.5", "STRATEGY"),
+        )
+        commands = (command(1),)
+        await iteration.replace_commands(commands)
+        await iteration.maintain_local()
+        return preparation, analytics
+
+    preparation, _analytics = asyncio.run(scenario())
+
+    assert preparation.local_commands == (command(1),)
+
 
 def test_one_analytics_frame_evaluates_each_position_once_before_sdk_dispatch() -> None:
     async def scenario():

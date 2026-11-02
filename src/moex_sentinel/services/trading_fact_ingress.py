@@ -204,7 +204,7 @@ class TradingFactIngressService:
                     runtime_authorization=runtime_authorization,
                     automation_instrument_id=current.instrument_id,
                 )
-                age_policy_expired_at = self._validate_age_policy_failure(
+                age_policy_result = self._validate_age_policy_failure(
                     uow,
                     fact,
                     scope_id=scope_id,
@@ -215,12 +215,15 @@ class TradingFactIngressService:
                     automation_instrument_id=current.instrument_id,
                     now=self._now(),
                 )
-                if age_policy_expired_at is not None and not uow.record_age_policy_candidate(
-                    scope_id,
-                    str(fact.payload.idempotency_key),
-                    expired_at=age_policy_expired_at,
-                ):
-                    raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+                age_policy_expired_at = None
+                if age_policy_result is not None:
+                    age_policy_expired_at, needs_candidate = age_policy_result
+                    if needs_candidate and not uow.record_age_policy_candidate(
+                        scope_id,
+                        str(fact.payload.idempotency_key),
+                        expired_at=age_policy_expired_at,
+                    ):
+                        raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
                 self._mapper.apply(
                     uow,
                     fact,
@@ -335,7 +338,7 @@ class TradingFactIngressService:
         runtime_authorization: FactRuntimeAuthorization | None,
         automation_instrument_id: str,
         now: datetime,
-    ) -> datetime | None:
+    ) -> tuple[datetime, bool] | None:
         if not isinstance(fact, BrokerOrderStateChangedEnvelope):
             return None
         payload = fact.payload
@@ -358,48 +361,39 @@ class TradingFactIngressService:
             raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE) from None
         reservation = uow.get_fact_submit_reservation(scope_id, str(payload.idempotency_key))
         order = uow.orders.get_order(scope_id, str(payload.broker_order_id))
-        if reservation is None:
-            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
-        origin_matches = (
-            reservation.runtime_instance_id == str(runtime_instance_id)
-            and reservation.generation == generation
-            and reservation.origin_registration_status == "OWNER"
-        )
-        retired_origin_matches = (
-            reservation.origin_registration_status == "RETIRED"
-            and reservation.generation < generation
-        )
         try:
             # The Worker payload records when its age sweep observed expiry. The
             # envelope timestamp may be advanced by the outbox for monotonic order.
             expired_at = require_utc_millisecond(payload.occurred_at)
         except (AttributeError, TypeError, ValueError):
             raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE) from None
+        decision = uow.orders.get_decision(scope_id, order.decision_id)
         if (
             not is_historical(order.created_at, now)
             or not is_historical(order.created_at, expired_at)
             or expired_at > now
-            or reservation.state not in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
-            or not (origin_matches or retired_origin_matches)
-            or reservation.automation_id != str(automation_id)
-            or reservation.idempotency_key != order.idempotency_key
-            or reservation.idempotency_key != str(payload.idempotency_key)
-            or reservation.side != order.side.value
-            or reservation.side != payload.side.value
-            or reservation.quantity_lots != order.quantity_lots
-            or reservation.quantity_lots != payload.quantity_lots
-            or reservation.limit_price != order.limit_price
-            or reservation.limit_price != payload.limit_price
-            or reservation.requested_amount != order.requested_amount
-            or reservation.requested_amount != payload.requested_amount
+            or payload.updated_at != expired_at
             or order.user_broker_id != scope_id
             or order.automation_id != str(automation_id)
             or order.instrument_id != automation_instrument_id
             or order.instrument_id != str(payload.instrument_id)
-            or order.state is BrokerOrderStatus.FAILED
+            or order.idempotency_key != str(payload.idempotency_key)
+            or order.side.value != payload.side.value
+            or order.quantity_lots != payload.quantity_lots
+            or order.limit_price != payload.limit_price
+            or order.requested_amount != payload.requested_amount
+            or order.state
+            in {
+                BrokerOrderStatus.FAILED,
+                BrokerOrderStatus.FILLED,
+                BrokerOrderStatus.CANCELLED,
+                BrokerOrderStatus.REJECTED,
+                BrokerOrderStatus.EXPIRED,
+            }
             or order.terminal_at is not None
             or payload.from_state is None
             or payload.from_state.value != order.state.value
+            or payload.created_at != order.created_at
             or payload.external_order_id != order.external_order_id
             or payload.executed_amount != order.executed_amount
             or payload.executed_commission != order.executed_commission
@@ -413,9 +407,39 @@ class TradingFactIngressService:
             or (payload.position_cycle_id is None) != (order.position_cycle_id is None)
             or (payload.position_cycle_id is not None and str(payload.position_cycle_id) != order.position_cycle_id)
             or payload.strategy_snapshot != order.strategy_snapshot
+            or decision.user_broker_id != scope_id
+            or decision.automation_id != str(automation_id)
+            or decision.instrument_id != automation_instrument_id
+            or decision.position_cycle_id != order.position_cycle_id
         ):
             raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
-        return expired_at
+        if reservation is None:
+            return expired_at, False
+        origin_matches = (
+            reservation.runtime_instance_id == str(runtime_instance_id)
+            and reservation.generation == generation
+            and reservation.origin_registration_status == "OWNER"
+        )
+        retired_origin_matches = (
+            reservation.origin_registration_status == "RETIRED" and reservation.generation < generation
+        )
+        if (
+            reservation.state not in {"IN_FLIGHT", "BROKER_ACTIVE", "UNKNOWN"}
+            or not (origin_matches or retired_origin_matches)
+            or reservation.automation_id != str(automation_id)
+            or reservation.idempotency_key != order.idempotency_key
+            or reservation.idempotency_key != str(payload.idempotency_key)
+            or reservation.side != order.side.value
+            or reservation.side != payload.side.value
+            or reservation.quantity_lots != order.quantity_lots
+            or reservation.quantity_lots != payload.quantity_lots
+            or reservation.limit_price != order.limit_price
+            or reservation.limit_price != payload.limit_price
+            or reservation.requested_amount != order.requested_amount
+            or reservation.requested_amount != payload.requested_amount
+        ):
+            raise _FactGroupRejected(FactIngressErrorCode.INVALID_FACT_STATE)
+        return expired_at, True
 
     @staticmethod
     def _proof_matches_reservation(
